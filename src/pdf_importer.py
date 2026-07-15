@@ -14,6 +14,7 @@ from pathlib import Path
 import pypdfium2 as pdfium
 from PIL import Image
 
+import config
 from notice_parser import NoticeData
 from image_utils import fix_rotation, ocr_page
 
@@ -227,7 +228,7 @@ def process_pdf(
         List of NoticeData objects ready for enrichment.
     """
     if date_added is None:
-        date_added = datetime.now().strftime("%Y-%m-%d")
+        date_added = config.run_date()
 
     _COUNTY_DEFAULT_CITY = {"knox": "Knoxville", "blount": "Maryville", "tulsa": "Tulsa"}
     _COUNTY_STATE = {"knox": "TN", "blount": "TN", "tulsa": "OK"}

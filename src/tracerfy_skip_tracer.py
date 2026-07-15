@@ -19,6 +19,14 @@ import requests
 import config as cfg
 from notice_parser import NoticeData
 
+# Government/institutional patterns that should never go to skip trace
+_GOVT_ENTITY_RE = __import__("re").compile(
+    r"\b(?:SCHOOL\s+DISTRICT|COUNTY\s+(?:OF|COMMISSION)|CITY\s+OF|STATE\s+OF|"
+    r"UNITED\s+STATES|DEPARTMENT\s+OF|BOARD\s+OF|MUNICIPALITY|TOWNSHIP|"
+    r"FEDERAL|NATIONAL\s+ASSN|YMCA|UTILITIES)\b",
+    __import__("re").IGNORECASE,
+)
+
 logger = logging.getLogger(__name__)
 
 # Tracerfy batch response phone/email fields
@@ -92,6 +100,10 @@ def _get_contacts_for_trace(
         # Living owner — single contact
         name = (notice.owner_name or "").strip()
         if name:
+            # Skip government/institutional entities
+            if cfg.BUSINESS_RE.search(name) or _GOVT_ENTITY_RE.search(name):
+                logger.debug("Tracerfy: skipping entity '%s'", name)
+                return contacts
             first, last = _split_name(name)
             if first and last:
                 contacts.append((
@@ -106,11 +118,70 @@ def _get_contacts_for_trace(
 
 
 def _split_name(name: str) -> tuple[str, str]:
-    """Split a full name into (first, last). Returns ('', '') if unparseable."""
-    parts = name.strip().split()
-    if len(parts) < 2:
+    """Split a full name into (first, last). Returns ('', '') if unparseable.
+
+    Handles both 'First Last' and 'LAST, FIRST MIDDLE' court formats.
+    """
+    name = name.strip()
+    if not name:
         return ("", "")
-    return (parts[0], parts[-1])
+    if "," in name:
+        # "LAST, FIRST MIDDLE" court format (OSCN, county clerk records)
+        last_part, _, first_part = name.partition(",")
+        last = last_part.strip()
+        first = first_part.strip().split()[0] if first_part.strip() else ""
+    else:
+        parts = name.split()
+        if len(parts) < 2:
+            return ("", "")
+        first = parts[0]
+        last = parts[-1]
+    if not first or not last:
+        return ("", "")
+    return (first, last)
+
+
+def _alt_name_splits(name: str) -> list[tuple[str, str]]:
+    """Generate alternate (first, last) splits for compound surnames.
+
+    For "DE LA TORRE, ANA" the primary split is ("ANA", "DE LA TORRE").
+    Alternates try: ("ANA", "TORRE"), ("ANA DE LA", "TORRE"),
+    ("ANA", "DE LA TORRE") with first two words as first name, etc.
+
+    Returns only splits that differ from the primary.
+    """
+    primary = _split_name(name)
+    if not primary[0]:
+        return []
+
+    alts: list[tuple[str, str]] = []
+    name = name.strip()
+
+    if "," in name:
+        last_part, _, first_part = name.partition(",")
+        last_words = last_part.strip().split()
+        first_word = first_part.strip().split()[0] if first_part.strip() else ""
+        if len(last_words) >= 2 and first_word:
+            # Try just the final word of the compound last name
+            alts.append((first_word, last_words[-1]))
+            # Try first word of last name as part of first name
+            alts.append((first_word + " " + last_words[0], last_words[-1]))
+    else:
+        parts = name.split()
+        if len(parts) >= 3:
+            # "FIRST MIDDLE LAST" — try "FIRST" + "MIDDLE" as first name
+            alts.append((parts[0] + " " + parts[1], parts[-1]))
+            # Try first two as first, last word as last
+            alts.append((parts[0], parts[1]))
+
+    # Deduplicate and remove primary
+    seen = {primary}
+    result = []
+    for alt in alts:
+        if alt not in seen and alt[0] and alt[1]:
+            seen.add(alt)
+            result.append(alt)
+    return result
 
 
 # Keep backward-compatible single-contact function for callers that expect it
@@ -171,7 +242,7 @@ def _lookup_missing_heir_addresses(
         if addr and addr.get("street"):
             heir["street"] = addr.get("street", "")
             heir["city"] = addr.get("city", "") or city_hint
-            heir["state"] = addr.get("state", "") or "TN"
+            heir["state"] = addr.get("state", "") or ""
             heir["zip"] = addr.get("zip", "")
             heir["address_source"] = addr.get("source", "")
             filled += 1
@@ -276,7 +347,7 @@ def batch_skip_trace(
     writer.writerow(["first_name", "last_name", "address", "city", "state",
                      "zip", "mail_address", "mail_city", "mail_state"])
     for notice_ref, first, last, address, city, zip_code, _ in lookup_map:
-        state = notice_ref.state or "TN"
+        state = notice_ref.state or ""
         writer.writerow([first, last, address, city, state, zip_code, "", "", ""])
     csv_content = csv_buffer.getvalue()
     csv_buffer.close()
@@ -336,6 +407,12 @@ def batch_skip_trace(
 
             # Handle both response formats
             if isinstance(result_data, list):
+                if not result_data:
+                    # Empty list = still processing, keep polling
+                    if attempt % 6 == 5:
+                        logger.info("  Tracerfy batch still processing (%ds)...",
+                                    (attempt + 1) * 5)
+                    continue
                 records = result_data
             elif isinstance(result_data, dict):
                 status = result_data.get("status", "")
@@ -357,6 +434,10 @@ def batch_skip_trace(
             logger.info("  Tracerfy batch complete: %d/%d matched, %d phones, %d emails, $%.2f",
                         stats["matched"], stats["submitted"],
                         stats["phones_found"], stats["emails_found"], stats["cost"])
+
+            # Retry unmatched records with compound surnames using alternate name splits
+            _retry_compound_names(notices, lookup_map, stats)
+
             return stats
 
         logger.warning("Tracerfy batch job %s timed out after 5 min", queue_id)
@@ -366,6 +447,129 @@ def batch_skip_trace(
     except Exception as e:
         logger.warning("Tracerfy batch skip trace failed: %s", e)
         return stats
+
+
+def _retry_compound_names(
+    notices: list[NoticeData],
+    lookup_map: list,
+    stats: dict,
+) -> None:
+    """Retry unmatched records that have multi-word last names with alternate splits.
+
+    For compound surnames like "DE LA TORRE" or "OROZCO MUNOZ", the primary
+    split may not match Tracerfy's records. This submits a small follow-up
+    batch with alternate name splits for unmatched records only.
+    """
+    if not cfg.TRACERFY_API_KEY:
+        return
+
+    # Find unmatched records with compound last names
+    matched_keys = set()
+    for notice in notices:
+        if notice.primary_phone:
+            name = (notice.owner_name or "").strip()
+            matched_keys.add(name.lower())
+
+    retry_entries: list[tuple[NoticeData, str, str, str, str, str, str]] = []
+    for notice, first, last, address, city, zip_code, heir_key in lookup_map:
+        if heir_key.lower() in matched_keys:
+            continue
+        if notice.primary_phone:
+            continue
+        name = heir_key
+        alts = _alt_name_splits(name)
+        if not alts:
+            continue
+        for alt_first, alt_last in alts:
+            retry_entries.append(
+                (notice, alt_first, alt_last, address, city, zip_code, heir_key)
+            )
+
+    if not retry_entries:
+        return
+
+    logger.info("  Tracerfy retry: %d alternate name splits for %d unmatched compound names ($%.2f)",
+                len(retry_entries),
+                len(set(hk for _, _, _, _, _, _, hk in retry_entries)),
+                len(retry_entries) * 0.02)
+
+    csv_buffer = io.StringIO()
+    writer = csv.writer(csv_buffer)
+    writer.writerow(["first_name", "last_name", "address", "city", "state",
+                     "zip", "mail_address", "mail_city", "mail_state"])
+    for notice_ref, first, last, address, city, zip_code, _ in retry_entries:
+        state = notice_ref.state or ""
+        writer.writerow([first, last, address, city, state, zip_code, "", "", ""])
+    csv_content = csv_buffer.getvalue()
+    csv_buffer.close()
+
+    try:
+        resp = requests.post(
+            TRACERFY_TRACE_URL,
+            headers={"Authorization": f"Bearer {cfg.TRACERFY_API_KEY}"},
+            data={
+                "first_name_column": "first_name",
+                "last_name_column": "last_name",
+                "address_column": "address",
+                "city_column": "city",
+                "state_column": "state",
+                "zip_column": "zip",
+                "mail_address_column": "mail_address",
+                "mail_city_column": "mail_city",
+                "mail_state_column": "mail_state",
+                "mailing_zip_column": "zip",
+            },
+            files={"csv_file": ("retry_batch.csv", csv_content, "text/csv")},
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            logger.warning("  Tracerfy retry batch %d: %s", resp.status_code, resp.text[:200])
+            return
+        queue_data = resp.json()
+        queue_id = queue_data.get("queue_id")
+        if not queue_id:
+            return
+
+        logger.info("  Tracerfy retry job %s submitted", queue_id)
+
+        for attempt in range(60):
+            time.sleep(5)
+            result_resp = requests.get(
+                f"{TRACERFY_QUEUE_URL}{queue_id}",
+                headers={"Authorization": f"Bearer {cfg.TRACERFY_API_KEY}"},
+                timeout=15,
+            )
+            result_resp.raise_for_status()
+            result_data = result_resp.json()
+
+            if isinstance(result_data, list):
+                if not result_data:
+                    continue
+                records = result_data
+            elif isinstance(result_data, dict):
+                if result_data.get("status") == "failed":
+                    return
+                if result_data.get("status") != "completed":
+                    continue
+                records = result_data.get("records", [])
+            else:
+                continue
+
+            _match_results(records, retry_entries, stats)
+            retry_cost = len(retry_entries) * 0.02
+            stats["cost"] += retry_cost
+            stats["submitted"] += len(retry_entries)
+            retry_matched = sum(1 for r in records if any(
+                (r.get("first_name") or "").strip().lower() == f.lower()
+                and (r.get("last_name") or "").strip().lower() == l.lower()
+                for _, f, l, *_ in retry_entries
+            ))
+            logger.info("  Tracerfy retry complete: %d additional matches, $%.2f",
+                        retry_matched, retry_cost)
+            return
+
+    except Exception as e:
+        logger.warning("  Tracerfy retry failed: %s", e)
 
 
 def _heir_has_phones(notice: NoticeData, heir_key: str) -> bool:

@@ -65,7 +65,7 @@ class SubjectProperty:
     """The property being analyzed."""
     address: str = ""
     city: str = ""
-    state: str = "TN"
+    state: str = ""
     zip_code: str = ""
     latitude: float = 0.0
     longitude: float = 0.0
@@ -88,7 +88,7 @@ class CompProperty:
     """A comparable property with sale data."""
     address: str = ""
     city: str = ""
-    state: str = "TN"
+    state: str = ""
     zip_code: str = ""
     latitude: float = 0.0
     longitude: float = 0.0
@@ -166,7 +166,7 @@ def _api_get(endpoint: str, params: dict, api_key: str) -> dict | None:
     return None
 
 
-def fetch_subject_property(address: str, city: str = "", state: str = "TN",
+def fetch_subject_property(address: str, city: str = "", state: str = "",
                            zip_code: str = "", api_key: str = "") -> SubjectProperty | None:
     """Fetch full property details for the subject property."""
     api_key = api_key or config.OPENWEBNINJA_API_KEY
@@ -275,7 +275,7 @@ def fetch_comparable_sales(subject: SubjectProperty, radius_miles: float = DEFAU
         comp = CompProperty(
             address=item.get("streetAddress") or item.get("address") or "",
             city=item.get("city") or "",
-            state=item.get("state") or "TN",
+            state=item.get("state") or "",
             zip_code=str(item.get("zipcode") or item.get("zip") or ""),
             latitude=lat,
             longitude=lon,
@@ -891,7 +891,7 @@ def generate_comp_report(subject: SubjectProperty, comps: list[CompProperty],
 
 # ── Main entry point ──────────────────────────────────────────────────
 
-def run_comp_analysis(address: str, city: str = "", state: str = "TN",
+def run_comp_analysis(address: str, city: str = "", state: str = "",
                       zip_code: str = "", radius: float = DEFAULT_RADIUS_MILES,
                       months: int = DEFAULT_MONTHS_BACK,
                       output_path: str = "") -> dict:

@@ -94,8 +94,25 @@ SIFT_COLUMNS = [
     "entity_research_source",
     "entity_research_confidence",
     "source_url",
+    # Tracerfy skip-trace phone + email fields
+    "primary_phone",
+    "mobile_1",
+    "mobile_2",
+    "mobile_3",
+    "mobile_4",
+    "mobile_5",
+    "landline_1",
+    "landline_2",
+    "landline_3",
+    "email_1",
+    "email_2",
+    "email_3",
+    "email_4",
+    "email_5",
     # Pipeline metadata
     "run_id",
+    # DataSift filtering
+    "Tags",
 ]
 
 
@@ -114,12 +131,19 @@ def _split_name(full_name: str) -> tuple[str, str]:
     """Split a full name into (first_name, last_name).
 
     Handles common patterns:
-      "John Doe"         → ("John", "Doe")
-      "John A. Doe"      → ("John A.", "Doe")
+      "John Doe"              → ("John", "Doe")
+      "John A. Doe"           → ("John A.", "Doe")
       "John Doe And Jane Doe" → ("John", "Doe And Jane Doe")
+      "LAST, FIRST MIDDLE"    → ("FIRST", "LAST")  (court format)
     """
     if not full_name:
         return ("", "")
+    if "," in full_name:
+        # "LAST, FIRST MIDDLE" court format (OSCN, county clerk records)
+        last_part, _, first_part = full_name.partition(",")
+        last = last_part.strip()
+        first = first_part.strip().split()[0] if first_part.strip() else ""
+        return (first, last) if first and last else ("", "")
     parts = full_name.strip().split()
     if len(parts) == 1:
         return (parts[0], "")
@@ -137,6 +161,22 @@ def _notice_id_from_url(url: str) -> str:
     import re
     m = re.search(r"[?&]ID=(\d+)", url)
     return m.group(1) if m else ""
+
+
+_DIGITS_RE = re.compile(r"\D")
+
+def _normalize_parcel(pid: str) -> str:
+    """Normalize a Tulsa County parcel ID to its 9-digit account number.
+
+    Acclaim stores parcel IDs as 14-digit sub+account (e.g. "78333842856380"
+    = sub "78333" + account "842856380"). The Tulsa Assessor returns only the
+    9-digit account number. Strip non-digits and drop any leading 5-digit
+    subdivision prefix so both formats compare equal.
+    """
+    digits = _DIGITS_RE.sub("", pid)
+    if len(digits) == 14:
+        return digits[5:]  # drop 5-digit sub prefix, keep 9-digit account
+    return digits
 
 
 def deduplicate(notices: list[NoticeData]) -> list[NoticeData]:
@@ -163,8 +203,9 @@ def deduplicate(notices: list[NoticeData]) -> list[NoticeData]:
             result.append(notice)
             continue
 
-        # Secondary dedup: by parcel_id (for PDF imports)
-        pid = notice.parcel_id.strip()
+        # Secondary dedup: by normalized parcel_id (Acclaim 14-digit and
+        # Assessor 9-digit both normalize to the same 9-digit account key)
+        pid = _normalize_parcel(notice.parcel_id.strip())
         if pid:
             if pid in seen_parcels:
                 continue
@@ -191,6 +232,12 @@ def deduplicate(notices: list[NoticeData]) -> list[NoticeData]:
     return result
 
 
+def _build_notice_tags(notice: NoticeData) -> str:
+    """Build a comma-separated Tags string for DataSift filtering."""
+    from datasift_formatter import _build_tags
+    return _build_tags(notice)
+
+
 def write_csv(notices: list[NoticeData], filename: str | None = None) -> Path:
     """Write notices to a Sift-formatted CSV file.
 
@@ -203,7 +250,9 @@ def write_csv(notices: list[NoticeData], filename: str | None = None) -> Path:
     """
     if filename is None:
         timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-        filename = f"tn_notices_{timestamp}.csv"
+        states = {n.state.upper() for n in notices if n.state}
+        prefix = "ok" if states == {"OK"} else "tn"
+        filename = f"{prefix}_notices_{timestamp}.csv"
 
     output_path = OUTPUT_DIR / filename
     written = 0
@@ -213,19 +262,34 @@ def write_csv(notices: list[NoticeData], filename: str | None = None) -> Path:
         writer.writeheader()
 
         for notice in notices:
-            first, last = _split_name(notice.owner_name)
+            # Deceased owners: contact = DM (who we're mailing to)
+            # Living owners: contact = property owner
+            dm_name = (notice.decision_maker_name or "").strip()
+            if notice.owner_deceased == "yes" and dm_name:
+                contact_name = dm_name
+                contact_street = notice.decision_maker_street or notice.owner_street or notice.address
+                contact_city = notice.decision_maker_city or notice.owner_city or notice.city
+                contact_state = notice.decision_maker_state or notice.owner_state or notice.state
+                contact_zip = notice.decision_maker_zip or notice.owner_zip or notice.zip
+            else:
+                contact_name = notice.owner_name
+                contact_street = notice.owner_street
+                contact_city = notice.owner_city
+                contact_state = notice.owner_state
+                contact_zip = notice.owner_zip
+            first, last = _split_name(contact_name)
             row = {
-                "full_name": notice.owner_name,
+                "full_name": contact_name,
                 "address": notice.address,
                 "city": notice.city,
                 "state": notice.state,
                 "zip": notice.zip,
                 "first_name": first,
                 "last_name": last,
-                "Owner Street": notice.owner_street,
-                "Owner City": notice.owner_city,
-                "Owner State": notice.owner_state,
-                "Owner ZIP Code": notice.owner_zip,
+                "Owner Street": contact_street,
+                "Owner City": contact_city,
+                "Owner State": contact_state,
+                "Owner ZIP Code": contact_zip,
                 "Date Added": _format_date_sift(notice.date_added),
                 "notice_type": notice.notice_type,
                 "county": notice.county,
@@ -288,7 +352,22 @@ def write_csv(notices: list[NoticeData], filename: str | None = None) -> Path:
                 "entity_research_source": notice.entity_research_source,
                 "entity_research_confidence": notice.entity_research_confidence,
                 "source_url": notice.source_url,
+                "primary_phone": notice.primary_phone,
+                "mobile_1": notice.mobile_1,
+                "mobile_2": notice.mobile_2,
+                "mobile_3": notice.mobile_3,
+                "mobile_4": notice.mobile_4,
+                "mobile_5": notice.mobile_5,
+                "landline_1": notice.landline_1,
+                "landline_2": notice.landline_2,
+                "landline_3": notice.landline_3,
+                "email_1": notice.email_1,
+                "email_2": notice.email_2,
+                "email_3": notice.email_3,
+                "email_4": notice.email_4,
+                "email_5": notice.email_5,
                 "run_id": notice.run_id,
+                "Tags": _build_notice_tags(notice),
             }
             writer.writerow(row)
             written += 1

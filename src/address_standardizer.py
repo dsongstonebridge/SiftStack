@@ -8,6 +8,7 @@ unchanged.
 """
 
 import logging
+import re
 import time
 
 from smartystreets_python_sdk import (
@@ -24,6 +25,87 @@ from notice_parser import NoticeData
 logger = logging.getLogger(__name__)
 
 MAX_BATCH_SIZE = 100
+
+# Tulsa's address grid is built on numbered E/W streets and N/S avenues
+# (74th, 91st, 101st, etc.). Any of them fail Smarty's DPV match unless the
+# number carries an ordinal suffix: "8120 E 74 Ct S" -> "8120 E 74th Ct S".
+# Confirmed 2026-07-09 on MUNOZ/MUNG (numbered avenue, "Av" abbreviation) and
+# 2026-07-10 on THERIOT (numbered street, "Ct" suffix) -- not specific to
+# avenues, it's any numbered grid street regardless of suffix type.
+# The trailing lookahead requires the suffix to be at the end of the street
+# (optionally followed by a single N/S/E/W direction letter) so this doesn't
+# misfire on named streets like "100 St Andrews Dr" or "5001 St Anthony Dr".
+_NUMBERED_STREET_SUFFIXES = (
+    "St", "Ave", "Av", "Ct", "Dr", "Pl", "Ln", "Rd", "Way",
+    "Ter", "Blvd", "Cir", "Pkwy", "Trl",
+)
+_NUMBERED_STREET_RE = re.compile(
+    r'\b(\d+)\s+(' + "|".join(_NUMBERED_STREET_SUFFIXES) + r')\b\.?'
+    r'(?=\s*(?:[NSEW]\b)?\s*$)',
+    re.IGNORECASE,
+)
+
+# A spelled-out directional (as opposed to the single-letter USPS form) breaks
+# DataSift's enrichment match -- e.g. "1328 S 77th East Ave" must be
+# "1328 S 77th E Ave" / "...Ave E" to enrich. Confirmed 2026-07-11 on Steven
+# Mirkin and Carolyn Gray's addresses (both had this from an older pipeline
+# run; current Assessor-lookup output no longer produces it, but this catches
+# it defensively for any other source -- Zillow, OCR/photo import, manual
+# entry -- that might reintroduce a spelled-out word). Only fires on strings
+# that already contain a digit (i.e. look like a real street address), so it
+# won't misfire on unrelated text.
+_SPELLED_DIRECTION_RE = re.compile(r'\b(North|South|East|West)\b', re.IGNORECASE)
+_DIRECTION_ABBREV = {"north": "N", "south": "S", "east": "E", "west": "W"}
+
+
+def _abbreviate_spelled_directions(street: str) -> str:
+    """Abbreviate a spelled-out cardinal direction word to its USPS letter."""
+    if not street or not re.search(r'\d', street):
+        return street
+    return _SPELLED_DIRECTION_RE.sub(
+        lambda m: _DIRECTION_ABBREV[m.group(1).lower()], street,
+    )
+
+
+def _ordinal_suffix(n: int) -> str:
+    """Return the ordinal suffix (st/nd/rd/th) for an integer."""
+    if 10 <= n % 100 <= 20:
+        return "th"
+    return {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+
+
+def _normalize_tulsa_numbered_street(street: str) -> str:
+    """Add ordinal suffix (and spell out 'Av' -> 'Ave') on Tulsa's numbered
+    grid streets.
+
+    "3329 S 93 Av E" -> "3329 S 93rd Ave E"
+    "8120 E 74 Ct S" -> "8120 E 74th Ct S"
+    Leaves already-correct addresses (e.g. "...93rd Ave...") untouched —
+    only fires on a bare number directly followed by a street-type suffix.
+    """
+    if not street:
+        return street
+
+    def _fix(m: re.Match) -> str:
+        n = int(m.group(1))
+        suffix = m.group(2)
+        street_type = "Ave" if suffix.lower() == "av" else suffix
+        return f"{n}{_ordinal_suffix(n)} {street_type}"
+
+    return _NUMBERED_STREET_RE.sub(_fix, street)
+
+
+def normalize_grid_addresses(notices: list[NoticeData]) -> None:
+    """Apply the free, local Tulsa grid-street ordinal fix to every notice.
+
+    Pure string normalization, no API call/cost involved — safe and cheap
+    to run unconditionally, including on --skip-smarty runs where the paid
+    Smarty API step itself is skipped to conserve the 250/month free tier.
+    """
+    for notice in notices:
+        if notice.address:
+            notice.address = _normalize_tulsa_numbered_street(notice.address)
+            notice.address = _abbreviate_spelled_directions(notice.address)
 
 
 def _build_client(auth_id: str, auth_token: str):
@@ -42,7 +124,7 @@ def _build_lastline(notice: NoticeData) -> str:
     lastline = ", ".join(parts)
     if notice.zip:
         lastline += " " + notice.zip if lastline else notice.zip
-    return lastline or "TN"
+    return lastline or ""
 
 
 def standardize_addresses(
@@ -61,6 +143,11 @@ def standardize_addresses(
         The same list (modified in-place) for chaining convenience.
         On any credential/API failure, returns notices unchanged.
     """
+    # Fix known Smarty-breaking address patterns before anything else — runs
+    # unconditionally (even without Smarty credentials) so every CSV export
+    # gets the corrected format, not just ones where the API call succeeds.
+    normalize_grid_addresses(notices)
+
     if not auth_id or not auth_token:
         logger.info("Smarty credentials not configured -- skipping address standardization")
         return notices
@@ -125,12 +212,13 @@ def standardize_addresses(
             metadata = candidate.metadata
             analysis = candidate.analysis
 
-            # Safety: reject non-TN results (bad match on out-of-state address)
-            if components and components.state_abbreviation and components.state_abbreviation != "TN":
+            # Safety: reject results where state doesn't match the notice's state
+            notice_state = (notice.state or "").strip().upper()
+            smarty_state = (components.state_abbreviation or "").strip().upper() if components else ""
+            if smarty_state and notice_state and smarty_state != notice_state:
                 logger.warning(
-                    "Smarty returned %s for '%s' -- keeping original",
-                    components.state_abbreviation,
-                    notice.address,
+                    "Smarty returned %s for '%s' (expected %s) -- keeping original",
+                    smarty_state, notice.address, notice_state,
                 )
                 failed += 1
                 continue
@@ -318,7 +406,9 @@ def retry_with_geocoded_city(
             metadata = candidate.metadata
             analysis = candidate.analysis
 
-            if components and components.state_abbreviation and components.state_abbreviation != "TN":
+            notice_state = (notice.state or "").strip().upper()
+            smarty_state = (components.state_abbreviation or "").strip().upper() if components else ""
+            if smarty_state and notice_state and smarty_state != notice_state:
                 failed += 1
                 continue
 

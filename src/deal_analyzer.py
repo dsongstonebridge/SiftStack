@@ -37,7 +37,8 @@ DEFAULT_INSURANCE_MONTHLY = 150.0
 DEFAULT_UTILITIES_MONTHLY = 200.0
 DEFAULT_AGENT_COMMISSION = 0.06    # 6% (3% buyer + 3% seller)
 DEFAULT_CLOSING_COSTS_PCT = 0.025  # 2.5% of sale price
-DEFAULT_TRANSFER_TAX_PCT = 0.0037  # TN transfer tax: $0.37 per $100
+TRANSFER_TAX_BY_STATE = {"TN": 0.0037, "OK": 0.0015}  # TN: $0.37/$100, OK: $0.75/$500
+DEFAULT_TRANSFER_TAX_PCT = 0.0037  # fallback if state unknown
 DEFAULT_WHOLESALE_FEE = 10000.0
 DEFAULT_FLIP_RULE = 0.75           # 75% Rule: MAO = ARV × 0.75 - rehab
 DEFAULT_WHOLESALE_RULE = 0.70      # 70% Rule for wholesale
@@ -675,7 +676,7 @@ def generate_deal_report(pkg: DealPackage, output_path: str = "") -> str:
 
 # ── Main entry point ──────────────────────────────────────────────────
 
-def run_deal_analysis(address: str, city: str = "", state: str = "TN",
+def run_deal_analysis(address: str, city: str = "", state: str = "",
                       zip_code: str = "", purchase_price: float = 0,
                       rehab_tier: int = 2, exit_strategy: str = "flip",
                       region: str = DEFAULT_REGION,

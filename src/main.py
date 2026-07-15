@@ -51,8 +51,13 @@ def _filter_searches(
 # ── Preflight health checks ─────────────────────────────────────────
 
 
-def _preflight_check(mode: str) -> list[str]:
+def _preflight_check(mode: str, searches: list[SavedSearch] | None = None) -> list[str]:
     """Verify required API keys and service connectivity before running.
+
+    Args:
+        searches: Filtered search list for this run. When provided, credential
+                  checks are scoped to the sources actually in use so that an
+                  Oklahoma-only run doesn't fail on missing TN credentials.
 
     Returns a list of failure descriptions. Empty list = all checks passed.
     """
@@ -64,10 +69,15 @@ def _preflight_check(mode: str) -> list[str]:
     datasift_modes = {"manage-presets", "manage-sold", "phone-validate"}
 
     if mode in scrape_modes:
-        if not config.TNPN_EMAIL or not config.TNPN_PASSWORD:
-            failures.append("TNPN_EMAIL / TNPN_PASSWORD not set (required for scraping)")
-        if not config.CAPTCHA_API_KEY:
-            failures.append("CAPTCHA_API_KEY not set (CAPTCHA solving will fail)")
+        # Only require TNPN creds when tnpn-source searches are in scope.
+        # OK searches (OSCN, TinStar) are public and need no credentials.
+        active = searches if searches is not None else list(SAVED_SEARCHES)
+        has_tnpn = any(s.source == "tnpn" for s in active)
+        if has_tnpn:
+            if not config.TNPN_EMAIL or not config.TNPN_PASSWORD:
+                failures.append("TNPN_EMAIL / TNPN_PASSWORD not set (required for TN scraping)")
+            if not config.CAPTCHA_API_KEY:
+                failures.append("CAPTCHA_API_KEY not set (CAPTCHA solving will fail)")
 
     if mode in enrichment_modes:
         # These are warnings, not blockers — pipeline degrades gracefully
@@ -90,8 +100,8 @@ def _preflight_check(mode: str) -> list[str]:
         if not config.TRESTLE_API_KEY:
             failures.append("TRESTLE_API_KEY not set (required for phone validation)")
 
-    # ── Connectivity checks (only for scrape modes) ─────────────────
-    if mode in scrape_modes:
+    # ── Connectivity checks (only for TN scrape modes) ─────────────
+    if mode in scrape_modes and has_tnpn:
         import requests as _requests
         try:
             resp = _requests.head(config.BASE_URL, timeout=10, allow_redirects=True)
@@ -100,8 +110,8 @@ def _preflight_check(mode: str) -> list[str]:
         except Exception as e:
             failures.append(f"Cannot reach tnpublicnotice.com: {e}")
 
-    # ── 2Captcha balance check ──────────────────────────────────────
-    if mode in scrape_modes and config.CAPTCHA_API_KEY:
+    # ── 2Captcha balance check (TN only) ───────────────────────────
+    if mode in scrape_modes and has_tnpn and config.CAPTCHA_API_KEY:
         import requests as _requests
         try:
             resp = _requests.get(
@@ -473,7 +483,7 @@ async def actor_main() -> None:
             try:
                 from datasift_formatter import write_datasift_split_csvs
 
-                csv_infos = write_datasift_split_csvs(notices)
+                csv_infos = write_datasift_split_csvs(notices, source_label=mode)
                 kvs = await Actor.open_key_value_store()
                 for info in csv_infos:
                     key = f"datasift_{info['label'].lower().replace(' ', '_')}.csv"
@@ -593,6 +603,73 @@ def setup_logging(verbose: bool = False) -> None:
     logging.info("Logging to %s", log_file)
 
 
+def _upload_notices_to_datasift(notices: list, args, source_label: str = "") -> dict | None:
+    """Format notices as DataSift-ready CSV(s) and upload, if --upload-datasift set.
+
+    Shared by every ingestion path (scrape, PDF import, photo import,
+    dropbox watch, csv-import, obituary pre-probate) so no scraper we build
+    can silently skip DataSift's Notes/Tags/Call Prep formatting the way
+    pdf-import and photo-import previously did.
+
+    Args:
+        notices: Enriched NoticeData records to upload.
+        args: Parsed CLI args.
+        source_label: Scraper/source name (e.g. "acclaim", "oscn",
+            "preprobate_obituary", "pdf_import") embedded in the generated
+            filenames so every DataSift-ready CSV is traceable to its source.
+
+    Returns the upload result dict, or None if --upload-datasift wasn't set.
+    """
+    if not getattr(args, "upload_datasift", False):
+        return None
+
+    from datasift_formatter import write_datasift_split_csvs
+
+    csv_infos = write_datasift_split_csvs(notices, source_label=source_label)
+    for info in csv_infos:
+        logging.info("DataSift CSV (%s): %s", info["label"], info["path"])
+
+    if getattr(args, "csv_only", False):
+        logging.info(
+            "--csv-only set — DataSift CSV(s) generated, skipping automated "
+            "Playwright upload. Upload manually."
+        )
+        return {"success": None, "message": "CSV generated; automated upload skipped (--csv-only)"}
+
+    from datasift_uploader import upload_datasift_split, upload_to_datasift
+
+    do_enrich = not getattr(args, "no_enrich", False)
+    do_skip_trace = not getattr(args, "no_skip_trace", False)
+    update_list = getattr(args, "datasift_update_list", None)
+    ds_mode = "update" if update_list else "add"
+
+    if len(csv_infos) > 1:
+        upload_result = asyncio.run(
+            upload_datasift_split(csv_infos, enrich=do_enrich, skip_trace=do_skip_trace)
+        )
+    else:
+        upload_result = asyncio.run(
+            upload_to_datasift(
+                csv_infos[0]["path"],
+                enrich=do_enrich,
+                skip_trace=do_skip_trace,
+                mode=ds_mode,
+                list_name=update_list,
+            )
+        )
+
+    if upload_result.get("success"):
+        logging.info("DataSift upload: %s", upload_result.get("message", "OK"))
+        if upload_result.get("enrich_result"):
+            logging.info("  Enrich: %s", upload_result["enrich_result"].get("message", ""))
+        if upload_result.get("skip_trace_result"):
+            logging.info("  Skip trace: %s", upload_result["skip_trace_result"].get("message", ""))
+    else:
+        logging.error("DataSift upload failed: %s", upload_result.get("message"))
+
+    return upload_result
+
+
 def _run_pdf_import(args) -> None:
     """Run the PDF import pipeline: OCR → parse → enrich → CSV."""
     from pdf_importer import process_pdf
@@ -658,6 +735,8 @@ def _run_pdf_import(args) -> None:
     filename = f"{county.lower()}_tax_sale_{timestamp}.csv"
     path = write_csv(notices, filename=filename)
     logging.info("Output: %s", path)
+
+    _upload_notices_to_datasift(notices, args, source_label=f"pdf_import_{county.lower()}")
     logging.info("Done — %d records exported", len(notices))
 
 
@@ -734,6 +813,8 @@ def _run_photo_import(args) -> None:
     filename = f"{county.lower()}_{notice_type}_{timestamp}.csv"
     path = write_csv(notices, filename=filename)
     logging.info("Output: %s", path)
+
+    _upload_notices_to_datasift(notices, args, source_label=f"photo_{notice_type}")
     logging.info("Done — %d records exported", len(notices))
 
 
@@ -830,46 +911,36 @@ def _run_csv_import(args) -> None:
         logging.warning("No records remaining after pipeline")
         return
 
+    # Tracerfy batch skip trace (Trestle scoring deferred to phone-validate
+    # post-DataSift step — see feedback-pipeline-order in memory)
+    if not getattr(args, "skip_tracerfy", False) and config.TRACERFY_API_KEY:
+        from tracerfy_skip_tracer import batch_skip_trace
+        tracerfy_stats = batch_skip_trace(notices)
+        if tracerfy_stats.get("credits_exhausted"):
+            logging.error(
+                "TRACERFY OUT OF CREDITS -- skip trace disabled. "
+                "Add credits at https://tracerfy.com/billing"
+            )
+        logging.info(
+            "Tracerfy: %d/%d matched, %d phones, %d emails, $%.2f",
+            tracerfy_stats.get("matched", 0), tracerfy_stats.get("submitted", 0),
+            tracerfy_stats.get("phones_found", 0), tracerfy_stats.get("emails_found", 0),
+            tracerfy_stats.get("cost", 0.0),
+        )
+
     # Write output
     timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     filename = f"{csv_paths[0].stem}_reimport_{timestamp}.csv"
     path = write_csv(notices, filename=filename)
     logging.info("Output: %s", path)
 
-    # DataSift upload (same logic as daily/historical mode)
-    if getattr(args, "upload_datasift", False):
-        from datasift_formatter import write_datasift_split_csvs
-        from datasift_uploader import upload_datasift_split, upload_to_datasift
+    # Derive a clean source label from the input filename for the DataSift
+    # CSV name, e.g. "acclaim_consolidated_2026-07-09" -> "acclaim_consolidated"
+    import re as _re_label
+    csv_label = _re_label.sub(r"_\d{4}-\d{2}-\d{2}(_\d{6})?$", "", csv_paths[0].stem)
+    csv_label = _re_label.sub(r"_(FINAL|reimport)$", "", csv_label, flags=_re_label.IGNORECASE)
 
-        do_enrich = not getattr(args, "no_enrich", False)
-        do_skip_trace = not getattr(args, "no_skip_trace", False)
-
-        csv_infos = write_datasift_split_csvs(notices)
-        for info in csv_infos:
-            logging.info("DataSift CSV (%s): %s", info["label"], info["path"])
-
-        if len(csv_infos) > 1:
-            upload_result = asyncio.run(
-                upload_datasift_split(
-                    csv_infos,
-                    enrich=do_enrich,
-                    skip_trace=do_skip_trace,
-                )
-            )
-        else:
-            upload_result = asyncio.run(
-                upload_to_datasift(
-                    csv_infos[0]["path"],
-                    enrich=do_enrich,
-                    skip_trace=do_skip_trace,
-                )
-            )
-
-        if upload_result.get("success"):
-            logging.info("DataSift upload: %s", upload_result.get("message", "OK"))
-        else:
-            logging.error("DataSift upload failed: %s", upload_result.get("message"))
-
+    _upload_notices_to_datasift(notices, args, source_label=csv_label)
     logging.info("Done — %d records exported", len(notices))
 
 
@@ -916,6 +987,8 @@ def _run_phone_validate(args) -> None:
     # Full validation workflow
     from datasift_uploader import run_phone_validation_workflow
 
+    run_csv = getattr(args, "run_csv", None)
+
     result = asyncio.run(run_phone_validation_workflow(
         list_name=list_name,
         preset_folder=preset_folder,
@@ -926,6 +999,7 @@ def _run_phone_validate(args) -> None:
         tiers=tiers,
         add_litigator=getattr(args, "add_litigator", False),
         batch_size=getattr(args, "batch_size", 10),
+        run_csv=run_csv,
     ))
 
     if result.get("success"):
@@ -935,11 +1009,594 @@ def _run_phone_validate(args) -> None:
             logging.info("  Results: %d scored, %d errors", vr.get("results_count", 0), vr.get("errors_count", 0))
             for tag, count in vr.get("tier_counts", {}).items():
                 logging.info("    %s: %d", tag, count)
+        if result.get("run_tag_csv"):
+            logging.info("  Run-specific tags: %s", result["run_tag_csv"])
         if result.get("upload_result"):
             logging.info("  Tag upload: %s", result["upload_result"].get("message", ""))
     else:
         logging.error("Phone validation failed: %s", result.get("message"))
         sys.exit(1)
+
+
+def _run_daily_obits(args) -> None:
+    """Run the pre-probate obituary pipeline.
+
+    Scrapes Tulsa obituaries -> Assessor lookup (property owner?) ->
+    LLM heir parsing -> enrichment -> CSV output.
+    """
+    from tulsa_assessor import lookup_addresses_tulsa
+    from enrichment_pipeline import run_enrichment_pipeline, PipelineOptions
+
+    # Step 1: Scrape direct funeral home sites (complete heir data from day 1, no delay needed)
+    import asyncio as _asyncio
+    from funeral_home_scraper import scrape_all_funeral_homes, FUNERAL_HOMES, _SEEN_FILE, _load_seen, _save_seen
+    headless = not getattr(args, "headed", False)
+
+    # --rescrape: remove today's entries from the seen file so this run
+    # re-processes all obituaries scraped earlier today.
+    if getattr(args, "rescrape", False):
+        import json as _json
+        from datetime import datetime as _dt
+        today = _dt.now().strftime("%Y-%m-%d")
+        seen = _load_seen()
+        before = len(seen)
+        seen = {url: dt for url, dt in seen.items() if dt != today}
+        _save_seen(seen)
+        cleared = before - len(seen)
+        logging.info("--rescrape: cleared %d today's seen entries (%d remaining)", cleared, len(seen))
+
+    logging.info("Scraping direct funeral home sites (%d configured)...", len(FUNERAL_HOMES))
+    obits = _asyncio.run(scrape_all_funeral_homes(headless=headless))
+    logging.info("Funeral homes: %d new obituaries", len(obits))
+
+    if not obits:
+        logging.warning("No new obituaries found across funeral home sites")
+        return
+
+    # Drop obituaries with no survived-by text — without heir info we have no
+    # one to contact and no DM to corroborate the Assessor property match.
+    obits_with_heirs = [o for o in obits if o.get("survived_by_raw", "").strip()]
+    dropped_no_heirs = len(obits) - len(obits_with_heirs)
+    if dropped_no_heirs:
+        logging.info(
+            "Dropped %d obituaries with no survived-by text (%d remaining)",
+            dropped_no_heirs, len(obits_with_heirs),
+        )
+    obits = obits_with_heirs
+    if not obits:
+        logging.warning("No obituaries with heir information — nothing to process")
+        return
+
+    property_owners = resolve_obit_leads(obits, headless=headless)
+    if not property_owners:
+        return
+
+    # Step 4: Run enrichment pipeline
+    logging.info("Running enrichment on %d pre-probate leads...", len(property_owners))
+    skip_zillow = getattr(args, "skip_zillow", False)
+    skip_tracerfy = getattr(args, "skip_tracerfy", False)
+
+    skip_smarty = getattr(args, "skip_smarty", False)
+
+    opts = PipelineOptions(
+        skip_smarty=skip_smarty,
+        skip_zillow=skip_zillow,
+        skip_obituary=True,  # already have DOD + heirs from obituary
+        skip_tax=True,
+        skip_entity_filter=False,
+        source_label="daily-obits",
+    )
+    enriched = run_enrichment_pipeline(property_owners, opts)
+
+    if not enriched:
+        logging.warning("No records after enrichment")
+        return
+
+    # Step 5: Tracerfy skip trace the HEIR, not the deceased
+    if not skip_tracerfy and config.TRACERFY_API_KEY:
+        from tracerfy_skip_tracer import batch_skip_trace
+        tracerfy_stats = batch_skip_trace(enriched)
+        logging.info(
+            "Tracerfy: %d/%d matched, %d phones, %d emails, $%.2f",
+            tracerfy_stats.get("matched", 0), tracerfy_stats.get("submitted", 0),
+            tracerfy_stats.get("phones_found", 0), tracerfy_stats.get("emails_found", 0),
+            tracerfy_stats.get("cost", 0.0),
+        )
+
+    # Step 6: Write output CSV
+    from data_formatter import write_csv
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    csv_path = config.OUTPUT_DIR / ("ok_obits_preprobate_%s.csv" % timestamp)
+
+    # Pre-probate/obituary tags (Pre-Probate, obituary, county, month, deceased,
+    # dm_*, no_heirs, needs_deep_prospecting, etc.) are generated by
+    # datasift_formatter._build_tags() -- called automatically for both this
+    # raw CSV's "Tags" column and the DataSift-ready CSV below. Don't set
+    # notice.tags by hand here; it's never read back out.
+
+    write_csv(enriched, csv_path)
+    logging.info("Output: %s (%d pre-probate leads)", csv_path, len(enriched))
+
+    # DataSift upload (same logic as every other ingestion path) -- previously
+    # this mode only ever wrote the raw CSV, so obituary/pre-probate leads
+    # never got a DataSift-formatted Notes/Tags upload (Message Board content,
+    # Call Prep, needs_deep_prospecting, etc.) unless someone manually ran
+    # csv-import afterward.
+    _upload_notices_to_datasift(enriched, args, source_label="preprobate_obituary")
+
+    # Summary
+    logging.info("== Pre-Probate Obituary Summary ==")
+    logging.info("  Obituaries scraped: %d (direct funeral homes)", len(obits))
+    logging.info("  Property owners: %d", len(property_owners))
+    logging.info("  After enrichment: %d", len(enriched))
+    with_dm = sum(1 for n in enriched if n.decision_maker_name)
+    logging.info("  With decision maker: %d", with_dm)
+
+
+def resolve_obit_leads(
+    obits: list[dict], headless: bool = True, apply_buy_box: bool = True,
+) -> list["NoticeData"]:
+    """Resolve a list of scraped obituary dicts into property-owning leads with a DM.
+
+    Shared by _run_daily_obits and any one-off rerun script that gathers its
+    own `obits` list (e.g. re-fetching specific historical obituaries) —
+    keeps the Assessor lookup + decision-maker resolution logic in one place.
+
+    Steps: build NoticeData -> pre-seed DM from obituary -> Assessor address
+    lookup -> drop non-owners -> buy box filter -> DM resolution (obituary
+    text first, Assessor co-owner fallback, spouse last-name fill / SUSPECT
+    swap).
+
+    apply_buy_box: set False to keep records that fail the buy-box filter
+    (e.g. an operator has manually decided a specific lead is worth pursuing
+    despite failing sqft/year-built/type criteria).
+    """
+    from tulsa_assessor import lookup_addresses_tulsa
+
+    # Step 2: Search Assessor for each deceased — do they own property?
+    logging.info("Checking %d deceased for property ownership...", len(obits))
+    notices = []
+    from notice_parser import NoticeData
+    for obit in obits:
+        name = obit["name"]
+        dod = obit.get("date_of_death", "")
+        age = obit.get("age")
+
+        # Prefix source_url so datasift_formatter._build_tags() detects
+        # this as a pre-probate obituary record (not a court-filed probate)
+        # and applies Pre-Probate + obituary tags instead of "probate".
+        detail_url = obit.get("detail_url", "")
+        source = obit.get("source", "")
+        if source == "funeral_home_direct" and detail_url:
+            source_url = "funeral_home_direct:" + detail_url
+        else:
+            source_url = detail_url
+
+        n = NoticeData(
+            date_added=datetime.now().strftime("%Y-%m-%d"),
+            owner_name=name,
+            decedent_name=name,
+            notice_type="probate",
+            county="Tulsa",
+            state="OK",
+            source_url=source_url,
+            obituary_url=detail_url,
+            owner_deceased="yes",
+            date_of_death=dod,
+        )
+        n._obit_data = obit
+        notices.append(n)
+
+    # Step 1.5: Pre-seed DM from obituary BEFORE Assessor lookup so _dm_corroborates
+    # can pick the correct property when multiple records exist for the same surname.
+    # This also becomes the FINAL DM — Step 3 won't override it (obituary = authoritative
+    # for who is living; Assessor deed can be years out of date with deceased co-owners).
+    for n in notices:
+        obit_pre = getattr(n, "_obit_data", {})
+        survived_pre = obit_pre.get("survived_by_raw", "")
+        if survived_pre and not n.decision_maker_name:
+            heir_pre = _parse_heirs_from_obituary(survived_pre, n.owner_name or "")
+            n._heir_parse_result = heir_pre  # preserve all_heirs for Step 3 SUSPECT swap
+            if heir_pre.get("dm_name"):
+                n.decision_maker_name = heir_pre["dm_name"]
+                n.decision_maker_relationship = heir_pre.get("dm_relationship", "")
+
+    # Run Assessor lookup to find property addresses
+    import asyncio
+    lookup_result = asyncio.run(lookup_addresses_tulsa(notices, headless=headless))
+    found_count = lookup_result[0] if isinstance(lookup_result, tuple) else lookup_result
+    logging.info("Assessor: %d/%d deceased owned property", found_count, len(notices))
+
+    # Keep only records where an address was confirmed by Assessor.
+    # Records dropped here are either renters, out-of-county owners, or
+    # non-spousal DM cases where all Assessor records had unmatched co-owners
+    # (can't confirm the right property — better to drop than mail wrong house).
+    property_owners = [n for n in notices if n.address and n.address.strip()]
+    no_property = len(notices) - len(property_owners)
+    if no_property:
+        logging.info(
+            "Dropped %d deceased with no confirmed property "
+            "(renters, out-of-county, or unconfirmed co-owner)",
+            no_property,
+        )
+
+    if not property_owners:
+        logging.warning("No property-owning deceased found in obituaries")
+        return []
+
+    # Buy box filter — shared logic from enrichment_pipeline
+    if apply_buy_box:
+        from enrichment_pipeline import filter_buy_box
+        property_owners = filter_buy_box(property_owners)
+        if not property_owners:
+            logging.warning("No records passed buy box filter")
+            return []
+
+    # Ensure owner_name is populated (Assessor lookup may have left it blank)
+    for n in property_owners:
+        if not n.owner_name and n.decedent_name:
+            n.owner_name = n.decedent_name
+
+    # Step 3: Identify decision maker — obituary text first, Assessor co-owner as fallback.
+    # The obituary "survived by" text is the authoritative source for who is ALIVE.
+    # The Assessor deed can be years out of date (deceased spouses stay on deeds).
+    # Only use Assessor co-owner when obituary gave us nothing.
+    import re as _re
+    for n in property_owners:
+        # Priority 1: obituary text — most reliable for living heirs
+        if not n.decision_maker_name:
+            obit = getattr(n, "_obit_data", {})
+            survived_by = obit.get("survived_by_raw", "")
+            if survived_by:
+                heir_info = _parse_heirs_from_obituary(survived_by, n.owner_name or n.decedent_name)
+                if heir_info.get("dm_name"):
+                    n.decision_maker_name = heir_info["dm_name"]
+                    n.decision_maker_relationship = heir_info.get("dm_relationship", "")
+                    n.dm_confidence = heir_info.get("confidence", "")
+                    n.dm_confidence_reason = "obituary"
+                    logging.info("  %s -> DM (obituary): %s (%s)",
+                                 n.owner_name or n.decedent_name,
+                                 n.decision_maker_name,
+                                 n.decision_maker_relationship)
+
+        # Priority 2: Assessor co-owner — only when obituary gave us nothing
+        # e.g. obituary has no "survived by" section but deed shows joint ownership
+        tax_name = n.tax_owner_name or ""
+        co_owner_match = _re.search(r"\s+(?:&|AND)\s+(.+?)(?:\s+(?:TTEE|TRUST|REV\b|ET\s|CO\s)|$)",
+                                    tax_name, _re.IGNORECASE)
+        if co_owner_match and not n.decision_maker_name:
+            co_raw = co_owner_match.group(1).strip().title()
+            deceased_name_raw = n.owner_name or n.decedent_name or ""
+            deceased_last = deceased_name_raw.strip().split()[-1] if deceased_name_raw else ""
+            deceased_first = deceased_name_raw.strip().split()[0].upper() if deceased_name_raw else ""
+            co_parts = co_raw.split()
+
+            # If the co-owner IS the deceased (deceased listed 2nd on deed, e.g.
+            # "MOORE, BILLY JAMES AND DONNA JEAN" where Donna is the decedent),
+            # flip and use the primary owner (before AND) instead.
+            co_first_upper = co_parts[0].upper() if co_parts else ""
+            if deceased_first and co_first_upper and (
+                deceased_first == co_first_upper
+                or (len(deceased_first) >= 4 and len(co_first_upper) >= 4
+                    and deceased_first[:4] == co_first_upper[:4])
+            ):
+                primary_m = _re.match(r"^(.+?)\s+(?:&|AND)\s+", tax_name, _re.IGNORECASE)
+                if primary_m:
+                    praw = primary_m.group(1).strip()
+                    if "," in praw:
+                        last_p, first_p = praw.split(",", 1)
+                        praw = first_p.strip() + " " + last_p.strip()
+                    co_raw = praw.title()
+                    co_parts = co_raw.split()
+                    logging.debug(
+                        "  %s: deceased listed 2nd on deed — using primary owner '%s'",
+                        deceased_name_raw, co_raw,
+                    )
+
+            # "CHELSI J" or "CHELSI" → no real last name; resolve to full name.
+            # "CHELSI JOHNSON" (last name 3+ chars) → keep as-is.
+            has_real_last = len(co_parts) >= 2 and len(co_parts[-1]) >= 3
+            if not has_real_last:
+                co_first = co_parts[0]
+                # Search the obituary's survived_by text for "{co_first} LastName"
+                obit_data = getattr(n, "_obit_data", {})
+                obit_survived = obit_data.get("survived_by_raw", "") or ""
+                stop_words = {"the", "and", "his", "her", "with", "who", "their",
+                              "that", "this", "from", "was", "are", "for", "she"}
+                full_match = _re.search(
+                    r'\b' + _re.escape(co_first) + r'\s+([A-Z][a-z]{2,})\b',
+                    obit_survived, _re.IGNORECASE,
+                )
+                if full_match and full_match.group(1).lower() not in stop_words:
+                    co_raw = co_first + " " + full_match.group(1).title()
+                elif deceased_last:
+                    co_raw = co_first + " " + deceased_last.title()
+            n.decision_maker_name = co_raw
+            n.decision_maker_relationship = "spouse"
+            n.dm_confidence = "high"
+            n.dm_confidence_reason = "assessor_co_owner"
+            logging.info("  %s -> DM (Assessor co-owner): %s", n.owner_name or n.decedent_name, co_raw)
+
+        # Step 3b: spouse last-name fill + SUSPECT swap.
+        # We now know the Assessor result, so we can make better decisions:
+        #   corr=False  → spouse NOT on deed (likely remarried) → try child swap, no last-name fill
+        #   corr=None   → sole owner (no co-owner to check)     → original spouse assumed, fill last name
+        #   corr=True   → spouse confirmed on deed              → fill last name
+        if n.decision_maker_relationship == "spouse":
+            from tulsa_assessor import _dm_corroborates
+            corr = _dm_corroborates(n.tax_owner_name or "", n.decision_maker_name)
+            heir_result = getattr(n, "_heir_parse_result", {})
+            all_heirs = heir_result.get("all_heirs") or []
+            deceased_surname = (n.owner_name or n.decedent_name or "").strip().split()
+            deceased_surname = deceased_surname[-1].upper() if deceased_surname else ""
+
+            if corr is False:
+                # Spouse not on deed — likely remarried. Prefer a same-surname child.
+                swapped = False
+                for heir in all_heirs:
+                    heir_clean = _clean_dm_name_from_obit(heir)
+                    if not heir_clean:
+                        continue
+                    heir_parts = heir_clean.strip().split()
+                    if (len(heir_parts) >= 2
+                            and deceased_surname
+                            and heir_parts[-1].upper() == deceased_surname):
+                        logging.info(
+                            "  %s -> SUSPECT spouse '%s' swapped to child '%s' "
+                            "(spouse not on Assessor deed, likely remarried)",
+                            n.owner_name or n.decedent_name,
+                            n.decision_maker_name, heir_clean,
+                        )
+                        n.decision_maker_name = heir_clean
+                        n.decision_maker_relationship = "child"
+                        n.dm_confidence = "medium"
+                        n.dm_confidence_reason = "suspect_spouse_swap"
+                        swapped = True
+                        break
+                if not swapped:
+                    logging.info(
+                        "  %s -> SUSPECT spouse '%s' — no same-surname child in all_heirs, "
+                        "keeping spouse (no last-name fill — may be remarried)",
+                        n.owner_name or n.decedent_name, n.decision_maker_name,
+                    )
+            else:
+                # corr=True (on deed) or corr=None (sole owner) — original spouse, fill last name
+                dm_parts = n.decision_maker_name.strip().split()
+                if len(dm_parts) == 1 and deceased_surname and len(deceased_surname) > 2:
+                    n.decision_maker_name = f"{dm_parts[0]} {deceased_surname.title()}"
+                    logging.info(
+                        "  %s -> spouse '%s' last name filled from deceased surname",
+                        n.owner_name or n.decedent_name, n.decision_maker_name,
+                    )
+
+    return property_owners
+
+
+_OBIT_JUNK_WORDS = frozenset({
+    "of", "his", "her", "the", "a", "an", "their", "and", "or", "with",
+    "by", "in", "on", "at", "to", "from", "as", "is", "was", "are", "were",
+    "wife", "husband", "mother", "father", "son", "daughter", "child",
+    "children", "sibling", "brother", "sister", "parent", "survivor",
+    "survived", "also", "one", "two", "three", "four", "five",
+})
+
+
+def _clean_dm_name_from_obit(name: str) -> str:
+    """Strip location/extra phrases from an obituary-parsed DM name.
+
+    'Carisa of Collinsville'  -> 'Carisa'   (location phrase)
+    'Tommy Goad and Michelle' -> 'Tommy Goad'  (joint DMs)
+    'Rachel Tatro of Tulsa, OK' -> 'Rachel Tatro'
+    'Debbie Denton of'        -> 'Debbie Denton'  (trailing junk word)
+    'Terri Jean Hozhabri'     -> 'Terri Hozhabri'  (drop middle name, keep first+last)
+    'of'  -> ''  (LLM hallucination — function word, not a name)
+    """
+    import re as _re
+    if not name:
+        return name
+    # Strip " of [CityName]" and anything after
+    name = _re.sub(r"\s+of\s+[A-Z][A-Za-z]+.*$", "", name).strip()
+    # Strip " and ..." suffix (joint/multiple DMs — keep only first)
+    name = _re.sub(r"\s+and\s+.*$", "", name, flags=_re.IGNORECASE).strip()
+    # Strip trailing junk words ("Debbie Denton of" → "Debbie Denton")
+    name = _re.sub(r"\s+\b(?:of|and|the|a|an|his|her)\b\s*$", "", name, flags=_re.IGNORECASE).strip()
+    # Strip trailing comma/punctuation
+    name = name.rstrip(",.;").strip()
+    words = name.split()
+    if not words:
+        return ""
+    # Expand CamelCase-fused tokens before further checks.
+    # "JeanHozhabri" → ["Jean", "Hozhabri"]; skips Mc/Mac prefixes (McDonald, MacPherson).
+    _MC_MAC = _re.compile(r"^(?:Mc|Mac)[A-Z]")
+    expanded = []
+    for w in words:
+        parts = _re.findall(r"[A-Z][a-z]{2,}", w) if w and w[0].isupper() else []
+        if len(parts) >= 2 and "".join(parts) == w and not _MC_MAC.match(w):
+            expanded.extend(parts)
+        else:
+            expanded.append(w)
+    words = expanded
+    # Reject any name whose first word is a function/relation word — the LLM
+    # extracted a phrase instead of a person's name ("of almost", "of 38 years")
+    if words[0].lower() in _OBIT_JUNK_WORDS:
+        return ""
+    # Reject single tokens under 3 chars
+    if len(words) == 1 and len(words[0]) <= 2:
+        return ""
+    # Normalize 3-word names to first + last (drop middle name).
+    # "Terri Jean Hozhabri" → "Terri Hozhabri"; "Mary Louise Johnson" → "Mary Johnson".
+    if len(words) == 3:
+        name = f"{words[0]} {words[2]}"
+    else:
+        name = " ".join(words)
+    return name
+
+
+def _fill_spouse_lastname(result: dict, deceased_name: str) -> dict:
+    """If a spouse was extracted with only a first name, append the deceased's last name.
+
+    'Donna' + deceased 'Jay Crabb' -> 'Donna Crabb'
+    Only applies when relationship == 'spouse' and dm_name is a single word.
+    """
+    if result.get("dm_relationship") != "spouse":
+        return result
+    dm = (result.get("dm_name") or "").strip()
+    if not dm or len(dm.split()) >= 2:
+        return result  # already has last name
+    deceased_parts = deceased_name.strip().split()
+    if not deceased_parts:
+        return result
+    deceased_last = deceased_parts[-1]
+    if deceased_last.lower() in _OBIT_JUNK_WORDS or len(deceased_last) <= 2:
+        return result
+    result["dm_name"] = f"{dm} {deceased_last}"
+    return result
+
+
+def _parse_heirs_from_obituary(survived_by: str, deceased_name: str) -> dict:
+    """Extract the best decision maker from 'survived by' text.
+
+    Returns dict with dm_name, dm_relationship, confidence.
+    Uses regex for now; LLM parsing available when ANTHROPIC_API_KEY is set.
+    """
+    import re as _re
+
+    result = {"dm_name": "", "dm_relationship": "", "confidence": ""}
+
+    if not survived_by:
+        return result
+
+    text = survived_by
+
+    # Try LLM parsing first if available
+    if config.ANTHROPIC_API_KEY and config.ANTHROPIC_API_KEY != "sk-ant-api03-your-key-here":
+        llm_result = _llm_parse_heirs(text, deceased_name)
+        if llm_result:
+            llm_result["dm_name"] = _clean_dm_name_from_obit(llm_result.get("dm_name", ""))
+            # If LLM chose a spouse (first-name-only) but there's a full-name child
+            # with the deceased's last name in all_heirs, prefer that child.
+            # Guards against in-laws: Bryan (Crabb) has a DIFFERENT last name from Jay Crabb,
+            # so he won't displace Donna (spouse). But a "Moore, William" child would beat Maurice.
+            if llm_result.get("dm_relationship") == "spouse":
+                all_heirs = llm_result.get("all_heirs") or []
+                dm_parts = (llm_result.get("dm_name") or "").strip().split()
+                deceased_surname = deceased_name.strip().split()[-1].upper() if deceased_name.strip() else ""
+                for heir in all_heirs:
+                    heir_clean = _clean_dm_name_from_obit(heir)
+                    if not heir_clean:
+                        continue
+                    heir_parts = heir_clean.strip().split()
+                    heir_surname = heir_parts[-1].upper() if heir_parts else ""
+                    # Full-name child sharing deceased's surname beats a spouse with no last name
+                    if (len(heir_parts) >= 2
+                            and len(dm_parts) < 2
+                            and deceased_surname
+                            and heir_surname == deceased_surname):
+                        llm_result["dm_name"] = heir_clean
+                        llm_result["dm_relationship"] = "child"
+                        llm_result["confidence"] = "medium"
+                        break
+            return llm_result
+
+    # Regex fallback: look for spouse first, then children
+    # "his wife, Sandra" / "her beloved wife, Donna" / "her husband, John"
+    # Limit to 0-2 words between pronoun and wife/husband — prevents matching
+    # "his children Nicole Hooper and husband James" where James is a son-in-law.
+    # Require "his/her" pronoun — the bare "husband/wife" pattern caused false
+    # positives on "Nicole Hooper and husband James" (son-in-law in children list).
+    spouse_patterns = [
+        _re.compile(r"(?:his|her)\s+(?:\w+\s+){0,2}(?:wife|husband|spouse),?\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)", _re.IGNORECASE),
+    ]
+    for pat in spouse_patterns:
+        m = pat.search(text)
+        if m:
+            result["dm_name"] = _clean_dm_name_from_obit(m.group(1).strip())
+            result["dm_relationship"] = "spouse"
+            result["confidence"] = "high"
+            return result
+
+    # Children: "his daughter Rachel Tatro" / "her son Michael"
+    child_patterns = [
+        _re.compile(r"(?:his|her)\s+(?:daughter|son),?\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)", _re.IGNORECASE),
+        _re.compile(r"(?:children|sons|daughters),?\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)", _re.IGNORECASE),
+    ]
+    for pat in child_patterns:
+        m = pat.search(text)
+        if m:
+            result["dm_name"] = _clean_dm_name_from_obit(m.group(1).strip())
+            result["dm_relationship"] = "child"
+            result["confidence"] = "medium"
+            return result
+
+    # Sibling: "his sister Teresa" / "her brother Dean"
+    sibling_patterns = [
+        _re.compile(r"(?:his|her)\s+(?:sister|brother),?\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)", _re.IGNORECASE),
+    ]
+    for pat in sibling_patterns:
+        m = pat.search(text)
+        if m:
+            result["dm_name"] = _clean_dm_name_from_obit(m.group(1).strip())
+            result["dm_relationship"] = "sibling"
+            result["confidence"] = "low"
+            return result
+
+    # Parents: "his parents, Charles Leroy Martin and Ella Darlene Martin"
+    parent_patterns = [
+        _re.compile(r"(?:his|her)\s+parents?,?\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)", _re.IGNORECASE),
+    ]
+    for pat in parent_patterns:
+        m = pat.search(text)
+        if m:
+            result["dm_name"] = _clean_dm_name_from_obit(m.group(1).strip())
+            result["dm_relationship"] = "parent"
+            result["confidence"] = "low"
+            return result
+
+    return result
+
+
+def _llm_parse_heirs(survived_by_text: str, deceased_name: str) -> Optional[dict]:
+    """Use Claude Haiku to parse structured heir data from obituary text."""
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
+
+        prompt = (
+            "From this obituary excerpt, identify the best person to contact about "
+            "selling the deceased's property. Priority: spouse > adult child > sibling > parent.\n\n"
+            "Deceased: %s\n\n"
+            "Obituary 'survived by' text: %s\n\n"
+            "Rules:\n"
+            "- dm_name MUST be an actual person's name (first name or full name) literally present in the text.\n"
+            "- Do NOT return generic words like 'wife', 'husband', 'of', 'his', 'her', 'children', etc.\n"
+            "- Only use relationship 'spouse' if the text explicitly names a surviving husband or wife.\n"
+            "- If the deceased's spouse is also mentioned as deceased (e.g. 'preceded by his husband'), "
+            "do not list them as a survivor — list the children instead.\n"
+            "- If you cannot find a clear name, return empty string for dm_name.\n"
+            "- PRIORITY ORDER: adult child with full name (First Last) who shares the deceased's surname > "
+            "spouse > adult child with only first name > sibling > parent.\n"
+            "- IMPORTANT: When the text says 'X and her husband, Y', 'X and his wife, Y', or "
+            "'X and husband Y' or 'X and wife Y' where X is already identified as a child of the "
+            "deceased, Y is a son-in-law or daughter-in-law — do NOT list Y as the deceased's spouse or DM.\n"
+            "- Example: 'his children Nicole Hooper and husband James' → Nicole Hooper is the child; "
+            "James is Nicole's husband (son-in-law). The deceased has NO surviving spouse listed here.\n"
+            "- Exclude sons-in-law and daughters-in-law entirely.\n\n"
+            "Respond with ONLY a JSON object (no markdown):\n"
+            '{"dm_name": "First Last", "dm_relationship": "spouse|child|sibling|parent", '
+            '"confidence": "high|medium|low", "all_heirs": ["Name1", "Name2"]}'
+        ) % (deceased_name, survived_by_text[:1000])
+
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=200,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        import json
+        text = resp.content[0].text.strip()
+        return json.loads(text)
+    except Exception as e:
+        logging.debug("LLM heir parse failed: %s", e)
+        return None
 
 
 def _run_manage_presets(args) -> None:
@@ -983,6 +1640,59 @@ def _run_manage_presets(args) -> None:
         sys.exit(1)
 
 
+def _run_manage_list(args) -> None:
+    """Trigger enrichment and/or skip trace on an existing DataSift list."""
+    import asyncio as _asyncio
+    from playwright.async_api import async_playwright as _apw
+
+    list_name = getattr(args, "list_name", None)
+    if not list_name:
+        logging.error("--list-name is required for manage-list mode")
+        sys.exit(1)
+
+    do_enrich = not getattr(args, "no_enrich", False)
+    do_skip_trace = not getattr(args, "no_skip_trace", False)
+
+    async def _run():
+        from datasift_core import login
+        from datasift_uploader import enrich_records, skip_trace_records
+
+        async with _apw() as p:
+            browser = await p.chromium.launch(headless=False)
+            context = await browser.new_context(
+                viewport={"width": 1280, "height": 720},
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+            )
+            page = await context.new_page()
+            try:
+                logged_in = await login(page, config.DATASIFT_EMAIL, config.DATASIFT_PASSWORD)
+                if not logged_in:
+                    logging.error("DataSift login failed")
+                    return
+
+                if do_enrich:
+                    result = await enrich_records(page, list_name)
+                    if result.get("success"):
+                        logging.info("Enrichment: %s", result.get("message", "OK"))
+                    else:
+                        logging.error("Enrichment failed: %s", result.get("message"))
+
+                if do_skip_trace:
+                    result = await skip_trace_records(page, list_name)
+                    if result.get("success"):
+                        logging.info("Skip trace: %s", result.get("message", "OK"))
+                    else:
+                        logging.error("Skip trace failed: %s", result.get("message"))
+            finally:
+                await browser.close()
+
+    _asyncio.run(_run())
+
+
 def _run_manage_sold(args) -> None:
     """Run the SiftMap sold properties management workflow."""
     from datasift_uploader import run_manage_sold_workflow
@@ -1017,14 +1727,16 @@ def cli_main() -> None:
         "mode",
         choices=[
             "daily", "historical", "pdf-import", "photo-import", "dropbox-watch",
-            "csv-import", "phone-validate", "manage-sold", "manage-presets",
+            "csv-import", "phone-validate", "manage-sold", "manage-presets", "manage-list",
+            "daily-obits",
             # New analysis & workflow modes
             "comp", "rehab", "analyze-deal", "market-analysis", "buyer-prospect",
             "deep-prospect", "lead-manage", "setup-sequences", "niche-sequential",
             "playbook",
         ],
         help=(
-            "daily/historical = scrape notices; pdf-import/photo-import = import from files; "
+            "daily/historical = scrape notices; daily-obits = pre-probate obituary leads; "
+            "pdf-import/photo-import = import from files; "
             "dropbox-watch = poll Dropbox; csv-import = re-enrich CSV; "
             "phone-validate = Trestle scoring; manage-sold/manage-presets = DataSift ops; "
             "comp = comparable sales ARV; rehab = rehab cost estimate; "
@@ -1056,6 +1768,16 @@ def cli_main() -> None:
         type=str,
         default=None,
         help="Override date cutoff (YYYY-MM-DD). Overrides daily/historical mode logic.",
+    )
+    parser.add_argument(
+        "--force-tax-refresh",
+        action="store_true",
+        help="Ignore cached tax-delinquent scan and do a full re-scan from oktaxrolls.com",
+    )
+    parser.add_argument(
+        "--force-tinstar",
+        action="store_true",
+        help="Run TinStar scraper regardless of day of week (normally Fridays only)",
     )
     parser.add_argument(
         "--max-notices",
@@ -1218,6 +1940,26 @@ def cli_main() -> None:
         help="Skip Tracerfy batch skip trace (phones + emails) before DataSift upload",
     )
     parser.add_argument(
+        "--headed",
+        action="store_true",
+        help="Run browsers in headed (visible) mode — lets you watch every click",
+    )
+    parser.add_argument(
+        "--rescrape",
+        action="store_true",
+        help="daily-obits: clear today's seen-file entries and re-process all obituaries from today",
+    )
+    parser.add_argument(
+        "--skip-acclaim",
+        action="store_true",
+        help="Skip Acclaim (Tulsa County Clerk) scraper — use for daily OSCN-only runs",
+    )
+    parser.add_argument(
+        "--acclaim-only",
+        action="store_true",
+        help="Run Acclaim scraper only — skips OSCN, TinStar, Tulsa World, and tax scraper",
+    )
+    parser.add_argument(
         "--llm-backend",
         choices=["anthropic", "ollama", "openrouter"],
         default=os.getenv("LLM_BACKEND", "anthropic"),
@@ -1248,6 +1990,24 @@ def cli_main() -> None:
         "--upload-datasift",
         action="store_true",
         help="Upload results to DataSift.ai via Playwright (requires DATASIFT_EMAIL/PASSWORD)",
+    )
+    parser.add_argument(
+        "--csv-only",
+        action="store_true",
+        help=(
+            "With --upload-datasift: generate the DataSift-ready CSV(s) but skip the "
+            "automated Playwright upload step. Use while doing manual uploads."
+        ),
+    )
+    parser.add_argument(
+        "--datasift-update-list",
+        metavar="LIST_NAME",
+        default=None,
+        help=(
+            "Use DataSift 'Update Data' mode to update an existing list rather than "
+            "creating a new one. Provide the exact list name, e.g. 'SiftStack 2026-06-12'. "
+            "Prevents duplicate records when re-uploading with fixes."
+        ),
     )
     parser.add_argument(
         "--no-enrich",
@@ -1314,6 +2074,33 @@ def cli_main() -> None:
         "--add-litigator",
         action="store_true",
         help="Include litigator risk check in phone validation (phone-validate mode)",
+    )
+    parser.add_argument(
+        "--run-csv",
+        type=str,
+        default=None,
+        help="Path to current run's output CSV — filters phone tags to only this run's records (phone-validate mode)",
+    )
+
+    # Daily-obits arguments
+    parser.add_argument(
+        "--obit-pages",
+        type=int,
+        default=3,
+        help="Max Echovita listing pages to scrape (20 obits/page, default: 3)",
+    )
+    parser.add_argument(
+        "--obit-days",
+        type=int,
+        default=7,
+        help="Only include obituaries with DOD within this many days (default: 7)",
+    )
+    parser.add_argument(
+        "--obit-min-days",
+        type=int,
+        default=0,
+        help="Skip obituaries newer than this many days (default: 0 = no minimum). "
+             "Use 7 to skip fresh stubs and target 7-14 day window with better heir data.",
     )
 
     # Manage sold arguments
@@ -1454,8 +2241,22 @@ def cli_main() -> None:
 
     setup_logging(args.verbose)
 
+    # ── Early search filtering (needed by preflight) ─────────────────
+    # For scrape modes, filter searches now so preflight can scope its
+    # credential checks to the sources actually in use this run.
+    _early_counties = None
+    _early_types = None
+    if args.mode in {"daily", "historical"}:
+        if args.counties and args.counties.lower() != "all":
+            _early_counties = [c.strip() for c in args.counties.split(",")]
+        if args.types and args.types.lower() != "all":
+            _early_types = [t.strip() for t in args.types.split(",")]
+    _preflight_searches = _filter_searches(_early_counties, _early_types) or None
+    if getattr(args, "acclaim_only", False) and _preflight_searches:
+        _preflight_searches = [s for s in _preflight_searches if s.source == "acclaimed"] or None
+
     # ── Preflight health checks ──────────────────────────────────────
-    preflight_failures = _preflight_check(args.mode)
+    preflight_failures = _preflight_check(args.mode, _preflight_searches)
     if preflight_failures:
         for f in preflight_failures:
             logging.error("Preflight FAILED: %s", f)
@@ -1653,6 +2454,11 @@ def cli_main() -> None:
         _run_manage_presets(args)
         return
 
+    # Manage list mode — enrich/skip-trace an existing DataSift list
+    if args.mode == "manage-list":
+        _run_manage_list(args)
+        return
+
     # Manage sold properties mode — SiftMap workflow
     if args.mode == "manage-sold":
         _run_manage_sold(args)
@@ -1681,6 +2487,11 @@ def cli_main() -> None:
     # CSV re-import mode — separate pipeline
     if args.mode == "csv-import":
         _run_csv_import(args)
+        return
+
+    # Daily obituary pre-probate pipeline
+    if args.mode == "daily-obits":
+        _run_daily_obits(args)
         return
 
     # Filter saved searches
@@ -1717,13 +2528,187 @@ def cli_main() -> None:
 
 def _run_scrape_pipeline(args, searches) -> None:
     """Run the daily/historical scrape → enrich → export → upload pipeline."""
-    # Scrape
-    notices = asyncio.run(scrape_all(
-        mode=args.mode, searches=searches,
-        llm_api_key=config.ANTHROPIC_API_KEY or None,
-        since_date_override=args.since,
-        max_notices=args.max_notices,
-    ))
+    from datetime import timedelta
+
+    # ── Resolve the since_date shared across all scrapers ────────────
+    since_date: str | None = args.since
+    if not since_date:
+        if args.mode == "daily":
+            from scraper import load_last_run_date
+            since_date = load_last_run_date()
+            if not since_date:
+                since_date = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+                logging.info("No prior run state found — pulling last 7 days (%s)", since_date)
+        elif args.mode == "historical":
+            since_date = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
+
+    # ── Partition searches by data source ────────────────────────────
+    _acclaim_only = getattr(args, "acclaim_only", False)
+
+    tnpn_searches       = [] if _acclaim_only else [s for s in searches if s.source == "tnpn"]
+    oscn_searches        = [] if _acclaim_only else [s for s in searches if s.source == "oscn"]
+    tinstar_searches     = [] if _acclaim_only else [s for s in searches if s.source == "tinstar"]
+    oktaxrolls_searches  = [] if _acclaim_only else [s for s in searches if s.source == "oktaxrolls"]
+    tulsaworld_searches  = [] if _acclaim_only else [s for s in searches if s.source == "tulsaworld"]
+    acclaimed_searches   = [s for s in searches if s.source == "acclaimed"]
+
+    all_notices: list = []
+    _td_notices: list = []  # tax delinquent records — written to a separate CSV
+    _acclaim_new_instrs: dict = {}  # instrument# → date; saved to cache after CSV write
+
+    # ── TN Public Notice scraper (existing Playwright + CAPTCHA flow) ─
+    if tnpn_searches:
+        logging.info(
+            "Scraping %d TN saved search(es) via tnpublicnotice.com",
+            len(tnpn_searches),
+        )
+        tn_notices = asyncio.run(scrape_all(
+            mode=args.mode, searches=tnpn_searches,
+            llm_api_key=config.ANTHROPIC_API_KEY or None,
+            since_date_override=since_date,
+            max_notices=args.max_notices,
+        ))
+        all_notices.extend(tn_notices)
+
+    # ── Oklahoma OSCN scraper (plain HTTP, no login/CAPTCHA) ─────────
+    if oscn_searches:
+        from oscn_scraper import scrape_oscn
+        logging.info("Scraping %d OSCN search(es) for Tulsa County", len(oscn_searches))
+        for search in oscn_searches:
+            try:
+                ok_notices = scrape_oscn(
+                    county=search.county,
+                    notice_type=search.notice_type,
+                    since_date=since_date or (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d"),
+                )
+                all_notices.extend(ok_notices)
+            except Exception:
+                logging.exception("OSCN scrape failed for %s/%s", search.county, search.notice_type)
+
+    # ── Tulsa County Treasurer tax-delinquent scraper ────────────────
+    if oktaxrolls_searches:
+        from tulsa_tax_delinquent import scrape_tulsa_tax_delinquent
+        logging.info("Scraping Tulsa County tax-delinquent list (2+ years, Real Estate)")
+        try:
+            max_td = args.max_notices if getattr(args, "max_notices", 0) > 0 else 500
+            td_notices = scrape_tulsa_tax_delinquent(
+                min_years_delinquent=2,
+                min_amount=500.0,
+                max_records=max_td,
+                force_refresh=getattr(args, "force_tax_refresh", False),
+            )
+            _td_notices.extend(td_notices)
+            logging.info("Tax delinquent: %d records fetched (writing to separate CSV)", len(td_notices))
+        except Exception:
+            logging.exception("Tax delinquent scrape failed")
+
+    # ── TinStar sheriff sale scraper (Fridays only — list updates weekly) ──
+    _is_friday = datetime.now().weekday() == 4
+    _force_tinstar = getattr(args, "force_tinstar", False)
+    if tinstar_searches and (_is_friday or _force_tinstar):
+        from tinstar_scraper import scrape_tinstar
+        logging.info("Scraping %d TinStar search(es) for Tulsa County", len(tinstar_searches))
+        for search in tinstar_searches:
+            try:
+                ts_notices = asyncio.run(scrape_tinstar(
+                    county=search.county,
+                    since_date=since_date,
+                    email=config.TINSTAR_EMAIL,
+                    password=config.TINSTAR_PASSWORD,
+                ))
+                all_notices.extend(ts_notices)
+            except Exception:
+                logging.exception("TinStar scrape failed for %s", search.county)
+    elif tinstar_searches and not _is_friday:
+        logging.info("TinStar skipped (runs Fridays only — use --force-tinstar to override)")
+
+    # ── Tulsa World legal notice scraper (Column.us REST API) ────────────
+    if tulsaworld_searches:
+        from tulsa_world_scraper import scrape_tulsa_world
+        logging.info("Scraping Tulsa World legal notices (Column.us API)")
+        try:
+            tw_notices = scrape_tulsa_world(
+                since_date=since_date,
+                days_back=30,
+            )
+            all_notices.extend(tw_notices)
+            logging.info("Tulsa World: %d real-estate notices", len(tw_notices))
+        except Exception:
+            logging.exception("Tulsa World scrape failed")
+
+    # ── Acclaim (Tulsa County Clerk) recorded document scraper ───────────
+    if acclaimed_searches and not getattr(args, "skip_acclaim", False):
+        if not config.ACCLAIM_EMAIL or not config.ACCLAIM_PASSWORD:
+            logging.warning(
+                "Acclaim: acclaim_EMAIL / acclaim_PASSWORD not set in .env -- skipping"
+            )
+        else:
+            import json as _json
+            import re as _re
+            from acclaimed_scraper import scrape_acclaimed
+
+            logging.info("Scraping Tulsa County Clerk (Acclaim) for Lis Pendens + Sheriff Deeds")
+
+            # Acclaim database is verified ~7 days behind real-time.  Use a 14-day
+            # floor so each weekly run covers a full week of verified recordings.
+            _acclaim_14d = (datetime.now() - timedelta(days=14)).strftime("%Y-%m-%d")
+            _acclaim_since = since_date if since_date and since_date < _acclaim_14d else _acclaim_14d
+
+            # Load seen-IDs cache — prevents re-exporting instruments across weekly runs
+            _acc_cache_path = config.ACCLAIM_SEEN_IDS_FILE
+            _acc_seen: dict = {}
+            if _acc_cache_path.exists():
+                try:
+                    _acc_seen = _json.loads(_acc_cache_path.read_text(encoding="utf-8"))
+                except Exception as _e:
+                    logging.warning("Acclaim: could not load seen-IDs cache: %s", _e)
+            _acc_seen_keys_before: set = set(_acc_seen.keys())
+
+            def _acc_instr(url: str) -> str:
+                m = _re.search(r"instrumentNumber=(\d+)", url)
+                return m.group(1) if m else ""
+
+            try:
+                acc_notices = asyncio.run(scrape_acclaimed(
+                    since_date=_acclaim_since,
+                    email=config.ACCLAIM_EMAIL,
+                    password=config.ACCLAIM_PASSWORD,
+                    max_records=args.max_notices if getattr(args, "max_notices", 0) > 0 else 500,
+                    seen_ids=_acc_seen,
+                    headless=not getattr(args, "headed", False),
+                ))
+
+                # All cache-filtered instruments were already skipped inside scrape_acclaimed.
+                # Register new instruments for cache persistence, tagging with doc_type.
+                for _n in acc_notices:
+                    _instr = _acc_instr(_n.source_url)
+                    if _instr and _instr not in _acc_seen_keys_before:
+                        import re as _re_dt
+                        _dt_m = _re_dt.search(r'\|acclaim_doc_type:(\S+)', _n.raw_text or '')
+                        _dt_label = _dt_m.group(1) if _dt_m else ""
+                        _acclaim_new_instrs[_instr] = (
+                            f"{datetime.now().strftime('%Y-%m-%d')}|{_dt_label}"
+                            if _dt_label else datetime.now().strftime("%Y-%m-%d")
+                        )
+                # Also save instruments dropped in OCR phase — _enrich_notices_with_pdf
+                # mutated _acc_seen directly with |DROPPED entries so they skip next run.
+                for _k, _v in _acc_seen.items():
+                    if _k not in _acc_seen_keys_before:
+                        _acclaim_new_instrs.setdefault(_k, _v)
+
+                all_notices.extend(acc_notices)
+                logging.info("Acclaim: %d new records", len(acc_notices))
+            except Exception:
+                logging.exception("Acclaim scrape failed")
+
+    notices = all_notices
+    logging.info("Total raw notices across all sources: %d", len(notices))
+
+    # Cap total records when --max-notices is set (applies to all sources)
+    if getattr(args, "max_notices", 0) > 0 and len(notices) > args.max_notices:
+        notices = notices[: args.max_notices]
+        logging.info("Truncated to %d notices (--max-notices)", args.max_notices)
+
     # Handle async probate lookup before pipeline (requires asyncio.run)
     probate_notices = [n for n in notices if n.notice_type == "probate" and n.decedent_name and not n.address]
     if probate_notices:
@@ -1735,6 +2720,34 @@ def _run_scrape_pipeline(args, searches) -> None:
             logging.warning("property_lookup module not found -- skipping property lookup")
         except Exception as e:
             logging.warning("Property lookup failed: %s -- continuing without lookups", e)
+
+    # Tulsa County Assessor address lookup for:
+    # 1. OK records with no address at all
+    # 2. Acclaim records flagged by OCR (kept without a verified street address from the PDF)
+    tulsa_no_addr = [
+        n for n in notices
+        if n.county == "Tulsa" and n.state == "OK"
+        and (not n.address.strip() or getattr(n, "needs_assessor_lookup", False))
+    ]
+    if tulsa_no_addr:
+        try:
+            from tulsa_assessor import lookup_addresses_tulsa
+            logging.info(
+                "Tulsa Assessor: looking up addresses for %d records...", len(tulsa_no_addr)
+            )
+            found, missed = asyncio.run(lookup_addresses_tulsa(tulsa_no_addr))
+            logging.info("Tulsa Assessor: %d found, %d not found", found, missed)
+        except Exception as e:
+            logging.warning("Tulsa Assessor lookup failed: %s -- continuing", e)
+
+    # Drop OK records that still have no address after all lookup tiers.
+    # These are genuine misses (renter, out-of-county property, pre-death transfer)
+    # and cannot be mailed or uploaded to DataSift usefully.
+    before_drop = len(notices)
+    notices = [n for n in notices if not (n.state == "OK" and not n.address.strip())]
+    dropped = before_drop - len(notices)
+    if dropped:
+        logging.info("Removed %d OK records with no address after all lookup tiers", dropped)
 
     # Run unified enrichment pipeline
     from enrichment_pipeline import PipelineOptions, run_enrichment_pipeline
@@ -1791,21 +2804,8 @@ def _run_scrape_pipeline(args, searches) -> None:
                 tracerfy_stats.get("phones_found", 0), tracerfy_stats.get("emails_found", 0),
                 tracerfy_stats.get("cost", 0.0),
             )
-            # Score every phone (DM #1 + all heirs) — writes per-heir phone_scores
-            # into heir_map_json so DataSift Notes and PDFs can surface tier badges.
-            if cfg.TRESTLE_API_KEY:
-                from phone_validator import score_record_phones
-                dp_cands = [
-                    n for n in notices
-                    if n.owner_deceased == "yes" or n.heir_map_json or n.decision_maker_name
-                ]
-                if dp_cands:
-                    try:
-                        tiers_map = score_record_phones(dp_cands, cfg.TRESTLE_API_KEY)
-                        logging.info("Trestle scored %d unique phones across %d DP records",
-                                     len(tiers_map), len(dp_cands))
-                    except Exception as e:
-                        logging.warning("Per-record Trestle scoring failed: %s", e)
+            # Trestle scoring deferred to phone-validate post-DataSift step
+            # (see feedback-pipeline-order in memory)
 
     # Write output
     if args.split:
@@ -1815,6 +2815,33 @@ def _run_scrape_pipeline(args, searches) -> None:
     else:
         path = write_csv(notices)
         logging.info("Output: %s", path)
+
+    # ── Persist Acclaim seen-IDs cache (only after successful CSV write) ──
+    if _acclaim_new_instrs:
+        import json as _json
+        _acc_cache_path = config.ACCLAIM_SEEN_IDS_FILE
+        try:
+            existing: dict = {}
+            if _acc_cache_path.exists():
+                existing = _json.loads(_acc_cache_path.read_text(encoding="utf-8"))
+            existing.update(_acclaim_new_instrs)
+            # Prune entries older than 60 days to prevent unbounded growth
+            _cutoff = (datetime.now() - timedelta(days=60)).strftime("%Y-%m-%d")
+            existing = {k: v for k, v in existing.items() if v >= _cutoff}
+            _acc_cache_path.write_text(_json.dumps(existing, indent=2), encoding="utf-8")
+            logging.info("Acclaim: seen-IDs cache saved (%d total entries)", len(existing))
+        except Exception as _e:
+            logging.warning("Acclaim: could not save seen-IDs cache: %s", _e)
+
+    # ── Tax delinquent separate CSV (no Smarty/Zillow — preserve API credits) ──
+    if _td_notices:
+        try:
+            from datetime import datetime as _dt
+            _td_filename = f"ok_tax_delinquent_{_dt.now().strftime('%Y-%m-%d_%H%M%S')}.csv"
+            _td_path = write_csv(_td_notices, filename=_td_filename)
+            logging.info("Tax delinquent output: %s (%d records)", _td_path, len(_td_notices))
+        except Exception:
+            logging.exception("Tax delinquent CSV write failed")
 
     # Generate deep-prospecting PDFs for deceased/DM/heir records.
     # Matches the Apify branch behavior so CLI runs get the same reports —
@@ -1844,46 +2871,25 @@ def _run_scrape_pipeline(args, searches) -> None:
         except Exception:
             logging.exception("Report generator import failed")
 
-    # DataSift upload
-    upload_result = None
-    if getattr(args, "upload_datasift", False):
-        from datasift_formatter import write_datasift_csv, write_datasift_split_csvs
-        from datasift_uploader import upload_to_datasift, upload_datasift_split
+    # Label the DataSift CSV by whichever scraper source(s) actually ran this
+    # pass, e.g. "acclaim" for an --acclaim-only run, "tnpn_oscn_acclaim" for
+    # a full mixed daily run.
+    _active_sources = []
+    if tnpn_searches:
+        _active_sources.append("tnpn")
+    if oscn_searches:
+        _active_sources.append("oscn")
+    if tinstar_searches:
+        _active_sources.append("tinstar")
+    if oktaxrolls_searches:
+        _active_sources.append("taxrolls")
+    if tulsaworld_searches:
+        _active_sources.append("tulsaworld")
+    if acclaimed_searches:
+        _active_sources.append("acclaim")
+    _scrape_source_label = "_".join(_active_sources) or args.mode
 
-        do_enrich = not getattr(args, "no_enrich", False)
-        do_skip_trace = not getattr(args, "no_skip_trace", False)
-
-        # Use split flow (separate DM + Heir Map Message Board entries)
-        csv_infos = write_datasift_split_csvs(notices)
-        for info in csv_infos:
-            logging.info("DataSift CSV (%s): %s", info["label"], info["path"])
-
-        if len(csv_infos) > 1:
-            upload_result = asyncio.run(
-                upload_datasift_split(
-                    csv_infos,
-                    enrich=do_enrich,
-                    skip_trace=do_skip_trace,
-                )
-            )
-        else:
-            # No deceased-with-heirs — single CSV upload
-            upload_result = asyncio.run(
-                upload_to_datasift(
-                    csv_infos[0]["path"],
-                    enrich=do_enrich,
-                    skip_trace=do_skip_trace,
-                )
-            )
-
-        if upload_result.get("success"):
-            logging.info("DataSift upload: %s", upload_result.get("message", "OK"))
-            if upload_result.get("enrich_result"):
-                logging.info("  Enrich: %s", upload_result["enrich_result"].get("message", ""))
-            if upload_result.get("skip_trace_result"):
-                logging.info("  Skip trace: %s", upload_result["skip_trace_result"].get("message", ""))
-        else:
-            logging.error("DataSift upload failed: %s", upload_result.get("message"))
+    upload_result = _upload_notices_to_datasift(notices, args, source_label=_scrape_source_label)
 
     # Slack/Discord notification
     if getattr(args, "notify_slack", False):
@@ -1895,6 +2901,12 @@ def _run_scrape_pipeline(args, searches) -> None:
     if getattr(args, "audit_records", False):
         logging.info("--audit-records: Not yet implemented. "
                       "Will check DataSift Incomplete tab via Playwright in a future build.")
+
+    # Persist last_run_date so the next daily run only pulls new records
+    if args.mode == "daily":
+        from scraper import save_last_run_date
+        save_last_run_date()
+        logging.info("Run state saved — next daily run will start from today")
 
     logging.info("Done — %d notices exported", len(notices))
 

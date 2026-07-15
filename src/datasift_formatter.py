@@ -32,6 +32,8 @@ DATASIFT_COLUMNS = [
     "Property ZIP Code",
     "Owner First Name",
     "Owner Last Name",
+    "Owner Type",
+    "Company Name",
     "Mailing Street Address",
     "Mailing City",
     "Mailing State",
@@ -146,6 +148,7 @@ def _clean_and_split_name(full_name: str) -> tuple[str, str]:
     """Clean a full name for DataSift upload and split into (first, last).
 
     Handles patterns that cause DataSift "incomplete" records:
+    - Court format "LAST, FIRST MIDDLE": "EDWARDS, NICHOLAS" → ("NICHOLAS", "EDWARDS")
     - Joint names with "&" or "AND": "John & Jane Smith" → ("John", "Smith")
     - Entity names (LLC, Trust, etc.): returns ("", "") — entity goes to Notes
     - Special characters: strips &, @, #, % from name parts
@@ -158,6 +161,15 @@ def _clean_and_split_name(full_name: str) -> tuple[str, str]:
     # Entity names → empty (don't put business names in person fields)
     if _is_entity_name(name):
         return ("", "")
+
+    # Court format "LAST, FIRST MIDDLE" → reorder to "FIRST LAST" before further processing
+    if "," in name:
+        last_part, _, first_part = name.partition(",")
+        last = last_part.strip()
+        first_words = first_part.strip().split()
+        first = first_words[0] if first_words else ""
+        if first and last:
+            name = f"{first} {last}"
 
     # Split joint owners on " & " or " AND " — keep first person only
     # "John & Jane Smith" → "John Smith"
@@ -237,9 +249,34 @@ def _build_tags(notice: NoticeData) -> str:
     """
     tags = ["Courthouse Data"]
 
-    # Notice type
+    # Detect pre-probate obituary sources once — used in two places below.
+    # These records are ahead of the court filing; they need different tags from
+    # regular court-sourced probate records.
+    src_lower = (notice.source_url or "").lower()
+    is_obit_source = (
+        notice.notice_type == "probate"
+        and any(x in src_lower for x in (
+            "echovita", "funeral_home_direct", "legacy.com",
+        ))
+    )
+
+    # Data source tag
+    if "acclaim" in src_lower:
+        tags.append("Acclaim")
+    elif "oscn.net" in src_lower:
+        tags.append("OSCN")
+    elif "column.us" in src_lower or "tulsaworld" in src_lower:
+        tags.append("Tulsa World")
+    elif "tnpublicnotice" in src_lower:
+        tags.append("TN Public Notice")
+
+    # Notice type — pre-probate obituary records get Pre-Probate + obituary instead
+    # of the raw "probate" type so they're distinct in DataSift filter presets.
     if notice.notice_type:
-        tags.append(notice.notice_type)
+        if is_obit_source:
+            tags.extend(["Pre-Probate", "obituary"])
+        else:
+            tags.append(notice.notice_type)
 
     # County
     if notice.county:
@@ -259,6 +296,10 @@ def _build_tags(notice: NoticeData) -> str:
         # DM confidence
         if notice.dm_confidence:
             tags.append(f"{notice.dm_confidence}_confidence")
+        # DM relationship — tells callers who they're contacting before they dial
+        if notice.decision_maker_relationship:
+            rel = notice.decision_maker_relationship.lower().replace(" ", "_")
+            tags.append(f"dm_{rel}")
     else:
         tags.append("living")
 
@@ -285,12 +326,25 @@ def _build_tags(notice: NoticeData) -> str:
         tags.append("dm_verified")
     if notice.heir_map_json:
         tags.append("has_heirs")
-    elif notice.owner_deceased == "yes":
+    elif notice.owner_deceased == "yes" and not is_obit_source:
+        # no_heirs means heir research was done and found none.
+        # Pre-probate obituary records haven't had heir research run yet —
+        # don't tag them no_heirs just because the field is empty.
         tags.append("no_heirs")
     if (notice.owner_deceased == "yes"
             and notice.decision_maker_street
             and notice.decision_maker_street != notice.address):
         tags.append("has_dm_address")
+
+    # Deep Prospecting flag — probate/obituary cases where we either have no
+    # heir at all, or the heir we have isn't the spouse (PR, child, sibling,
+    # etc.), and we still don't have a mailing address for them. Spouse-only
+    # cases are excluded since the spouse is usually still at the property
+    # address already on file.
+    if notice.notice_type == "probate" and notice.owner_deceased == "yes" and not notice.decision_maker_street:
+        rel = (notice.decision_maker_relationship or "").strip().lower()
+        if not notice.decision_maker_name or rel != "spouse":
+            tags.append("needs_deep_prospecting")
 
     # Signing chain tags
     if notice.signing_chain_count:
@@ -330,6 +384,11 @@ def _build_tags(notice: NoticeData) -> str:
     # Photo import tag (source_url starts with "photo:")
     if notice.source_url and notice.source_url.startswith("photo:"):
         tags.append("photo_import")
+
+    # Trestle dial tier (set by apply_trestle_tiers_to_notices after scoring)
+    dial_tier = getattr(notice, "_dial_tier", "") or ""
+    if dial_tier:
+        tags.append(dial_tier)
 
     return ",".join(tags)
 
@@ -440,7 +499,7 @@ def _build_heir_summary(notice: NoticeData) -> str:
             street = h.get("street", "")
             if street:
                 city = h.get("city", "")
-                state = h.get("state", "TN")
+                state = h.get("state", "")
                 zip_code = h.get("zip", "")
                 addr_parts = [street]
                 if city:
@@ -467,6 +526,59 @@ def _build_heir_summary(notice: NoticeData) -> str:
             lines.append(f"(+{remaining} more)")
 
     return "\n".join(lines)
+
+
+def _build_call_prep_section(notice: NoticeData) -> str:
+    """Build actionable "what to know before calling" guidance for cold callers.
+
+    Synthesizes confidence/verification/backup-heir signals already on the
+    record into a short call script, rather than just restating raw facts
+    (which the DECISION MAKERS / SIGNING CHAIN sections already do). Only
+    fires for deceased-owner records with a named decision maker — living
+    owner records are straightforward enough not to need a script.
+    """
+    if notice.owner_deceased != "yes" or not notice.decision_maker_name:
+        return ""
+
+    lines = []
+    name = notice.decision_maker_name
+    rel = notice.decision_maker_relationship or "unknown relationship"
+    status = notice.decision_maker_status or "unverified"
+    confidence = (notice.dm_confidence or "").lower()
+
+    lines.append(f"Primary contact: {name} ({rel})")
+
+    if status == "verified_living":
+        lines.append(
+            "VERIFIED LIVING — warm lead. Open by referencing the property/estate directly."
+        )
+    else:
+        decedent = notice.decedent_name or "the deceased owner"
+        lines.append(
+            f"UNVERIFIED contact — confirm you've reached {name} before mentioning "
+            f"{decedent}'s passing. If it's the wrong number, ask neutrally whether they "
+            "handle the estate rather than revealing details."
+        )
+
+    # Backup contacts — known heirs beyond the primary DM
+    backups = []
+    if notice.decision_maker_2_name:
+        backups.append(f"{notice.decision_maker_2_name} ({notice.decision_maker_2_relationship or 'unknown'})")
+    if notice.decision_maker_3_name:
+        backups.append(f"{notice.decision_maker_3_name} ({notice.decision_maker_3_relationship or 'unknown'})")
+    if backups:
+        lines.append(f"Known heirs (backup if primary unreachable): {', '.join(backups)}")
+    elif not notice.heir_map_json:
+        lines.append("No other heirs identified yet — ask on this call if there are additional siblings/heirs.")
+
+    if not notice.decision_maker_street:
+        lines.append("Needs Deep Prospecting — no mailing address on file for this contact yet.")
+
+    if confidence:
+        reason = f" — {notice.dm_confidence_reason}" if notice.dm_confidence_reason else ""
+        lines.append(f"DM confidence: {confidence.upper()}{reason}")
+
+    return "=== CALL PREP ===\n" + "\n".join(lines)
 
 
 def _build_dm_section(notice: NoticeData) -> str:
@@ -573,6 +685,11 @@ def _build_notes(notice: NoticeData) -> str:
         if dm_section:
             sections.append(dm_section)
 
+        # Section 2b: Call prep — actionable script, not just raw facts
+        call_prep_section = _build_call_prep_section(notice)
+        if call_prep_section:
+            sections.append(call_prep_section)
+
         # Section 3: Heir map
         heir_section = _build_heir_summary(notice)
         if heir_section:
@@ -629,6 +746,11 @@ def _build_dm_notes(notice: NoticeData) -> str:
     dm_section = _build_dm_section(notice)
     if dm_section:
         sections.append(dm_section)
+
+    # Call prep — actionable script, not just raw facts
+    call_prep_section = _build_call_prep_section(notice)
+    if call_prep_section:
+        sections.append(call_prep_section)
 
     # Property details
     prop_section = _build_property_section(notice)
@@ -704,10 +826,12 @@ def _build_row(notice: NoticeData, notes_override: str | None = None) -> dict:
         # ── Core auto-mapped ──
         "Property Street Address": notice.address,
         "Property City": notice.city,
-        "Property State": notice.state or "TN",
+        "Property State": notice.state or "",
         "Property ZIP Code": notice.zip,
         "Owner First Name": contact["first"],
         "Owner Last Name": contact["last"],
+        "Owner Type": "Company" if _is_entity_name(notice.owner_name) else "Person",
+        "Company Name": notice.owner_name if _is_entity_name(notice.owner_name) else "",
         "Mailing Street Address": contact["street"],
         "Mailing City": contact["city"],
         "Mailing State": contact["state"],
@@ -783,22 +907,37 @@ def _build_row(notice: NoticeData, notes_override: str | None = None) -> dict:
     }
 
 
+def _slugify_source(source_label: str) -> str:
+    """Sanitize a scraper/source name for use in a filename.
+
+    "Acclaim" -> "acclaim", "TN Public Notice" -> "tn_public_notice"
+    """
+    slug = re.sub(r"[^a-z0-9]+", "_", source_label.strip().lower())
+    return slug.strip("_") or "unknown_source"
+
+
 def write_datasift_csv(
     notices: list[NoticeData],
     filename: str | None = None,
+    source_label: str = "",
 ) -> Path:
     """Write notices to a DataSift-formatted CSV file.
 
     Args:
         notices: List of enriched NoticeData objects.
         filename: Optional filename override.
+        source_label: Scraper/source name (e.g. "acclaim", "oscn",
+            "preprobate_obituary") embedded in the auto-generated filename so
+            every DataSift-ready CSV is traceable back to where it came from.
+            Ignored if filename is provided.
 
     Returns:
         Path to the written CSV file.
     """
     if filename is None:
         timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-        filename = f"datasift_upload_{timestamp}.csv"
+        slug = _slugify_source(source_label) if source_label else "unknown_source"
+        filename = f"datasift_ready_{slug}_{timestamp}.csv"
 
     output_path = OUTPUT_DIR / filename
     written = 0
@@ -833,6 +972,7 @@ def write_datasift_csv(
 def write_datasift_split_csvs(
     notices: list[NoticeData],
     date_str: str | None = None,
+    source_label: str = "",
 ) -> list[dict]:
     """Generate separate DM and Heir Map CSVs for two-upload Message Board flow.
 
@@ -845,6 +985,10 @@ def write_datasift_split_csvs(
     Args:
         notices: List of enriched NoticeData objects.
         date_str: Optional date string for filenames/list names (default: today).
+        source_label: Scraper/source name (e.g. "acclaim", "oscn",
+            "preprobate_obituary", "pdf_import") embedded in both filenames so
+            every DataSift-ready CSV is traceable back to where it came from,
+            e.g. datasift_ready_acclaim_2026-07-10_120000_DMs.csv.
 
     Returns:
         List of dicts: [{"path": Path, "label": str, "list_name": str}, ...]
@@ -854,10 +998,11 @@ def write_datasift_split_csvs(
         date_str = datetime.now().strftime("%Y-%m-%d")
 
     timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    slug = _slugify_source(source_label) if source_label else "unknown_source"
     results = []
 
     # CSV 1: DMs — all records
-    dm_path = OUTPUT_DIR / f"datasift_upload_DMs_{timestamp}.csv"
+    dm_path = OUTPUT_DIR / f"datasift_ready_{slug}_{timestamp}_DMs.csv"
     dm_written = 0
     incomplete = 0
     issue_counts: dict[str, int] = {}
@@ -894,7 +1039,7 @@ def write_datasift_split_csvs(
     ]
 
     if deceased_with_heirs:
-        heir_path = OUTPUT_DIR / f"datasift_upload_Heirs_{timestamp}.csv"
+        heir_path = OUTPUT_DIR / f"datasift_ready_{slug}_{timestamp}_Heirs.csv"
         heir_written = 0
         with open(heir_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=DATASIFT_COLUMNS)

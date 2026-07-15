@@ -337,7 +337,9 @@ def run_watcher(
                                 from datasift_formatter import write_datasift_split_csvs
                                 from datasift_uploader import upload_datasift_split, upload_to_datasift
 
-                                csv_infos = write_datasift_split_csvs(notices)
+                                csv_infos = write_datasift_split_csvs(
+                                    notices, source_label=f"photo_{notice_type}"
+                                )
                                 if len(csv_infos) > 1:
                                     upload_result = _asyncio.run(
                                         upload_datasift_split(csv_infos, enrich=True, skip_trace=True)

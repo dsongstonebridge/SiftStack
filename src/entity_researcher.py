@@ -322,9 +322,8 @@ def _research_single_entity(
     # Phase 2: Web search + LLM
     time.sleep(random.uniform(SEARCH_DELAY_MIN, SEARCH_DELAY_MAX))
 
-    state = notice.state or "Tennessee"
-    if state == "TN":
-        state = "Tennessee"
+    _STATE_NAMES = {"TN": "Tennessee", "OK": "Oklahoma"}
+    state = _STATE_NAMES.get(notice.state, notice.state) or "Tennessee"
 
     search_results = _search_entity(name, state)
     if not search_results:

@@ -440,6 +440,11 @@ async def lookup_decedent_properties(notices: list) -> None:
                     if maiden:
                         logger.info("  Retrying with maiden name: %s", maiden)
                         results = _tpad_lookup(maiden)
+            elif notice.county.lower() == "tulsa":
+                # Tulsa County uses a separate async lookup — handled below
+                logger.debug("Unsupported county for property lookup: %s", notice.county)
+                skipped += 1
+                continue
             else:
                 logger.debug("Unsupported county for property lookup: %s", notice.county)
                 skipped += 1

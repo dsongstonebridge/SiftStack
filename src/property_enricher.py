@@ -7,10 +7,12 @@ Graceful degradation: if no API key or API errors, all notices pass through
 unchanged.
 """
 
+import json
 import logging
 import random
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+from pathlib import Path
 
 import requests
 
@@ -25,6 +27,15 @@ REQUEST_DELAY_MIN = 1.0   # seconds between requests
 REQUEST_DELAY_MAX = 2.0
 REQUEST_TIMEOUT = 30       # seconds per API call (Zillow can be 0.5-4s+)
 MAX_RETRIES = 2
+
+# ── Cache Configuration ───────────────────────────────────────────────
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_CACHE_FILE = _PROJECT_ROOT / "output" / "zillow_cache.json"
+_CACHE_TTL_DAYS = 30
+
+# Notice types that get Zillow enrichment — tax_delinquent excluded to
+# conserve the 100-request/month quota (those records repeat across runs).
+ZILLOW_NOTICE_TYPES = {"probate", "foreclosure"}
 
 # ── Mapping tables ────────────────────────────────────────────────────
 
@@ -114,6 +125,37 @@ def _estimate_remaining_balance(
     return max(0.0, remaining)
 
 
+# ── Cache helpers ─────────────────────────────────────────────────────
+
+def _cache_key(address: str, city: str, state: str, zip_code: str) -> str:
+    return " ".join(filter(None, [address, city, state, zip_code])).lower().strip()
+
+
+def _load_cache() -> dict:
+    if not _CACHE_FILE.exists():
+        return {}
+    try:
+        return json.loads(_CACHE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_cache(cache: dict) -> None:
+    try:
+        _CACHE_FILE.parent.mkdir(exist_ok=True)
+        _CACHE_FILE.write_text(json.dumps(cache, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.warning("Could not save Zillow cache: %s", e)
+
+
+def _is_cache_fresh(entry: dict) -> bool:
+    try:
+        fetched = datetime.fromisoformat(entry["fetched"])
+        return datetime.now() - fetched < timedelta(days=_CACHE_TTL_DAYS)
+    except Exception:
+        return False
+
+
 # ── API call ──────────────────────────────────────────────────────────
 
 def _fetch_property(address: str, city: str, state: str, zip_code: str,
@@ -145,6 +187,8 @@ def _fetch_property(address: str, city: str, state: str, zip_code: str,
                 return None
             if resp.status_code == 429:
                 logger.warning("Zillow rate limit hit -- waiting 10s (attempt %d)", attempt)
+                if attempt == MAX_RETRIES:
+                    return "QUOTA_EXHAUSTED"
                 time.sleep(10)
                 continue
             resp.raise_for_status()
@@ -306,6 +350,10 @@ def enrich_properties(
 ) -> list[NoticeData]:
     """Enrich notices with Zillow property data (in-place).
 
+    Only processes probate and foreclosure records (ZILLOW_NOTICE_TYPES) to
+    conserve the monthly API quota. Results are cached for 30 days so the
+    same address is never fetched twice within that window.
+
     Args:
         notices: List of NoticeData (modified in-place).
         api_key: OpenWeb Ninja API key for Real-Time Zillow Data API.
@@ -317,33 +365,65 @@ def enrich_properties(
         logger.info("OpenWeb Ninja API key not configured -- skipping Zillow enrichment")
         return notices
 
-    eligible = [(i, n) for i, n in enumerate(notices) if n.address.strip()]
+    eligible = [
+        (i, n) for i, n in enumerate(notices)
+        if n.address.strip() and n.notice_type in ZILLOW_NOTICE_TYPES
+    ]
+    skipped_type = sum(
+        1 for n in notices
+        if n.notice_type not in ZILLOW_NOTICE_TYPES
+    )
+    skipped_addr = sum(
+        1 for n in notices
+        if n.notice_type in ZILLOW_NOTICE_TYPES and not n.address.strip()
+    )
+
     if not eligible:
-        logger.info("No notices with addresses to enrich")
+        logger.info(
+            "Zillow: no eligible records (%d wrong type, %d no address)",
+            skipped_type, skipped_addr,
+        )
         return notices
 
     logger.info(
-        "Enriching %d properties via Zillow API (%d skipped -- no address)",
-        len(eligible),
-        len(notices) - len(eligible),
+        "Zillow: %d eligible (probate/foreclosure), %d skipped (type), %d skipped (no address)",
+        len(eligible), skipped_type, skipped_addr,
     )
 
+    cache = _load_cache()
     enriched = 0
+    cache_hits = 0
     failed = 0
-    skipped = len(notices) - len(eligible)
+    api_calls = 0
     equity_values: list[float] = []
 
     for idx, (orig_idx, notice) in enumerate(eligible):
-        if idx > 0:
-            delay = random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX)
-            time.sleep(delay)
+        key = _cache_key(notice.address, notice.city, notice.state, notice.zip)
+        entry = cache.get(key)
 
-        data = _fetch_property(
-            notice.address, notice.city, notice.state, notice.zip,
-            api_key,
-        )
+        if entry and _is_cache_fresh(entry):
+            data = entry["data"]
+            cache_hits += 1
+        else:
+            if api_calls > 0:
+                time.sleep(random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX))
+            data = _fetch_property(
+                notice.address, notice.city, notice.state, notice.zip,
+                api_key,
+            )
+            api_calls += 1
+            if data == "QUOTA_EXHAUSTED":
+                remaining = len(eligible) - idx
+                logger.warning(
+                    "Zillow monthly quota exhausted -- skipping remaining %d records", remaining
+                )
+                failed += remaining
+                break
+            if data is not None:
+                cache[key] = {"fetched": datetime.now().isoformat(), "data": data}
+                _save_cache(cache)
 
-        if data is None:
+        if data is None or data == "QUOTA_EXHAUSTED":
             failed += 1
             continue
 
@@ -358,19 +438,13 @@ def enrich_properties(
         else:
             failed += 1
 
-        if (idx + 1) % 10 == 0:
-            logger.info(
-                "Zillow enrichment progress: %d/%d (enriched=%d, failed=%d)",
-                idx + 1, len(eligible), enriched, failed,
-            )
-
     avg_equity = ""
     if equity_values:
         avg = sum(equity_values) / len(equity_values)
         avg_equity = f", avg equity=${avg:,.0f}"
     logger.info(
-        "Zillow enrichment complete: %d enriched, %d failed, %d skipped%s",
-        enriched, failed, skipped, avg_equity,
+        "Zillow enrichment complete: %d enriched, %d cache hits, %d API calls, %d failed%s",
+        enriched, cache_hits, api_calls, failed, avg_equity,
     )
 
     return notices

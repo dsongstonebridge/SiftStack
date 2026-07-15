@@ -32,7 +32,7 @@ class NoticeData:
     auction_date: str = ""     # Scheduled sale/auction date (YYYY-MM-DD)
     address: str = ""
     city: str = ""
-    state: str = "TN"
+    state: str = ""
     zip: str = ""
     owner_name: str = ""
     notice_type: str = ""      # foreclosure | tax_sale | tax_lien | probate
@@ -132,12 +132,15 @@ class NoticeData:
     email_5: str = ""
     # Pipeline metadata (set by enrichment_pipeline)
     run_id: str = ""                   # Unique pipeline run identifier for data lineage
+    # Acclaim OCR flag — set when OCR kept the record but couldn't extract a street address
+    needs_assessor_lookup: bool = False
 
 
-# ── Known TN cities in Knox & Blount counties ─────────────────────────
+# ── Known cities in supported counties ──────────────────────────────
 # Sorted longest-first so "Lenoir City" matches before "City"
-TN_CITIES: list[str] = sorted(
+KNOWN_CITIES: list[str] = sorted(
     [
+        # TN — Knox & Blount counties
         "Knoxville", "Maryville", "Alcoa", "Farragut", "Powell",
         "Lenoir City", "Loudon", "Oak Ridge", "Clinton", "Sevierville",
         "Pigeon Forge", "Gatlinburg", "Karns", "Halls", "Concord",
@@ -145,13 +148,18 @@ TN_CITIES: list[str] = sorted(
         "Corryton", "Mascot", "Strawberry Plains", "New Market",
         "Kodak", "Dandridge", "Bean Station", "Jefferson City",
         "Morristown", "Madisonville", "Vonore", "Greenback",
+        # OK — Tulsa County
+        "Tulsa", "Broken Arrow", "Owasso", "Sand Springs", "Jenks",
+        "Bixby", "Sapulpa", "Glenpool", "Collinsville", "Skiatook",
+        "Sperry", "Catoosa", "Claremore", "Pryor",
     ],
     key=len,
     reverse=True,
 )
+TN_CITIES = KNOWN_CITIES  # backward compat
 
 # Set version for O(1) membership tests in standalone address validation
-_KNOWN_CITIES_SET: set[str] = {c.title() for c in TN_CITIES}
+_KNOWN_CITIES_SET: set[str] = {c.title() for c in KNOWN_CITIES}
 
 # ── Reusable suffix pattern ──────────────────────────────────────────
 # Word-boundary at the end prevents matching "Cir" inside "Circuit", etc.
@@ -216,7 +224,7 @@ FULL_PROPERTY_RE = re.compile(
     + r"([\w][\w\s]*?)"           # city name
     + _OPTIONAL_COUNTY
     + r"\s*[,.]\s*"
-    + r"(?:Tennessee|Tenn\.?|TN)"
+    + r"(?:Tennessee|Tenn\.?|TN|Oklahoma|Okla\.?|OK)"
     + r"\s*[,.\s]*"
     + r"(\d{5}(?:-\d{4})?)?",     # optional zip
     re.IGNORECASE,
@@ -237,7 +245,7 @@ LOCATED_AT_FULL_RE = re.compile(
     + r"([\w][\w\s]*?)"
     + _OPTIONAL_COUNTY
     + r"\s*[,.]\s*"
-    + r"(?:Tennessee|Tenn\.?|TN)"
+    + r"(?:Tennessee|Tenn\.?|TN|Oklahoma|Okla\.?|OK)"
     + r"\s*[,.\s]*"
     + r"(\d{5}(?:-\d{4})?)?",
     re.IGNORECASE,
@@ -256,7 +264,7 @@ STANDALONE_ADDR_RE = re.compile(
     + r"([\w][\w\s]*?)"           # city name
     + _OPTIONAL_COUNTY
     + r"\s*[,.]\s*"
-    + r"(?:Tennessee|Tenn\.?|TN)"
+    + r"(?:Tennessee|Tenn\.?|TN|Oklahoma|Okla\.?|OK)"
     + r"\s*[,.\s]*"
     + r"(\d{5}(?:-\d{4})?)?",     # optional zip
     re.IGNORECASE,
@@ -333,6 +341,7 @@ _COURTHOUSE_ZIPS = {
 _COUNTY_ZIP_PREFIXES: dict[str, list[str]] = {
     "Knox":   ["377", "378", "379"],
     "Blount": ["377", "378"],
+    "Tulsa":  ["740", "741"],
 }
 
 
@@ -453,7 +462,7 @@ PR_ADDRESS_RE = re.compile(
     r"\s*[,.\s]+\s*"
     r"([A-Za-z][\w\s]*?)"             # city
     r"\s*[,.]\s*"
-    r"(?:Tennessee|Tenn\.?|TN)"
+    r"(?:Tennessee|Tenn\.?|TN|Oklahoma|Okla\.?|OK)"
     r"\s*[,.\s]*"
     r"(\d{5})",                        # zip
     re.IGNORECASE,
@@ -754,7 +763,7 @@ async def parse_notice_page(
             if not notice.owner_street and llm_result.get("owner_street"):
                 notice.owner_street = llm_result["owner_street"]
                 notice.owner_city = llm_result.get("owner_city") or notice.owner_city
-                notice.owner_state = llm_result.get("owner_state") or "TN"
+                notice.owner_state = llm_result.get("owner_state") or ""
                 notice.owner_zip = llm_result.get("owner_zip") or notice.owner_zip
                 logger.info("LLM filled PR address: %s", notice.owner_street)
         else:
@@ -955,7 +964,7 @@ def _extract_city_zip_near(notice: NoticeData, text: str, addr_end: int) -> None
     city_state_re = re.compile(
         r"[,.\s]+([\w][\w\s]*?)"
         r"(?:\s*[,.]\s*\w+\s+County)?"   # optional county
-        r"\s*[,.]\s*(?:Tennessee|Tenn\.?|TN)"
+        r"\s*[,.]\s*(?:Tennessee|Tenn\.?|TN|Oklahoma|Okla\.?|OK)"
         r"\s*[,.\s]*(\d{5}(?:-\d{4})?)?",
         re.IGNORECASE,
     )
@@ -1088,7 +1097,7 @@ def _parse_pr_address(notice: NoticeData) -> None:
             street = street.title()
         notice.owner_street = street
         notice.owner_city = _clean_city(match.group(2))
-        notice.owner_state = "TN"
+        notice.owner_state = notice.state or ""
         notice.owner_zip = match.group(3)
         logger.debug(
             "PR address: %s, %s, TN %s",

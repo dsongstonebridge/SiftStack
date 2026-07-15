@@ -20,15 +20,17 @@ import config
 logger = logging.getLogger(__name__)
 
 # ── Regional multipliers ──────────────────────────────────────────────
-# Knoxville labor/materials costs relative to national average (1.0)
+# Regional labor/materials costs relative to national average (1.0)
 REGIONAL_MULTIPLIERS = {
-    "knoxville": 0.88,      # ~12% below national average
-    "blount": 0.86,          # Slightly lower than Knox
+    "knoxville": 0.88,
+    "blount": 0.86,
     "national": 1.00,
     "nashville": 0.95,
     "chattanooga": 0.90,
+    "tulsa": 0.82,
+    "broken arrow": 0.82,
 }
-DEFAULT_REGION = "knoxville"
+DEFAULT_REGION = ""
 
 # ── 4-Tier Finish System ─────────────────────────────────────────────
 # Cost per sqft by tier (national average, before regional multiplier)

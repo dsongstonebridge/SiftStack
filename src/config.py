@@ -23,8 +23,10 @@ SEEN_IDS_PRUNE_DAYS = 90
 CAPTCHA_FAILED_IDS_FILE = PROJECT_ROOT / "captcha_failed_ids.json"
 CAPTCHA_FAILED_PRUNE_DAYS = 14
 COOKIES_FILE = PROJECT_ROOT / "cookies.json"
+OSCN_COOKIES_FILE = PROJECT_ROOT / "oscn_cookies.json"
 DROPBOX_STATE_FILE = PROJECT_ROOT / "dropbox_state.json"
 PHOTO_STATE_FILE = PROJECT_ROOT / "photo_state.json"
+ACCLAIM_SEEN_IDS_FILE = OUTPUT_DIR / "acclaim_seen_ids.json"
 
 # ── Dropbox Watcher ────────────────────────────────────────────────────
 DROPBOX_POLL_INTERVAL = int(os.getenv("DROPBOX_POLL_INTERVAL", "900"))  # seconds (default 15 min)
@@ -69,6 +71,14 @@ BASE_URL = "https://www.tnpublicnotice.com"
 LOGIN_URL = f"{BASE_URL}/authenticate.aspx"
 SMART_SEARCH_URL = f"{BASE_URL}/Smartsearch/Default.aspx"
 
+# Oklahoma sources (no login required for OSCN; TinStar may require account)
+OSCN_SEARCH_URL = "https://www.oscn.net/dockets/Search.aspx"
+TINSTAR_REPORTS_URL = "https://www.tinstar.io/reports"
+TINSTAR_EMAIL = os.getenv("TINSTAR_EMAIL", "")
+TINSTAR_PASSWORD = os.getenv("TINSTAR_PASSWORD", "")
+ACCLAIM_EMAIL = os.getenv("acclaim_EMAIL", "")       # Tulsa County Clerk document search
+ACCLAIM_PASSWORD = os.getenv("acclaim_PASSWORD", "")
+
 # ── ASP.NET Selectors ─────────────────────────────────────────────────
 # Login form
 SEL_LOGIN_EMAIL = "#ctl00_ContentPlaceHolder1_AuthenticateIPA1_txtEmailAddress"
@@ -107,17 +117,37 @@ NOTICE_TYPES = ["foreclosure", "probate"]
 
 @dataclass
 class SavedSearch:
-    """Represents a saved search on tnpublicnotice.com."""
+    """Represents a saved search — either on tnpublicnotice.com or an OK portal."""
     county: str
     notice_type: str  # One of NOTICE_TYPES
-    saved_search_name: str  # Exact name in the Saved Searches dropdown
+    saved_search_name: str  # Display name / dropdown label
+    source: str = "tnpn"   # "tnpn" | "oscn" | "tinstar" | "oktaxrolls" | "acclaimed"
 
 
 # ── Saved Searches ─────────────────────────────────────────────────────
-# These names must match exactly what appears in the dropdown on the site.
+# TN sources: saved_search_name must match exactly what appears in the dropdown.
+# OK sources: saved_search_name is a display label only (not matched to a dropdown).
 SAVED_SEARCHES: list[SavedSearch] = [
-    SavedSearch("Knox", "foreclosure", "Foreclosure V2 Knox"),
+    # ── Tennessee — Knox & Blount (tnpublicnotice.com) ──────────────
+    SavedSearch("Knox",   "foreclosure", "Foreclosure V2 Knox"),
     SavedSearch("Blount", "foreclosure", "Foreclosure V2 Blount"),
+
+    # ── Oklahoma — Tulsa County ──────────────────────────────────────
+    # OSCN (oscn.net): court case filings — probate, eviction, and foreclosure (dcct=2)
+    # Foreclosure (CJ/dcct=2): higher volume than Acclaim but ~47% address failure;
+    # Acclaim provides address-confirmed overlap; parcel-tier dedup catches cross-source dupes
+    SavedSearch("Tulsa", "probate",     "Tulsa County Probate",          source="oscn"),
+    SavedSearch("Tulsa", "foreclosure", "Tulsa County OSCN Foreclosure", source="oscn"),
+    SavedSearch("Tulsa", "eviction",    "Tulsa County FED",              source="oscn"),
+    # TinStar: Tulsa County Sheriff scheduled auction properties (disabled -- too short lead time)
+    # SavedSearch("Tulsa", "foreclosure",    "Tulsa County Sheriff Sale",   source="tinstar"),
+    # OKTaxRolls: Tulsa County Treasurer delinquent tax list
+    SavedSearch("Tulsa", "tax_delinquent", "Tulsa County Tax Delinquent", source="oktaxrolls"),
+    # Tulsa World (Column.us): published legal notices — foreclosures, power of sale, probate RE sales
+    SavedSearch("Tulsa", "foreclosure", "Tulsa World Legal Notices", source="tulsaworld"),
+    # Acclaim (Tulsa County Clerk): recorded documents — Lis Pendens + Sheriff Deeds
+    # Every record tied to a parcel (address-confirmed). Supplements OSCN for address-confirmed records.
+    SavedSearch("Tulsa", "foreclosure", "Tulsa County Clerk Foreclosures", source="acclaimed"),
 ]
 
 # ── Entity Detection ──────────────────────────────────────────────────
@@ -127,7 +157,8 @@ BUSINESS_RE = re.compile(
     r"\b(?:LLC|L\.L\.C|INC|CORP|CORPORATION|COMPANY|CO\b|LTD|LP|L\.P|"
     r"PARTNERSHIP|ASSOCIATION|ASSOC|BANK|CREDIT UNION|CHURCH|MINISTRIES|"
     r"HOUSING|AUTHORITY|DEVELOPMENT|ENTERPRISES|PROPERTIES|INVESTMENTS|"
-    r"GROUP|HOLDINGS|MANAGEMENT|SERVICES|FOUNDATION|ORGANIZATION)\b",
+    r"GROUP|HOLDINGS|MANAGEMENT|SERVICES|FOUNDATION|ORGANIZATION|"
+    r"SCHOOL\s+DISTRICT|MUNICIPALITY|TOWNSHIP|UTILITIES)\b",
     re.IGNORECASE,
 )
 
@@ -140,6 +171,21 @@ ESTATE_OF_RE = re.compile(
     r"^(?:THE\s+)?ESTATE\s+OF\s+([\w]+(?:\s+[\w.]+)+?)(?:\s*,|\s*$)",
     re.IGNORECASE,
 )
+
+# ── Buy Box Criteria ──────────────────────────────────────────────────
+# Only rejects when Assessor data is present AND out of range.
+# Missing data passes through (Assessor lookup may not have found the property).
+BUY_BOX_SQFT_MIN   = int(os.getenv("BUY_BOX_SQFT_MIN",   "850"))
+BUY_BOX_SQFT_MAX   = int(os.getenv("BUY_BOX_SQFT_MAX",   "2000"))
+BUY_BOX_YEAR_MIN   = int(os.getenv("BUY_BOX_YEAR_MIN",   "1940"))
+BUY_BOX_YEAR_MAX   = int(os.getenv("BUY_BOX_YEAR_MAX",   "2005"))
+BUY_BOX_BATHS_MIN  = float(os.getenv("BUY_BOX_BATHS_MIN", "1.0"))
+BUY_BOX_BATHS_MAX  = float(os.getenv("BUY_BOX_BATHS_MAX", "3.0"))
+BUY_BOX_EXCLUDED_TYPES = {
+    t.strip().lower()
+    for t in os.getenv("BUY_BOX_EXCLUDED_TYPES", "Condo,Townhouse,Townhome,Condominium").split(",")
+    if t.strip()
+}
 
 _config_logger = logging.getLogger(__name__)
 

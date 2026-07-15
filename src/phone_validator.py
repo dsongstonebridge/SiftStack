@@ -475,7 +475,51 @@ def score_record_phones(
         if mutated:
             n.heir_map_json = json.dumps(heirs, ensure_ascii=False)
 
+    # Set best dial tier on each notice for tag generation
+    apply_trestle_tiers_to_notices(notices, results)
+
+    # Save to cache so phone-validate skips these later
+    _save_to_trestle_cache(results)
+
     return results
+
+
+def _save_to_trestle_cache(results: dict[str, dict]) -> None:
+    """Persist scored phones to the shared cache so phone-validate skips them."""
+    cache_path = config.OUTPUT_DIR / "phone_validation" / "trestle_scored_cache.json"
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        existing: dict = {}
+        if cache_path.exists():
+            existing = json.loads(cache_path.read_text(encoding="utf-8"))
+        for phone, info in results.items():
+            existing[phone] = {
+                "phone_number": phone,
+                "activity_score": info.get("score"),
+                "assigned_tag": info.get("tier", ""),
+                "line_type": info.get("line_type", ""),
+            }
+        cache_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+        logger.info("Trestle cache updated: %d total phones", len(existing))
+    except Exception as e:
+        logger.warning("Could not save Trestle cache: %s", e)
+
+
+def apply_trestle_tiers_to_notices(notices: list, tiers_map: dict) -> None:
+    """Set _dial_tier on each notice based on its best phone's Trestle score."""
+    tier_priority = {"Dial First": 1, "Dial Second": 2, "Dial Third": 3, "Dial Fourth": 4, "Drop": 5}
+    for n in notices:
+        phones = _collect_phones_from_notice(n)
+        best_tier = None
+        best_rank = 99
+        for p in phones:
+            info = tiers_map.get(p)
+            if info and info.get("tier") in tier_priority:
+                rank = tier_priority[info["tier"]]
+                if rank < best_rank:
+                    best_rank = rank
+                    best_tier = info["tier"]
+        n._dial_tier = best_tier or ""
 
 
 # ── Output Writers ────────────────────────────────────────────────────────
@@ -488,7 +532,8 @@ def write_datasift_tags_csv(results: list[dict], output_dir: str | Path) -> Path
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    filepath = output_dir / "phone_tags_for_datasift.csv"
+    today = datetime.now().strftime("%Y-%m-%d")
+    filepath = output_dir / f"phone_tags_for_datasift_{today}.csv"
 
     with open(filepath, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
@@ -555,7 +600,7 @@ def write_summary(
     filepath = output_dir / "summary.txt"
 
     total = len(results)
-    scores = [r["activity_score"] for r in results if r["activity_score"] is not None]
+    scores = [int(r["activity_score"]) for r in results if r["activity_score"] is not None]
     tag_counts = Counter(r["assigned_tag"] for r in results)
     line_type_counts = Counter(r["line_type"] for r in results if r["line_type"])
     avg_score = sum(scores) / len(scores) if scores else 0
@@ -662,17 +707,60 @@ def run_phone_validation(
         logger.error("No valid phone numbers found in %s", csv_path)
         return {"success": False, "message": "No valid phone numbers found"}
 
-    logger.info("Found %d phone entries (%d unique) — estimated cost: $%.2f",
-                total_entries, unique_count, unique_count * COST_PER_PHONE)
+    # Load cache of already-scored phones to avoid re-scoring
+    cache_path = output_dir / "trestle_scored_cache.json"
+    scored_cache: dict = {}
+    if cache_path.exists():
+        try:
+            scored_cache = json.loads(cache_path.read_text(encoding="utf-8"))
+            logger.info("Loaded %d previously scored phones from cache", len(scored_cache))
+        except Exception:
+            pass
 
-    # Process through Trestle API
-    results, errors = process_phones(
-        phones=phones,
-        api_key=api_key,
-        tiers=tiers,
-        add_litigator=add_litigator,
-        batch_size=batch_size,
-    )
+    # Filter out already-scored phones
+    new_phones = [(raw, cleaned) for raw, cleaned in phones if cleaned not in scored_cache]
+    cached_count = unique_count - len(dict.fromkeys(p[1] for p in new_phones))
+    new_unique = len(dict.fromkeys(p[1] for p in new_phones))
+
+    if cached_count > 0:
+        logger.info("Skipping %d already-scored phones (cache hit), %d new to score — estimated cost: $%.2f",
+                    cached_count, new_unique, new_unique * COST_PER_PHONE)
+    else:
+        logger.info("Found %d phone entries (%d unique) — estimated cost: $%.2f",
+                    total_entries, unique_count, unique_count * COST_PER_PHONE)
+
+    # Build cached results for phones we already know
+    cached_results = []
+    for raw, cleaned in phones:
+        if cleaned in scored_cache:
+            cached_results.append(scored_cache[cleaned])
+
+    # Process only NEW phones through Trestle API
+    if new_phones:
+        new_results, errors = process_phones(
+            phones=new_phones,
+            api_key=api_key,
+            tiers=tiers,
+            add_litigator=add_litigator,
+            batch_size=batch_size,
+        )
+        # Update cache with new results
+        for r in new_results:
+            cleaned = clean_phone(r.get("phone_number", ""))
+            if cleaned:
+                scored_cache[cleaned] = r
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text(json.dumps(scored_cache, indent=2), encoding="utf-8")
+            logger.info("Saved %d scored phones to cache", len(scored_cache))
+        except Exception as e:
+            logger.warning("Could not save phone cache: %s", e)
+    else:
+        new_results = []
+        errors = []
+        logger.info("All phones already scored — using cache only")
+
+    results = cached_results + new_results
 
     # Write outputs
     tag_csv = write_datasift_tags_csv(results, output_dir)
@@ -697,3 +785,122 @@ def run_phone_validation(
         "summary_path": summary,
         "tier_counts": dict(tag_counts),
     }
+
+
+def create_run_tags(
+    run_csv_path: str | Path,
+    datasift_export_path: str | Path,
+    full_tag_csv_path: str | Path,
+    api_key: str | None = None,
+    batch_size: int = 3,
+) -> Path | None:
+    """Create a tag CSV with only phones from the current run's records.
+
+    Matches run records against the DataSift export by name to collect
+    DataSift skip trace phones, also includes Tracerfy phones from the
+    run CSV, scores any unscored phones via Trestle, and writes a
+    date-stamped tag file.
+    """
+    run_csv_path = Path(run_csv_path)
+    datasift_export_path = Path(datasift_export_path)
+    full_tag_csv_path = Path(full_tag_csv_path)
+
+    if not run_csv_path.exists():
+        logger.warning("Run CSV not found: %s", run_csv_path)
+        return None
+
+    # 1. Read run CSV — get record names + any Tracerfy phones
+    run_names: set[tuple[str, str]] = set()
+    tracerfy_phones: set[str] = set()
+    tracerfy_fields = [
+        "primary_phone", "mobile_1", "mobile_2", "mobile_3", "mobile_4",
+        "mobile_5", "landline_1", "landline_2", "landline_3",
+    ]
+    with open(run_csv_path, encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            first = (row.get("first_name") or "").strip().upper()
+            last = (row.get("last_name") or "").strip().upper()
+            if first and last:
+                run_names.add((first, last))
+            for field in tracerfy_fields:
+                val = (row.get(field) or "").strip()
+                cleaned = clean_phone(val)
+                if cleaned:
+                    tracerfy_phones.add(cleaned)
+
+    logger.info("Run tags: %d records, %d Tracerfy phones from run CSV",
+                len(run_names), len(tracerfy_phones))
+
+    # 2. Match run names against DataSift export to get skip trace phones
+    datasift_phones: set[str] = set()
+    matched_names: set[tuple[str, str]] = set()
+    if datasift_export_path.exists():
+        with open(datasift_export_path, encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            phone_cols = [h for h in (reader.fieldnames or [])
+                          if h.startswith("Phone ")]
+            for row in reader:
+                first = (row.get("First Name") or "").strip().upper()
+                last = (row.get("Last Name") or "").strip().upper()
+                if (first, last) in run_names:
+                    matched_names.add((first, last))
+                    for pc in phone_cols:
+                        val = (row.get(pc) or "").strip()
+                        cleaned = clean_phone(val)
+                        if cleaned:
+                            datasift_phones.add(cleaned)
+
+    logger.info("Run tags: matched %d/%d names in DataSift export, %d skip trace phones",
+                len(matched_names), len(run_names), len(datasift_phones))
+
+    # 3. Combine all phones for this run
+    all_run_phones = datasift_phones | tracerfy_phones
+
+    if not all_run_phones:
+        logger.warning("Run tags: no phones found for this run's records")
+        return None
+
+    # 4. Load existing scored tags
+    scored: dict[str, str] = {}
+    if full_tag_csv_path.exists():
+        with open(full_tag_csv_path) as f:
+            for row in csv.DictReader(f):
+                scored[row["Phone Number"]] = row["Phone Tag"]
+
+    # 5. Score any phones not already in the tag file (e.g. Tracerfy-only phones)
+    unscored = [p for p in all_run_phones if p not in scored]
+    if unscored:
+        if not api_key:
+            api_key = config.TRESTLE_API_KEY
+        if api_key:
+            logger.info("Run tags: scoring %d unscored phones via Trestle ($%.2f)",
+                        len(unscored), len(unscored) * COST_PER_PHONE)
+            for i, phone in enumerate(unscored):
+                result = call_trestle(phone, api_key)
+                if result.get("activity_score") is not None:
+                    score = int(result["activity_score"])
+                    tag = assign_tier(score, DEFAULT_TIERS)
+                    scored[phone] = tag
+                if (i + 1) % batch_size == 0 and i + 1 < len(unscored):
+                    time.sleep(1)
+        else:
+            logger.warning("Run tags: %d phones unscored — no Trestle API key", len(unscored))
+
+    # 6. Write run-specific tag file
+    output_dir = full_tag_csv_path.parent
+    today = datetime.now().strftime("%Y-%m-%d")
+    run_tag_path = output_dir / f"phone_tags_{today}.csv"
+
+    rows = [(p, scored[p]) for p in sorted(all_run_phones) if p in scored]
+    with open(run_tag_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["Phone Number", "Phone Tag"])
+        w.writerows(rows)
+
+    tier_counts = Counter(t for _, t in rows)
+    logger.info("Run tags: wrote %d phones to %s", len(rows), run_tag_path)
+    for tier_name in DEFAULT_TIERS:
+        if tier_counts[tier_name]:
+            logger.info("  %s: %d", tier_name, tier_counts[tier_name])
+
+    return run_tag_path

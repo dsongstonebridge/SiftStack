@@ -34,16 +34,20 @@ async def _click_next_step(page: Page, timeout: int = 20000) -> bool:
     environments (Apify containers take longer than local desktop).
     """
     try:
-        btn = page.locator(
-            'button:has-text("Next Step"), '
-            'button:has-text("Next"), '
-            'button:has-text("Continue")'
-        )
+        await _dismiss_popups(page)
+        btn = page.get_by_role("button", name="Next Step")
+        if await btn.count() == 0:
+            btn = page.locator(
+                'button:has-text("Next Step"), '
+                'button:has-text("Continue")'
+            )
+        await btn.first.scroll_into_view_if_needed()
         await btn.first.wait_for(state="visible", timeout=timeout)
         await btn.first.click()
         await page.wait_for_timeout(2000)
         return True
     except PwTimeout:
+        await _screenshot(page, "next_step_not_found")
         logger.warning("Next Step button not found within %dms", timeout)
         return False
 
@@ -92,21 +96,25 @@ async def upload_csv(
 
     # ── Step 1: Click "Upload File" in sidebar ──
     logger.info("Step 1: Clicking Upload File...")
-    # Navigate to records page (skip if already there from login)
-    if "/records" not in page.url:
-        await page.goto(DATASIFT_UPLOAD_URL, wait_until="domcontentloaded")
+    # Always navigate to records page to ensure sidebar is loaded
+    await page.goto(DATASIFT_UPLOAD_URL, wait_until="domcontentloaded")
     # Wait for SPA to fully render (longer for headless/cloud environments)
     await page.wait_for_timeout(8000)
 
-    # Dismiss notifications popup if present
+    # Dismiss browser notification prompt and any overlay popups early,
+    # before opening the wizard, so they don't intercept wizard clicks.
     try:
+        # The browser notification prompt has NO THANKS / ALLOW buttons
         no_thanks = page.locator('button:has-text("NO, THANKS"), button:has-text("No, thanks")')
         if await no_thanks.count() > 0:
             await no_thanks.first.click()
-            await page.wait_for_timeout(500)
+            await page.wait_for_timeout(1000)
             logger.debug("Dismissed notifications popup")
+        await _dismiss_popups(page)
     except Exception as e:
         logger.debug("Popup dismissal failed: %s", e)
+
+    await _screenshot(page, "step1_before_upload_btn")
 
     try:
         # The Upload File button is in the sidebar — it's a styled element, not a <button>
@@ -119,6 +127,7 @@ async def upload_csv(
                 '[data-testid="upload-file"]'
             )
         if await upload_btn.count() > 0:
+            await upload_btn.first.scroll_into_view_if_needed()
             await upload_btn.first.click()
             await page.wait_for_timeout(3000)
         else:
@@ -303,69 +312,51 @@ async def upload_csv(
     # Click "Next Step" to proceed to step 2
     await _click_next_step(page, timeout=30000)
 
-    # ── Wizard Step 2: Add tags ──
-    logger.info("Wizard Step 2: Adding 'Courthouse Data' tag...")
+    # ── Wizard Step 2 (optional): Enrichment ──
+    # DataSift added an Enrichment step between Setup and Add Tags.
+    # Detect by "Auto-Enrichment" heading and click through with defaults (Swap Owners OFF).
+    await page.wait_for_timeout(2000)
+    await _screenshot(page, "step2_enrichment_check")
+    enrichment_check = page.locator('text="Auto-Enrichment"')
+    if await enrichment_check.count() > 0:
+        logger.info("Wizard Step 2 (Enrichment): detected — leaving defaults, clicking Next Step...")
+        await _dismiss_popups(page)
+        await _click_next_step(page, timeout=15000)
+        await page.wait_for_timeout(1500)
+
+    # ── Wizard Step 3: Add tags ──
+    logger.info("Wizard Step 3: Adding 'Courthouse Data' tag...")
     await page.wait_for_timeout(1000)
-    await _screenshot(page, "step2_tags")
+    await _dismiss_popups(page)
+    await _screenshot(page, "step3_tags")
 
     # Add "Courthouse Data" tag via the Custom Tags input on the right side
     try:
+        await _dismiss_popups(page)
         tag_input = page.locator('input[placeholder*="Search or add a new tag"]')
         if await tag_input.count() > 0:
-            # Click input first, then type to trigger autocomplete dropdown
-            await tag_input.first.click()
+            await tag_input.first.click(force=True)
             await page.wait_for_timeout(500)
             await tag_input.first.fill("")
             await page.wait_for_timeout(300)
             await tag_input.first.type("Courthouse Data", delay=50)
             await page.wait_for_timeout(1500)
-            await _screenshot(page, "step2_tag_typed")
+            await _dismiss_popups(page)
+            await _screenshot(page, "step3_tag_typed")
 
             # Check if "Courthouse Data" appears in autocomplete dropdown — click it
-            tag_option = page.locator('text="Courthouse Data"')
-            tag_count = await tag_option.count()
-            if tag_count > 1:
-                # Multiple matches — click the one in the dropdown (not the input)
-                await tag_option.nth(1).click()
+            tag_option = page.locator('[role="option"]:has-text("Courthouse Data"), li:has-text("Courthouse Data")')
+            if await tag_option.count() > 0:
+                await tag_option.first.click(force=True)
                 await page.wait_for_timeout(1000)
                 logger.info("Selected 'Courthouse Data' from dropdown")
-            elif tag_count == 1:
-                # Check if it's the input value or a dropdown option
-                tag_box = await tag_option.first.bounding_box()
-                if tag_box and tag_box["y"] > 350:
-                    # It's below the input — it's a dropdown option
-                    await tag_option.first.click()
-                    await page.wait_for_timeout(1000)
-                    logger.info("Selected 'Courthouse Data' from dropdown")
-                else:
-                    # It's the input itself — use JS to click "Add" or press Enter
-                    await tag_input.first.press("Enter")
-                    await page.wait_for_timeout(1000)
-                    logger.info("Added 'Courthouse Data' tag (via Enter)")
             else:
-                # No dropdown match — click "Add" via JS to create new tag
-                added = await page.evaluate('''() => {
-                    const els = document.querySelectorAll('span, div, a, button, p');
-                    for (const el of els) {
-                        const text = el.textContent.trim();
-                        const rect = el.getBoundingClientRect();
-                        if (text === "Add" && rect.width > 0 && rect.width < 60
-                            && rect.x > 700 && rect.y > 250 && rect.y < 400) {
-                            el.click();
-                            return true;
-                        }
-                    }
-                    return false;
-                }''')
-                if added:
-                    await page.wait_for_timeout(1000)
-                    logger.info("Created 'Courthouse Data' tag via Add button")
-                else:
-                    await tag_input.first.press("Enter")
-                    await page.wait_for_timeout(1000)
-                    logger.info("Added 'Courthouse Data' tag (via Enter fallback)")
+                # No dropdown option — press Enter to create the tag
+                await tag_input.first.press("Enter")
+                await page.wait_for_timeout(1000)
+                logger.info("Added 'Courthouse Data' tag via Enter")
 
-            await _screenshot(page, "step2_tag_added")
+            await _screenshot(page, "step3_tag_added")
         else:
             logger.warning("Tag input not found — 'Courthouse Data' tag NOT added")
     except Exception as e:
@@ -373,10 +364,11 @@ async def upload_csv(
 
     await _click_next_step(page)
 
-    # ── Wizard Step 3: Upload the file ──
-    logger.info("Wizard Step 3: Uploading CSV file: %s", csv_path.name)
+    # ── Wizard Step 4: Upload the file ──
+    logger.info("Wizard Step 4: Uploading CSV file: %s", csv_path.name)
     await page.wait_for_timeout(3000)
-    await _screenshot(page, "step3_before_upload")
+    await _dismiss_popups(page)
+    await _screenshot(page, "step4_before_upload")
 
     try:
         file_input = page.locator('input[type="file"]')
@@ -393,7 +385,7 @@ async def upload_csv(
             logger.info("CSV file selected: %s", csv_path.name)
             await page.wait_for_timeout(3000)
         else:
-            await _screenshot(page, "step3_no_file_input")
+            await _screenshot(page, "step4_no_file_input")
             result["message"] = "Could not find file input element"
             logger.error(result["message"])
             return result
@@ -402,11 +394,11 @@ async def upload_csv(
         logger.error(result["message"])
         return result
 
-    await _screenshot(page, "step3_file_uploaded")
+    await _screenshot(page, "step4_file_uploaded")
     await _click_next_step(page)
 
-    # ── Wizard Step 4: Map the columns ──
-    logger.info("Wizard Step 4: Column mapping — mapping Tags and Lists...")
+    # ── Wizard Step 5: Map the columns ──
+    logger.info("Wizard Step 5: Column mapping — mapping Tags and Lists...")
     await page.wait_for_timeout(3000)
     await _screenshot(page, "step4_column_mapping")
 
@@ -584,17 +576,28 @@ async def _filter_by_list(page: Page, list_name: str) -> bool:
         list_search = page.locator('input[placeholder*="Search for lists"]')
         if await list_search.count() > 0:
             await list_search.first.fill(list_name)
-            await page.wait_for_timeout(2000)
+            await page.wait_for_timeout(3000)
 
             await _screenshot(page, "filter_list_searched")
 
-            # Click the matching list option in the dropdown
-            list_option = page.locator(f'text="{list_name}"')
+            # Wait for the dropdown to filter, then click the matching option.
+            # Try an exact match first; fall back to contains-text for partial matches.
+            list_option = page.locator(f'[role="option"]:has-text("{list_name}")')
+            if await list_option.count() == 0:
+                list_option = page.locator(f'li:has-text("{list_name}")')
+            if await list_option.count() == 0:
+                # Last resort: any element in the dropdown containing the name
+                list_option = page.locator(f'text="{list_name}"')
+
             if await list_option.count() > 0:
-                # Use the last match (the one in the dropdown, not the input field)
                 await list_option.last.click()
                 await page.wait_for_timeout(1000)
                 logger.info("Selected list filter: %s", list_name)
+            else:
+                # Dropdown may not be filtering — try pressing Enter to confirm typed value
+                await list_search.first.press("Enter")
+                await page.wait_for_timeout(1000)
+                logger.warning("List option not found in dropdown for '%s' — pressed Enter", list_name)
         else:
             logger.warning("'Search for lists...' input not found")
 
@@ -624,7 +627,14 @@ async def _filter_by_list(page: Page, list_name: str) -> bool:
 
 
 async def _select_all_records(page: Page) -> bool:
-    """Select all records on the current page. Returns True if selected."""
+    """Select all records matching the current filter. Returns True if selected.
+
+    Tries three strategies in order, stopping at the first that works:
+      0. CheckboxDropdown "Select Max" — selects ALL pages at once (most reliable)
+      1. Header checkbox click → "Select all X records" banner
+      2. Individual JS checkbox clicks (fallback, selects visible page only)
+    """
+    import re as _re
     try:
         # Dismiss popups aggressively — the notification popup blocks all clicks
         await _dismiss_popups(page)
@@ -632,77 +642,127 @@ async def _select_all_records(page: Page) -> bool:
         await _dismiss_popups(page)
         await page.wait_for_timeout(500)
 
+        # Switch to "All" tab so incomplete/unprocessed records are visible
+        all_tab = page.locator('button:has-text("All"), [role="tab"]:has-text("All")')
+        if await all_tab.count() > 0:
+            await all_tab.first.click()
+            await page.wait_for_timeout(1500)
+            logger.debug("Switched to All tab")
+
+        # Wait for records to appear in the table (import may still be processing)
+        for wait_attempt in range(6):
+            row_count = await page.evaluate("""() => {
+                const rows = document.querySelectorAll('table tbody tr, [class*="TableRow"]');
+                return rows.length;
+            }""")
+            if row_count > 0:
+                logger.info("Records table loaded: %d rows visible", row_count)
+                break
+            logger.info("Waiting for records to load (attempt %d/6)...", wait_attempt + 1)
+            await page.wait_for_timeout(10_000)
+            await _dismiss_popups(page)
+        else:
+            logger.warning("Records table still empty after 60s — import may be pending")
+
         await _screenshot(page, "before_select_all")
 
-        # Strategy 1: Find the header checkbox position via JS, then use Playwright
-        # mouse.click to properly trigger React's event system.
-        # The header checkbox is near the "OWNER" column header text.
-        header_pos = await page.evaluate("""() => {
-            // Find the OWNER header text element
-            const allEls = document.querySelectorAll('*');
-            for (const el of allEls) {
-                if (el.textContent.trim() === 'OWNER' && el.children.length === 0) {
-                    const rect = el.getBoundingClientRect();
-                    // The header checkbox is in the same row, to the left
-                    // Find the nearest checkbox (same vertical position)
-                    const checkboxes = document.querySelectorAll('input[type="checkbox"]');
-                    let best = null;
-                    let bestDist = Infinity;
-                    for (const cb of checkboxes) {
-                        if (cb.classList.contains('react-toggle-screenreader-only')) continue;
-                        const cbRect = cb.getBoundingClientRect();
-                        // Must be roughly same Y position (within 30px) and to the left
-                        const yDist = Math.abs(cbRect.top - rect.top);
-                        if (yDist < 30 && cbRect.left < rect.left) {
-                            if (yDist < bestDist) {
-                                bestDist = yDist;
-                                best = cbRect;
+        # ── Strategy 0: "Select All" checkbox dropdown ────────────────────
+        # DataSift Records has a small chevron/arrow next to the header checkbox
+        # that opens a dropdown with "Select All", "Select Max", "Select Visible" etc.
+        # Try multiple selector patterns — the class name differs between Records
+        # and SiftMap pages.
+        selected_via_dropdown = False
+        _dropdown_candidates = [
+            page.locator('[class*="CheckboxDropdown"]').first,
+            # Arrow/chevron adjacent to header checkbox
+            page.locator('th input[type="checkbox"] ~ [class*="arrow"], '
+                         'th input[type="checkbox"] ~ svg, '
+                         'th [class*="chevron"], th [class*="caret"]').first,
+            # Small button/div to the right of the header checkbox row
+            page.locator('thead [class*="dropdown"], thead [class*="Dropdown"]').first,
+        ]
+        for _dd in _dropdown_candidates:
+            if await _dd.count() > 0:
+                await _dd.click()
+                await page.wait_for_timeout(1000)
+                # Look for any "Select All" / "Select Max" option in the opened menu
+                _select_all_opt = page.get_by_text(
+                    _re.compile(r"Select\s+(All|Max)", _re.IGNORECASE)
+                )
+                if await _select_all_opt.count() > 0:
+                    opt_text = await _select_all_opt.first.text_content() or "Select All"
+                    await _select_all_opt.first.click()
+                    await page.wait_for_timeout(2000)
+                    logger.info("Selected all via dropdown: %s", opt_text.strip())
+                    selected_via_dropdown = True
+                    break
+                else:
+                    await page.keyboard.press("Escape")
+                    await page.wait_for_timeout(500)
+
+        if not selected_via_dropdown:
+            # ── Strategy 1: Header checkbox + "Select all X records" banner ──
+            # Click the table header checkbox (selects current page), which triggers
+            # a DataSift banner letting you extend the selection to all pages.
+            header_pos = await page.evaluate("""() => {
+                // Find the OWNER header text element
+                const allEls = document.querySelectorAll('*');
+                for (const el of allEls) {
+                    const t = el.textContent.trim().toUpperCase();
+                    if ((t === 'OWNER' || t === 'OWNER NAME') && el.children.length === 0) {
+                        const rect = el.getBoundingClientRect();
+                        const checkboxes = document.querySelectorAll('input[type="checkbox"]');
+                        let best = null;
+                        let bestDist = Infinity;
+                        for (const cb of checkboxes) {
+                            if (cb.classList.contains('react-toggle-screenreader-only')) continue;
+                            const cbRect = cb.getBoundingClientRect();
+                            const yDist = Math.abs(cbRect.top - rect.top);
+                            if (yDist < 30 && cbRect.left < rect.left) {
+                                if (yDist < bestDist) {
+                                    bestDist = yDist;
+                                    best = cbRect;
+                                }
                             }
                         }
-                    }
-                    if (best) {
-                        return {x: best.left + best.width/2, y: best.top + best.height/2};
+                        if (best) {
+                            return {x: best.left + best.width/2, y: best.top + best.height/2};
+                        }
                     }
                 }
-            }
-            return null;
-        }""")
-
-        if header_pos:
-            # Use Playwright mouse click which properly triggers React events
-            await page.mouse.click(header_pos["x"], header_pos["y"])
-            clicked_header = f"clicked at ({header_pos['x']:.0f}, {header_pos['y']:.0f})"
-            logger.info("Clicked header checkbox via coordinates: %s", clicked_header)
-            await page.wait_for_timeout(1500)
-        else:
-            clicked_header = None
-
-        if clicked_header:
-            logger.info("Clicked header checkbox via JS: %s", clicked_header)
-            await page.wait_for_timeout(1500)
-        else:
-            # Strategy 2: Click each record checkbox individually via JS
-            clicked_count = await page.evaluate("""() => {
-                const checkboxes = document.querySelectorAll('input[type="checkbox"]');
-                let clicked = 0;
-                for (const cb of checkboxes) {
-                    if (cb.classList.contains('react-toggle-screenreader-only')) continue;
-                    cb.click();
-                    clicked++;
-                }
-                return clicked;
+                return null;
             }""")
-            logger.info("Clicked %d checkboxes via JS (all non-toggle)", clicked_count)
-            await page.wait_for_timeout(1500)
+
+            if header_pos:
+                await page.mouse.click(header_pos["x"], header_pos["y"])
+                logger.info("Clicked header checkbox via coordinates: (%.0f, %.0f)",
+                            header_pos["x"], header_pos["y"])
+                await page.wait_for_timeout(1500)
+
+                # DataSift shows a "Select all X records" banner after header click.
+                # Use partial match (text=...) — banner text includes the record count.
+                select_all_link = page.locator('text=Select all')
+                if await select_all_link.count() > 0:
+                    await select_all_link.first.click()
+                    await page.wait_for_timeout(1000)
+                    logger.info("Clicked 'Select all' records banner")
+            else:
+                # ── Strategy 2: Individual JS clicks (visible page only) ───────
+                clicked_count = await page.evaluate("""() => {
+                    const checkboxes = document.querySelectorAll('input[type="checkbox"]');
+                    let clicked = 0;
+                    for (const cb of checkboxes) {
+                        if (cb.classList.contains('react-toggle-screenreader-only')) continue;
+                        cb.click();
+                        clicked++;
+                    }
+                    return clicked;
+                }""")
+                logger.info("Clicked %d checkboxes via JS (visible page only — all-pages "
+                            "selection unavailable)", clicked_count)
+                await page.wait_for_timeout(1500)
 
         await _screenshot(page, "records_selected_header")
-
-        # After checking the header checkbox, a "Select All X records" banner may appear
-        select_all_link = page.locator('text="Select all"')
-        if await select_all_link.count() > 0:
-            await select_all_link.first.click()
-            await page.wait_for_timeout(1000)
-            logger.debug("Clicked 'Select all' records link")
 
         # Verify: check if Manage or Send To buttons are now visible
         manage_visible = await page.locator('button:has-text("Manage")').count() > 0
@@ -755,6 +815,7 @@ async def enrich_records(page: Page, list_name: str) -> dict:
             return result
 
         # Click Manage dropdown
+        await _dismiss_popups(page)
         manage_btn = page.locator('button:has-text("Manage")')
         if await manage_btn.count() == 0:
             manage_btn = page.locator('text="Manage"')
@@ -1008,6 +1069,8 @@ async def upload_to_datasift(
     headless: bool = True,
     enrich: bool = True,
     skip_trace: bool = True,
+    mode: str = "add",
+    list_name: str | None = None,
 ) -> dict:
     """Full DataSift workflow: launch browser → login → upload CSV → enrich → skip trace.
 
@@ -1018,6 +1081,8 @@ async def upload_to_datasift(
         headless: Run browser in headless mode.
         enrich: Run "Enrich Property Information" after upload (default True).
         skip_trace: Run "Skip Trace" after upload (default True, uses unlimited plan).
+        mode: "add" (new/existing) or "update" (update existing records in place).
+        list_name: Target list name. Required when mode="update"; auto-generated otherwise.
 
     Returns:
         Dict with upload results including enrich_result and skip_trace_result.
@@ -1036,7 +1101,7 @@ async def upload_to_datasift(
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=headless)
         context = await browser.new_context(
-            viewport={"width": 1280, "height": 720},
+            viewport={"width": 1280, "height": 900},
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -1056,23 +1121,29 @@ async def upload_to_datasift(
                     "message": "DataSift login failed",
                 }
 
+            # Derive the effective list name before upload
+            from datetime import datetime as _dt
+            effective_list_name = list_name or f"SiftStack {_dt.now().strftime('%Y-%m-%d')}"
+            existing_list = mode == "update"
+
             # Upload CSV
-            result = await upload_csv(page, csv_path)
+            result = await upload_csv(
+                page, csv_path,
+                mode=mode,
+                list_name=effective_list_name,
+                existing_list=existing_list,
+            )
 
             if result.get("success"):
-                # Derive list name (same format as upload_csv generates)
-                from datetime import datetime as _dt
-                list_name = f"SiftStack {_dt.now().strftime('%Y-%m-%d')}"
-
                 # Enrich property data via SiftMap
                 if enrich:
-                    enrich_result = await enrich_records(page, list_name)
+                    enrich_result = await enrich_records(page, effective_list_name)
                     result["enrich_result"] = enrich_result
                     logger.info("Enrichment: %s", enrich_result.get("message", ""))
 
                 # Skip trace for phones + emails
                 if skip_trace:
-                    skip_result = await skip_trace_records(page, list_name)
+                    skip_result = await skip_trace_records(page, effective_list_name)
                     result["skip_trace_result"] = skip_result
                     logger.info("Skip trace: %s", skip_result.get("message", ""))
 
@@ -1122,7 +1193,7 @@ async def upload_datasift_split(
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=headless)
         context = await browser.new_context(
-            viewport={"width": 1280, "height": 720},
+            viewport={"width": 1280, "height": 900},
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -1803,6 +1874,7 @@ async def run_phone_validation_workflow(
     tiers: dict | None = None,
     add_litigator: bool = False,
     batch_size: int = 10,
+    run_csv: str | None = None,
 ) -> dict:
     """Full phone validation workflow: export → validate → upload tags.
 
@@ -1849,7 +1921,7 @@ async def run_phone_validation_workflow(
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=headless)
             context = await browser.new_context(
-                viewport={"width": 1280, "height": 720},
+                viewport={"width": 1280, "height": 900},
                 user_agent=(
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -1900,6 +1972,20 @@ async def run_phone_validation_workflow(
 
     tag_csv_path = validation_result["tag_csv_path"]
 
+    # Create run-specific tag file if --run-csv provided
+    if run_csv and tag_csv_path:
+        from phone_validator import create_run_tags
+        run_tag_csv = create_run_tags(
+            run_csv_path=run_csv,
+            datasift_export_path=phone_csv_path,
+            full_tag_csv_path=tag_csv_path,
+            api_key=api_key,
+            batch_size=batch_size,
+        )
+        if run_tag_csv:
+            result["run_tag_csv"] = str(run_tag_csv)
+            tag_csv_path = str(run_tag_csv)
+
     # Upload phone tags back to DataSift
     if upload_tags and tag_csv_path:
         if not email or not password:
@@ -1908,7 +1994,7 @@ async def run_phone_validation_workflow(
             async with async_playwright() as p:
                 browser = await p.chromium.launch(headless=headless)
                 context = await browser.new_context(
-                    viewport={"width": 1280, "height": 720},
+                    viewport={"width": 1280, "height": 900},
                     user_agent=(
                         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -2431,21 +2517,19 @@ async def _siftmap_search_sold(
     import json as _json
     from urllib.parse import quote as _quote
 
-    # County FIPS codes for TN counties
     COUNTY_FIPS = {
         "Knox": "47093",
         "Blount": "47009",
+        "Tulsa": "40143",
     }
+    _COUNTY_STATE = {"Knox": "TN", "Blount": "TN", "Tulsa": "OK"}
 
     result = {"success": False, "records_added": 0, "message": ""}
 
     try:
-        # ── Step 1: Navigate directly via URL with all filters ──
-        # This is far more reliable than interacting with the calendar UI.
-        # URL params: location (county JSON), date range, min sale price.
-        fips = COUNTY_FIPS.get(county, "47093")
+        fips = COUNTY_FIPS.get(county, "")
+        county_state = _COUNTY_STATE.get(county, "")
 
-        # Convert dates from MM/DD/YYYY to YYYY-MM-DD for URL params
         from datetime import datetime as _dt
         start_dt = _dt.strptime(start_date, "%m/%d/%Y")
         end_dt = _dt.strptime(end_date, "%m/%d/%Y")
@@ -2454,9 +2538,9 @@ async def _siftmap_search_sold(
 
         location = _json.dumps({
             "searchType": "county",
-            "title": f"{county} County, TN",
+            "title": f"{county} County, {county_state}",
             "county": county,
-            "state": "TN",
+            "state": county_state,
             "counties": [{"fips": fips, "county_name": county}],
         })
 

@@ -33,6 +33,7 @@ class PipelineOptions:
     # Step skip flags (default: run everything)
     skip_filter_sold: bool = True  # only CSV re-import sets False
     skip_vacant_filter: bool = False
+    skip_buy_box_filter: bool = False
     skip_entity_filter: bool = False
     skip_entity_research: bool = True   # opt-in via --research-entities
     skip_commercial_filter: bool = False
@@ -159,6 +160,50 @@ def _filter_entity_owners(notices: list[NoticeData]) -> list[NoticeData]:
     return result
 
 
+def filter_buy_box(notices: list[NoticeData]) -> list[NoticeData]:
+    """Drop records where Assessor property data falls outside buy box criteria.
+
+    Only rejects when a field is populated and out of range — missing data
+    (no Assessor match yet) passes through so records aren't lost upstream.
+    """
+    passed, dropped = [], []
+    for n in notices:
+        reasons = []
+        if n.property_type and n.property_type.lower() in config.BUY_BOX_EXCLUDED_TYPES:
+            reasons.append(f"property_type={n.property_type} (excluded type)")
+        if n.sqft:
+            try:
+                v = int(str(n.sqft).replace(",", ""))
+                if not (config.BUY_BOX_SQFT_MIN <= v <= config.BUY_BOX_SQFT_MAX):
+                    reasons.append(f"sqft={v} (need {config.BUY_BOX_SQFT_MIN}-{config.BUY_BOX_SQFT_MAX})")
+            except (ValueError, TypeError):
+                pass
+        if n.year_built:
+            try:
+                v = int(str(n.year_built))
+                if not (config.BUY_BOX_YEAR_MIN <= v <= config.BUY_BOX_YEAR_MAX):
+                    reasons.append(f"year_built={v} (need {config.BUY_BOX_YEAR_MIN}-{config.BUY_BOX_YEAR_MAX})")
+            except (ValueError, TypeError):
+                pass
+        if n.bathrooms:
+            try:
+                v = float(str(n.bathrooms))
+                if not (config.BUY_BOX_BATHS_MIN <= v <= config.BUY_BOX_BATHS_MAX):
+                    reasons.append(f"bathrooms={v} (need {config.BUY_BOX_BATHS_MIN}-{config.BUY_BOX_BATHS_MAX})")
+            except (ValueError, TypeError):
+                pass
+        if reasons:
+            dropped.append((n, ", ".join(reasons)))
+        else:
+            passed.append(n)
+    if dropped:
+        for n, reason in dropped:
+            logger.info("  Buy box REJECT: %s @ %s -- %s",
+                        n.owner_name or n.decedent_name, n.address, reason)
+        logger.info("Buy box: %d passed, %d rejected", len(passed), len(dropped))
+    return passed
+
+
 def _filter_commercial(notices: list[NoticeData]) -> list[NoticeData]:
     """Remove records with Smarty RDI = 'Commercial'.
 
@@ -199,11 +244,15 @@ _GARBAGE_RE = re.compile(r"^[^a-zA-Z0-9]*$")
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
-def _validate_records(notices: list[NoticeData]) -> list[NoticeData]:
+def _validate_records(
+    notices: list[NoticeData],
+    require_address: bool = True,
+) -> list[NoticeData]:
     """Validate records before export. Removes invalid records and logs issues.
 
     Checks:
-      - address, city, zip must be non-empty
+      - address, city, zip must be non-empty (skipped when require_address=False,
+        e.g. OSCN court records that don't carry property addresses)
       - address must contain at least one letter (not pure garbage OCR)
       - date fields must be valid YYYY-MM-DD format if present
     """
@@ -213,17 +262,21 @@ def _validate_records(notices: list[NoticeData]) -> list[NoticeData]:
     for n in notices:
         issues = []
 
-        # Required fields
-        if not n.address.strip():
-            issues.append("missing address")
-        elif _GARBAGE_RE.match(n.address):
+        if require_address:
+            # Required fields — only enforced when Smarty geocoding ran
+            if not n.address.strip():
+                issues.append("missing address")
+            elif _GARBAGE_RE.match(n.address):
+                issues.append(f"garbage address: {n.address!r}")
+
+            if not n.city.strip():
+                issues.append("missing city")
+
+            if not n.zip.strip():
+                issues.append("missing zip")
+        elif n.address.strip() and _GARBAGE_RE.match(n.address):
+            # Even without full validation, reject pure garbage
             issues.append(f"garbage address: {n.address!r}")
-
-        if not n.city.strip():
-            issues.append("missing city")
-
-        if not n.zip.strip():
-            issues.append("missing zip")
 
         # Date format validation (only if populated)
         for date_field in ("date_added", "auction_date"):
@@ -353,7 +406,7 @@ def run_enrichment_pipeline(
         if n.notice_type == "probate"
         and not n.address.strip()
         and n.decedent_name.strip()
-        and n.county.lower() == "knox"
+        and n.county.lower() in ("knox", "tulsa")
     ]
     if probate_no_addr:
         logger.info("── Step 3c: Probate Property Lookup (%d candidates) ──", len(probate_no_addr))
@@ -372,7 +425,7 @@ def run_enrichment_pipeline(
         candidates = [
             n
             for n in notices
-            if n.parcel_id.strip() and n.county.lower() == "knox"
+            if n.parcel_id.strip() and n.county.lower() in ("knox", "tulsa")
         ]
         if candidates:
             logger.info(
@@ -411,6 +464,16 @@ def run_enrichment_pipeline(
         logger.info("── Step 5: Tax Delinquency (skipped) ──")
 
     # ── Step 6: Smarty Address Standardization ───────────────────────
+    # Grid-street ordinal fix (e.g. "74 Ct" -> "74th Ct") is free local string
+    # normalization, no API cost — runs even on --skip-smarty runs so the
+    # paid USPS validation can be skipped without losing this correction.
+    try:
+        from address_standardizer import normalize_grid_addresses
+
+        normalize_grid_addresses(notices)
+    except ImportError:
+        pass
+
     if not opts.skip_smarty and not opts.has_smarty:
         if config.SMARTY_AUTH_ID and config.SMARTY_AUTH_TOKEN:
             logger.info("── Step 6: Smarty Address Standardization ──")
@@ -452,6 +515,22 @@ def run_enrichment_pipeline(
             return notices
     else:
         logger.info("── Step 6a: Commercial Property Filter (skipped) ──")
+
+    # ── Step 6b: Buy Box Filter ──────────────────────────────────────────
+    # Runs on Assessor data (sqft/year_built/bathrooms populated before pipeline).
+    # Placed before Zillow (Step 8) to avoid wasting quota on out-of-box records.
+    if not opts.skip_buy_box_filter:
+        logger.info("── Step 6b: Buy Box Filter ──")
+        before = len(notices)
+        notices = filter_buy_box(notices)
+        removed = before - len(notices)
+        logger.info("  %d records after buy box filter%s", len(notices),
+                    f" ({removed} rejected)" if removed else "")
+        if not notices:
+            logger.warning("No records remaining after buy box filter")
+            return notices
+    else:
+        logger.info("── Step 6b: Buy Box Filter (skipped) ──")
 
     # ── Step 7: Reverse Geocode Retry ────────────────────────────────
     if (
@@ -548,9 +627,13 @@ def run_enrichment_pipeline(
         logger.info("── Step 9: Obituary (skipped) ──")
 
     # ── Step 9b: Data Validation ────────────────────────────────────
+    # Address/city/zip are only required when Smarty geocoding ran — those fields
+    # come from Smarty. Records from court portals (OSCN) legitimately have no
+    # address until a separate property-lookup step enriches them.
     logger.info("── Step 9b: Data Validation ──")
     before = len(notices)
-    notices = _validate_records(notices)
+    smarty_ran = not opts.skip_smarty and opts.has_smarty
+    notices = _validate_records(notices, require_address=smarty_ran)
     logger.info("  %d records after validation", len(notices))
     if not notices:
         logger.warning("No records remaining after validation")

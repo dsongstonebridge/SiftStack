@@ -229,7 +229,10 @@ def process_pdf(
     if date_added is None:
         date_added = datetime.now().strftime("%Y-%m-%d")
 
-    default_city = "Knoxville" if county.lower() == "knox" else "Maryville"
+    _COUNTY_DEFAULT_CITY = {"knox": "Knoxville", "blount": "Maryville", "tulsa": "Tulsa"}
+    _COUNTY_STATE = {"knox": "TN", "blount": "TN", "tulsa": "OK"}
+    default_city = _COUNTY_DEFAULT_CITY.get(county.lower(), "")
+    county_state = _COUNTY_STATE.get(county.lower(), "")
     use_llm = api_key and not regex_only
 
     logger.info("Processing PDF: %s (%s County)", pdf_path.name, county)
@@ -272,7 +275,7 @@ def process_pdf(
         notice = NoticeData(
             address=row["address"],
             city=default_city,
-            state="TN",
+            state=county_state or "",
             owner_name=row.get("owner_name", ""),
             notice_type="tax_sale",
             county=county,

@@ -147,7 +147,7 @@ async def login(page, email: str = None, password: str = None) -> bool:
         await page.goto(DATASIFT_RECORDS_URL, wait_until="domcontentloaded")
         await page.wait_for_timeout(5000)
         current_url = page.url
-        if "/login" not in current_url and ("/dashboard" in current_url or "/records" in current_url):
+        if "/login" not in current_url and "next=" not in current_url:
             logger.info("DataSift session restored from cookies")
             return True
         logger.info("DataSift cookies expired (url=%s), doing fresh login", current_url)
@@ -159,24 +159,39 @@ async def login(page, email: str = None, password: str = None) -> bool:
     await page.get_by_role("textbox", name="Email").fill(email)
     await page.get_by_role("textbox", name="Password").fill(password)
 
-    # Hidden checkboxes — click labels, not inputs
-    remember_label = page.locator('label:has-text("Remember me")')
-    if await remember_label.count() > 0:
-        await remember_label.first.click()
+    # Toggle checkboxes via dispatch_event on the hidden inputs (they have
+    # zero dimensions so Playwright's click() fails, but dispatch_event
+    # fires React's onChange correctly).
+    agree_cb = page.locator('input[name="agree"]')
+    if await agree_cb.count() > 0:
+        await agree_cb.first.dispatch_event("click")
+    remember_cb = page.locator('input[name="remember"]')
+    if await remember_cb.count() > 0:
+        await remember_cb.first.dispatch_event("click")
 
-    terms_label = page.locator('label:has-text("I\'ve read and agree")')
-    if await terms_label.count() > 0:
-        await terms_label.first.click()
+    # Brief pause for React state to propagate
+    await page.wait_for_timeout(500)
 
-    # Click Sign In
-    await page.get_by_role("button", name="Sign In").click()
-
-    # Wait for navigation away from login page
+    # Wait for Sign In button to become enabled, then click
+    signin_btn = page.get_by_role("button", name="Sign In")
     try:
-        await page.wait_for_url("**/dashboard/general**", timeout=15000)
-    except PwTimeout:
-        if "/login" in page.url:
-            logger.error("DataSift login failed — still on login page")
+        await signin_btn.click(timeout=10000)
+    except Exception as e:
+        logger.error("Sign In click failed: %s", e)
+        await screenshot(page, "login_signin_failed")
+        return False
+
+    # Wait for app to load (sidebar or dashboard content)
+    await page.wait_for_timeout(10000)
+    await screenshot(page, "login_after_signin")
+
+    # Check if we're still on the login page
+    current = page.url
+    if "/login" in current or "next=" in current:
+        # Check page content — sometimes URL stays /login but SPA loads dashboard
+        has_sidebar = await page.locator('text="Dashboard"').count()
+        if has_sidebar == 0:
+            logger.error("DataSift login failed — still on login page (url=%s)", current)
             return False
 
     await save_cookies(page)
@@ -242,6 +257,11 @@ async def dismiss_popups(page) -> None:
                     removed++;
                 }
             }
+            // Remove DataSift modal/aside overlays that block pointer events
+            document.querySelectorAll(
+                '[class*="ModalOverlay"], [class*="modal-overlay"], '
+                + '[id="asideOverlay"], [class*="AsideOverlay"], [class*="aside-overlay"]'
+            ).forEach(el => { el.remove(); removed++; });
             return removed;
         }""")
         if removed:

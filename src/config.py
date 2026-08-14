@@ -70,6 +70,7 @@ ENFORMION_AP_PASSWORD = os.getenv("ENFORMION_AP_PASSWORD", "")  # Enformion/Enda
 SCRAPFLY_KEY = os.getenv("SCRAPFLY_KEY", "")                  # Scrapfly web scraping API (residential proxy + ASP/CAPTCHA + screenshots)
 DATASIFT_EMAIL = os.getenv("DATASIFT_EMAIL", "")              # DataSift.ai login
 DATASIFT_PASSWORD = os.getenv("DATASIFT_PASSWORD", "")
+DATASIFT_API_KEY = os.getenv("DATASIFT_API_KEY", "")          # DataSift.ai REST API (apiv2.reisift.io)
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")        # Slack/Discord webhook
 ANCESTRY_EMAIL = os.getenv("ANCESTRY_EMAIL", "")              # Ancestry.com login
 ANCESTRY_PASSWORD = os.getenv("ANCESTRY_PASSWORD", "")

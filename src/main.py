@@ -1688,56 +1688,27 @@ def _run_manage_presets(args) -> None:
 
 
 def _run_manage_list(args) -> None:
-    """Trigger enrichment and/or skip trace on an existing DataSift list."""
-    import asyncio as _asyncio
-    from playwright.async_api import async_playwright as _apw
+    """Trigger enrichment and/or skip trace on an existing DataSift list.
 
-    list_name = getattr(args, "list_name", None)
-    if not list_name:
-        logging.error("--list-name is required for manage-list mode")
-        sys.exit(1)
-
-    do_enrich = not getattr(args, "no_enrich", False)
-    do_skip_trace = not getattr(args, "no_skip_trace", False)
-
-    async def _run():
-        from datasift_core import login
-        from datasift_uploader import enrich_records, skip_trace_records
-
-        async with _apw() as p:
-            browser = await p.chromium.launch(headless=False)
-            context = await browser.new_context(
-                viewport={"width": 1280, "height": 720},
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                ),
-            )
-            page = await context.new_page()
-            try:
-                logged_in = await login(page, config.DATASIFT_EMAIL, config.DATASIFT_PASSWORD)
-                if not logged_in:
-                    logging.error("DataSift login failed")
-                    return
-
-                if do_enrich:
-                    result = await enrich_records(page, list_name)
-                    if result.get("success"):
-                        logging.info("Enrichment: %s", result.get("message", "OK"))
-                    else:
-                        logging.error("Enrichment failed: %s", result.get("message"))
-
-                if do_skip_trace:
-                    result = await skip_trace_records(page, list_name)
-                    if result.get("success"):
-                        logging.info("Skip trace: %s", result.get("message", "OK"))
-                    else:
-                        logging.error("Skip trace failed: %s", result.get("message"))
-            finally:
-                await browser.close()
-
-    _asyncio.run(_run())
+    Disabled as of 2026-08-14. enrich_records()/skip_trace_records() are now
+    scoped by reading the exact records out of a source CSV and verifying
+    each one individually before selecting it — see the removal note above
+    _select_single_verified_record() in datasift_uploader.py for why (two
+    live incidents where a list-name-only filter silently failed to narrow
+    scope and a bulk action selected dozens of unrelated existing records).
+    This mode has no source CSV to verify against, so there's no safe way to
+    scope it the same way. Re-run the original upload instead, or ask for a
+    CSV-based version of this mode if re-triggering enrich/skip-trace on an
+    existing list without the original file is something you need often.
+    """
+    logging.error(
+        "manage-list mode is disabled — it relied on the now-removed "
+        "list-filter-then-select-all pattern, which caused two incidents on "
+        "2026-08-13/14 where automation acted on far more records than "
+        "intended. There is no CSV to safely scope this mode by. Re-run the "
+        "original CSV upload instead."
+    )
+    sys.exit(1)
 
 
 def _run_manage_sold(args) -> None:

@@ -133,15 +133,17 @@ async def main():
                 await page.wait_for_timeout(15000)
 
         if all_success:
-            # Use first list name (has all records) for enrich + skip trace
-            first_list = csv_infos[0]["list_name"]
+            # Scope enrich/skip trace to exactly the CSVs just uploaded — see
+            # the removal note above _select_single_verified_record() in
+            # datasift_uploader.py for why this is no longer a list name.
+            all_csv_paths = [info["path"] for info in csv_infos]
 
             # Enrich property data
             if not test_args.no_enrich:
                 logger.info("=== ENRICHMENT STEP ===")
                 logger.info("Pausing 10s before enrichment so you can inspect...")
                 await page.wait_for_timeout(10000)
-                enrich_result = await enrich_records(page, first_list)
+                enrich_result = await enrich_records(page, all_csv_paths)
                 logger.info("Enrich result: %s", enrich_result)
             else:
                 logger.info("Skipping enrichment (--no-enrich)")
@@ -151,7 +153,7 @@ async def main():
                 logger.info("=== SKIP TRACE STEP ===")
                 logger.info("Pausing 10s before skip trace so you can inspect...")
                 await page.wait_for_timeout(10000)
-                skip_result = await skip_trace_records(page, first_list)
+                skip_result = await skip_trace_records(page, all_csv_paths)
                 logger.info("Skip trace result: %s", skip_result)
             else:
                 logger.info("Skipping skip trace (--no-skip-trace)")

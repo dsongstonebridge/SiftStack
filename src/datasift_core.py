@@ -257,11 +257,20 @@ async def dismiss_popups(page) -> None:
                     removed++;
                 }
             }
-            // Remove DataSift modal/aside overlays that block pointer events
+            // Remove DataSift modal/aside overlays that block pointer events —
+            // but NEVER an overlay that's an active multi-step wizard (Upload
+            // File / Update Data), which uses this same ModalOverlay class.
+            // Removing it deletes the wizard's own Next Step button along with
+            // it, which silently broke every wizard flow that called this
+            // mid-flow (the wizard looked "not found" because it was gone).
             document.querySelectorAll(
                 '[class*="ModalOverlay"], [class*="modal-overlay"], '
                 + '[id="asideOverlay"], [class*="AsideOverlay"], [class*="aside-overlay"]'
-            ).forEach(el => { el.remove(); removed++; });
+            ).forEach(el => {
+                const t = el.textContent || '';
+                if (t.includes('Next Step') || t.includes('Finish Upload')) return;
+                el.remove(); removed++;
+            });
             return removed;
         }""")
         if removed:

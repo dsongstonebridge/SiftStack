@@ -27,29 +27,56 @@ logger = logging.getLogger(__name__)
 DATASIFT_UPLOAD_URL = "https://app.reisift.io/records/properties"
 
 
-async def _click_next_step(page: Page, timeout: int = 20000) -> bool:
+async def _click_next_step(page: Page, timeout: int = 20000, attempts: int = 2) -> bool:
     """Click the 'Next Step' button that appears in the upload wizard.
 
+    Uses a raw coordinate click (page.mouse.click at the button's bounding-box
+    center) instead of Locator.click(). DataSift's Next Step button is visible,
+    enabled, and un-occluded (confirmed via elementFromPoint) yet Playwright's
+    actionability pre-check on Locator.click() false-negatives on it every
+    time — a raw mouse click at the same coordinates works immediately. Root
+    cause is unconfirmed (likely a CSS transition/animation state Playwright's
+    hit-testing is conservative about), but the coordinate click is a reliable
+    workaround.
+
     Default timeout is 20s to handle slow SPA rendering in headless/cloud
-    environments (Apify containers take longer than local desktop).
+    environments (Apify containers take longer than local desktop). Retries
+    once on timeout — the button briefly exists-but-disabled right after a
+    field fill triggers a React re-render, and a fresh locator + short pause
+    is enough to clear that race without a longer flat timeout.
     """
-    try:
-        await _dismiss_popups(page)
-        btn = page.get_by_role("button", name="Next Step")
-        if await btn.count() == 0:
-            btn = page.locator(
-                'button:has-text("Next Step"), '
-                'button:has-text("Continue")'
-            )
-        await btn.first.scroll_into_view_if_needed()
-        await btn.first.wait_for(state="visible", timeout=timeout)
-        await btn.first.click()
-        await page.wait_for_timeout(2000)
-        return True
-    except PwTimeout:
-        await _screenshot(page, "next_step_not_found")
-        logger.warning("Next Step button not found within %dms", timeout)
-        return False
+    for attempt in range(attempts):
+        try:
+            await _dismiss_popups(page)
+            btn = page.get_by_role("button", name="Next Step")
+            if await btn.count() == 0:
+                btn = page.locator(
+                    'button:has-text("Next Step"), '
+                    'button:has-text("Continue")'
+                )
+            await btn.first.scroll_into_view_if_needed()
+            await btn.first.wait_for(state="visible", timeout=timeout)
+            box = await btn.first.bounding_box()
+            if not box:
+                raise PwTimeout("Next Step button has no bounding box")
+            cx = box["x"] + box["width"] / 2
+            cy = box["y"] + box["height"] / 2
+            await page.mouse.move(cx, cy)
+            await page.wait_for_timeout(150)
+            await page.mouse.click(cx, cy)
+            await page.wait_for_timeout(2000)
+            return True
+        except PwTimeout:
+            if attempt + 1 < attempts:
+                logger.debug("Next Step not ready yet (attempt %d/%d), retrying...",
+                             attempt + 1, attempts)
+                await page.wait_for_timeout(1500)
+                continue
+            await _screenshot(page, "next_step_not_found")
+            logger.warning("Next Step button not found within %dms (after %d attempts)",
+                           timeout, attempts)
+            return False
+    return False
 
 
 async def upload_csv(
@@ -258,6 +285,25 @@ async def upload_csv(
     except Exception as e:
         logger.debug("Phone numbers dropdown: %s", e)
 
+    # "WHERE WAS IT SKIPTRACED?" — select "Other" or first option (added by DataSift
+    # alongside the purchase-source dropdown; not always required, but fill it when present).
+    try:
+        skiptrace_dropdown = page.locator('text="WHERE WAS IT SKIPTRACED?"').locator(
+            '..').locator('text="Select an option"')
+        if await skiptrace_dropdown.count() > 0:
+            await skiptrace_dropdown.first.click()
+            await page.wait_for_timeout(500)
+            other = page.locator('text="Other"')
+            if await other.count() > 0:
+                await other.first.click()
+            else:
+                opts = page.locator('[class*="option"]')
+                if await opts.count() > 0:
+                    await opts.first.click()
+            await page.wait_for_timeout(500)
+    except Exception as e:
+        logger.debug("Skiptrace dropdown: %s", e)
+
     # "ASSOCIATE DATA WITH LIST" — enter or search for list name
     try:
         if existing_list:
@@ -303,14 +349,23 @@ async def upload_csv(
                     list_name = f"SiftStack {_dt.now().strftime('%Y-%m-%d')}"
                 await list_input.first.fill(list_name)
                 logger.info("Set list name: %s", list_name)
-                await page.wait_for_timeout(500)
+                # React needs a beat to flip the Next Step button from
+                # disabled to enabled after this fill — a short wait here
+                # avoids a race where the button is visible but not yet
+                # interactive when the click below fires.
+                await page.wait_for_timeout(1500)
     except Exception as e:
         logger.debug("List name input: %s", e)
 
     await _screenshot(page, "step1_form_filled")
 
-    # Click "Next Step" to proceed to step 2
-    await _click_next_step(page, timeout=30000)
+    # Click "Next Step" to proceed to step 2. No CSV has been submitted yet at
+    # this point, so a hard abort here is fully safe — nothing on DataSift's
+    # side needs cleanup.
+    if not await _click_next_step(page, timeout=30000):
+        result["message"] = "Setup step: Next Step click failed — aborting before any data was submitted"
+        logger.error(result["message"])
+        return result
 
     # ── Wizard Step 2 (optional): Enrichment ──
     # DataSift added an Enrichment step between Setup and Add Tags.
@@ -321,7 +376,10 @@ async def upload_csv(
     if await enrichment_check.count() > 0:
         logger.info("Wizard Step 2 (Enrichment): detected — leaving defaults, clicking Next Step...")
         await _dismiss_popups(page)
-        await _click_next_step(page, timeout=15000)
+        if not await _click_next_step(page, timeout=15000):
+            result["message"] = "Enrichment step: Next Step click failed — aborting before any data was submitted"
+            logger.error(result["message"])
+            return result
         await page.wait_for_timeout(1500)
 
     # ── Wizard Step 3: Add tags ──
@@ -362,7 +420,11 @@ async def upload_csv(
     except Exception as e:
         logger.warning("Tag addition failed: %s", e)
 
-    await _click_next_step(page)
+    # Still before file submission — safe to hard-abort.
+    if not await _click_next_step(page):
+        result["message"] = "Tags step: Next Step click failed — aborting before any data was submitted"
+        logger.error(result["message"])
+        return result
 
     # ── Wizard Step 4: Upload the file ──
     logger.info("Wizard Step 4: Uploading CSV file: %s", csv_path.name)
@@ -384,6 +446,12 @@ async def upload_csv(
             await file_input.first.set_input_files(str(csv_path))
             logger.info("CSV file selected: %s", csv_path.name)
             await page.wait_for_timeout(3000)
+            # From this point on, DataSift has the file and may already be
+            # parsing/ingesting it client- or server-side. A failure past this
+            # point can no longer be treated as "nothing happened" — the
+            # caller needs to verify actual DataSift state, not just trust
+            # this function's return value.
+            result["file_submitted"] = True
         else:
             await _screenshot(page, "step4_no_file_input")
             result["message"] = "Could not find file input element"
@@ -395,19 +463,60 @@ async def upload_csv(
         return result
 
     await _screenshot(page, "step4_file_uploaded")
-    await _click_next_step(page)
+    if not await _click_next_step(page):
+        result["message"] = (
+            "File was submitted to DataSift but the wizard did not advance past "
+            "Upload — state is unconfirmed. Do NOT assume nothing happened; "
+            "verify against DataSift before treating this as a clean failure."
+        )
+        logger.error(result["message"])
+        return result
 
     # ── Wizard Step 5: Map the columns ──
     logger.info("Wizard Step 5: Column mapping — mapping Tags and Lists...")
     await page.wait_for_timeout(3000)
     await _screenshot(page, "step4_column_mapping")
 
+    async def _capture_required_field_value(label: str) -> str | None:
+        """Read the sample value shown under a Required mapping target card
+        (e.g. 'Property Street' -> '148 N Richmond Ave'), by locating the
+        card via its exact label text."""
+        return await page.evaluate("""(label) => {
+            const els = Array.from(document.querySelectorAll('*')).filter(
+                el => el.children.length === 0 && el.textContent.trim() === label
+            );
+            for (const el of els) {
+                let card = el.closest('div');
+                for (let i = 0; i < 4 && card; i++) {
+                    if (card.textContent.includes('Required')) break;
+                    card = card.parentElement;
+                }
+                if (card && card.textContent.includes('Required')) {
+                    return card.textContent.replace(label, '').replace('Required', '').trim();
+                }
+            }
+            return null;
+        }""", label)
+
+    # Snapshot DataSift's own auto-mapped values for the required address
+    # fields BEFORE dragging anything. On 2026-08-14 the Tags/Lists drag below
+    # landed on the already-correctly-auto-mapped "Property Street" target
+    # instead of its own "Lists" target, silently overwriting the real street
+    # address with the CSV's Lists value ("Foreclosure") — the upload wizard
+    # completed normally and reported success; nothing else went wrong. This
+    # snapshot + the comparison after the drag loop is what catches that.
+    required_labels = ["Property Street", "Property City", "Property State", "Property ZIP Code"]
+    before_values = {label: await _capture_required_field_value(label) for label in required_labels}
+    logger.debug("Required field values before Tags/Lists mapping: %s", before_values)
+
     # Try to drag unmapped columns (left side) to their targets (right side)
     # DataSift uses styled-components with draggable="false" — need slow mouse drag
-    async def _drag_column(source_el, target_el):
-        """Drag a CSV column card to a mapping target using slow mouse moves."""
+    async def _drag_column(source_el, target_box: dict):
+        """Drag a CSV column card to a mapping target using slow mouse moves.
+        target_box is a raw {x, y, width, height} dict (from
+        _find_optional_target_box), not a Playwright locator."""
         src_box = await source_el.bounding_box()
-        dst_box = await target_el.bounding_box()
+        dst_box = target_box
         if not src_box or not dst_box:
             return False
         sx = src_box["x"] + src_box["width"] / 2
@@ -431,35 +540,93 @@ async def upload_csv(
         await page.wait_for_timeout(1000)
         return True
 
+    async def _find_optional_target_box(label: str) -> dict | None:
+        """Find the right-panel mapping target card for `label`, excluding
+        any card already marked "Required" (Tags/Lists are never required
+        fields — Property Street/City/State/ZIP are). On 2026-08-14, taking
+        the plain last text="Lists" match let the drag land on the
+        already-mapped "Property Street" Required card instead; this ruling
+        out Required cards is meant to stop that at the source rather than
+        only catching it after the fact."""
+        return await page.evaluate("""(label) => {
+            const els = Array.from(document.querySelectorAll('*')).filter(
+                el => el.children.length === 0 && el.textContent.trim() === label
+            );
+            for (const el of els) {
+                const rect = el.getBoundingClientRect();
+                if (rect.left < 600) continue;
+                let card = el.closest('div');
+                for (let i = 0; i < 4 && card; i++) {
+                    if (card.textContent.length > 10) break;
+                    card = card.parentElement;
+                }
+                if (card && !card.textContent.includes('Required')) {
+                    const r = card.getBoundingClientRect();
+                    return {x: r.x, y: r.y, width: r.width, height: r.height};
+                }
+            }
+            return null;
+        }""", label)
+
     # Map Tags column: find "Tags" card on left, drag to "Tags" target on right
     for col_name in ["Tags", "Lists"]:
         try:
             # Source: unmapped column card on the left (contains column name + sample data)
             source = page.locator(f'div:has-text("{col_name}") >> visible=true').first
-            # Target: mapping slot on the right side (search for it)
-            # Right-side targets have the field name — search within right panel area
-            target = page.locator(f'text="{col_name}"').last
-            if await source.count() > 0 and await target.count() > 0:
+            tgt_box = await _find_optional_target_box(col_name)
+            if await source.count() > 0 and tgt_box:
                 src_box = await source.bounding_box()
-                tgt_box = await target.bounding_box()
-                # Ensure source is on left (<600px) and target is on right (>600px)
-                if src_box and tgt_box and src_box["x"] < 600 and tgt_box["x"] > 600:
-                    if await _drag_column(source, target):
+                # Ensure source is on the left (<600px) — target is already
+                # confirmed right-panel + non-Required by the finder above.
+                if src_box and src_box["x"] < 600:
+                    if await _drag_column(source, tgt_box):
                         logger.info("Mapped column: %s", col_name)
                         await page.wait_for_timeout(1000)
                     else:
                         logger.warning("Drag failed for column: %s", col_name)
                 else:
-                    logger.debug("Column %s: no valid source/target positions", col_name)
+                    logger.debug("Column %s: no valid source position", col_name)
             else:
-                logger.debug("Column %s: source or target not found", col_name)
+                logger.debug("Column %s: source or non-Required target not found", col_name)
         except Exception as e:
             logger.warning("Column mapping %s failed: %s", col_name, e)
 
     await _screenshot(page, "step4_after_mapping")
 
-    # Click Next Step to proceed past mapping
-    await _click_next_step(page)
+    # Verify the Tags/Lists drag above didn't clobber one of DataSift's own
+    # correctly-auto-mapped required address fields — see the note above the
+    # "before" snapshot for the exact incident this catches. Any change here
+    # means a required field's real value got silently replaced, and the
+    # upload must not be allowed to finish in that state.
+    after_values = {label: await _capture_required_field_value(label) for label in required_labels}
+    logger.debug("Required field values after Tags/Lists mapping: %s", after_values)
+    changed = [
+        label for label in required_labels
+        if before_values.get(label) is not None and after_values.get(label) != before_values.get(label)
+    ]
+    if changed:
+        await _screenshot(page, "step4_mapping_corrupted")
+        result["message"] = (
+            f"Column mapping corrupted required field(s) {changed} — "
+            f"before: {({l: before_values[l] for l in changed})}, "
+            f"after: {({l: after_values[l] for l in changed})}. "
+            f"Aborting before Finish Upload; file was already submitted, "
+            f"so DataSift may have a bad record — verify and clean up manually."
+        )
+        logger.error(result["message"])
+        return result
+
+    # Click Next Step to proceed past mapping. File is already submitted by
+    # this point (result["file_submitted"] is set) — same "must verify, can't
+    # assume clean" situation as the Upload step above.
+    if not await _click_next_step(page):
+        result["message"] = (
+            "Column mapping step did not advance — state is unconfirmed "
+            "(file was already submitted). Verify against DataSift; do not "
+            "assume nothing happened."
+        )
+        logger.error(result["message"])
+        return result
     await _screenshot(page, "step4_mapping_done")
 
     # ── Wizard Step 5: Review ──
@@ -503,6 +670,122 @@ async def upload_csv(
         result["success"] = True
 
     await _save_cookies(page)
+    return result
+
+
+async def verify_uploaded_records(page: Page, csv_path: str | Path) -> dict:
+    """Read-only check that each CSV record actually landed correctly in
+    DataSift — catches exactly the "Foreclosure"-as-address corruption found
+    in the 2026-08-13 trial, where the wizard reported success (or an
+    unconfirmed failure) but a malformed duplicate record existed alongside
+    the correct one.
+
+    For each CSV row, searches Records by owner last name and checks that at
+    least one matching row's Property Address contains the expected street
+    number. Never clicks a checkbox or button — search box fill + read only.
+
+    Returns {"success": bool, "checked": int, "mismatches": [...]}. A mismatch
+    entry has "issue" plus context; "severity": "warning" entries (e.g. an
+    extra row beyond the one good match) don't flip success to False on their
+    own — only a genuinely missing/wrong address does.
+    """
+    import csv as _csv
+    import re as _re
+
+    result: dict = {"success": True, "checked": 0, "mismatches": []}
+
+    csv_path = Path(csv_path)
+    if not csv_path.exists():
+        result["success"] = False
+        result["mismatches"].append({"issue": f"Source CSV not found: {csv_path}"})
+        return result
+
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        rows = list(_csv.DictReader(f))
+
+    await _navigate_to_records(page)
+    await page.wait_for_timeout(3000)
+    await _dismiss_popups(page)
+
+    search_box = page.locator('input[placeholder*="Search"]')
+    if await search_box.count() == 0:
+        result["success"] = False
+        result["mismatches"].append({"issue": "Could not find Records search box for verification"})
+        return result
+
+    def _looks_like_address(text: str) -> bool:
+        return bool(_re.search(r"\d", text or ""))
+
+    async def _check_once(owner_last: str, street_number: str) -> tuple[int, list[str], bool]:
+        await search_box.first.fill(owner_last)
+        await page.wait_for_timeout(2000)
+        table_rows = page.locator('[class*="TableRow"]')
+        n = await table_rows.count()
+        found_rows_text = []
+        found_good = False
+        for i in range(n):
+            txt = await table_rows.nth(i).inner_text()
+            found_rows_text.append(txt.replace("\n", " | "))
+            if street_number and street_number in txt and _looks_like_address(txt):
+                found_good = True
+        await search_box.first.fill("")
+        await page.wait_for_timeout(500)
+        return n, found_rows_text, found_good
+
+    for row in rows:
+        expected_street = (row.get("Property Street Address") or "").strip()
+        owner_last = (row.get("Owner Last Name") or "").strip()
+        if not expected_street or not owner_last:
+            continue
+        result["checked"] += 1
+        street_number = expected_street.split()[0] if expected_street else ""
+
+        # DataSift's search index can lag behind a just-completed upload —
+        # confirmed 2026-08-14 (a record that read as "not found" immediately
+        # after upload showed up correctly, address and all, after a fresh
+        # page reload). Retry with a hard reload before treating a miss as a
+        # real mismatch, rather than false-alarming on an indexing delay.
+        n, found_rows_text, found_good = await _check_once(owner_last, street_number)
+        if not found_good:
+            for retry in range(2):
+                logger.info("Verification: %s not found on attempt %d, reloading and retrying...",
+                            owner_last, retry + 1)
+                await page.wait_for_timeout(3000)
+                await page.goto(DATASIFT_RECORDS_URL, wait_until="domcontentloaded", timeout=20000)
+                await page.wait_for_timeout(4000)
+                await _dismiss_popups(page)
+                n, found_rows_text, found_good = await _check_once(owner_last, street_number)
+                if found_good:
+                    logger.info("Verification: %s found after retry %d — was an indexing delay, not a real mismatch",
+                                owner_last, retry + 1)
+                    break
+
+        if n == 0:
+            result["success"] = False
+            result["mismatches"].append({
+                "owner": owner_last,
+                "expected_address": expected_street,
+                "issue": "No matching record found in DataSift at all",
+            })
+        elif not found_good:
+            result["success"] = False
+            result["mismatches"].append({
+                "owner": owner_last,
+                "expected_address": expected_street,
+                "issue": f"Found {n} row(s) for this owner but none matched the expected address",
+                "found_rows": found_rows_text,
+            })
+        elif n > 1:
+            result["mismatches"].append({
+                "owner": owner_last,
+                "expected_address": expected_street,
+                "issue": f"Found {n} rows for this owner (expected 1) — possible stray duplicate",
+                "found_rows": found_rows_text,
+                "severity": "warning",
+            })
+
+    logger.info("Verification: checked %d record(s), %d mismatch(es)",
+                result["checked"], len(result["mismatches"]))
     return result
 
 
@@ -626,439 +909,463 @@ async def _filter_by_list(page: Page, list_name: str) -> bool:
         return False
 
 
-async def _select_all_records(page: Page) -> bool:
-    """Select all records matching the current filter. Returns True if selected.
+# _select_all_records() was permanently removed on 2026-08-14. It selected
+# whatever the current filter/view showed under the assumption that
+# _filter_by_list() had correctly narrowed it — twice on 2026-08-13, that
+# assumption was false (the filter silently didn't apply) and it selected
+# dozens of unrelated live records instead of the run's own 2. There is no
+# bulk/header/"select all" primitive left anywhere in this file. Every
+# selection is now done one row at a time, with the match independently
+# verified against the CSV that's actually being processed, via
+# _select_single_verified_record() below.
 
-    Tries three strategies in order, stopping at the first that works:
-      0. CheckboxDropdown "Select Max" — selects ALL pages at once (most reliable)
-      1. Header checkbox click → "Select all X records" banner
-      2. Individual JS checkbox clicks (fallback, selects visible page only)
+
+async def _select_single_verified_record(
+    page: Page, owner_last: str, street: str,
+) -> tuple[bool, str]:
+    """Search Records for one specific CSV row and select ONLY that row's own
+    checkbox — never a header/bulk checkbox. Requires an exact 1-row match
+    (by owner last name + property street number) before clicking anything;
+    0 or 2+ matches are refused rather than guessed at.
+
+    Returns (True, "") on success, or (False, reason) without clicking
+    anything.
     """
     import re as _re
-    try:
-        # Dismiss popups aggressively — the notification popup blocks all clicks
+
+    def _looks_like_address(text: str) -> bool:
+        return bool(_re.search(r"\d", text or ""))
+
+    search_box = page.locator('input[placeholder*="Search"]')
+    if await search_box.count() == 0:
+        return False, "Could not find Records search box"
+
+    await search_box.first.fill(owner_last)
+    await page.wait_for_timeout(2000)
+    await _dismiss_popups(page)
+
+    table_rows = page.locator('[class*="TableRow"]')
+    n = await table_rows.count()
+    street_number = street.split()[0] if street else ""
+
+    matches = []
+    for i in range(n):
+        txt = await table_rows.nth(i).inner_text()
+        if street_number and street_number in txt and _looks_like_address(txt):
+            matches.append(i)
+
+    if len(matches) != 1:
+        return False, f"Expected exactly 1 matching row for '{owner_last}' / '{street}', found {len(matches)} (of {n} rows for this search)"
+
+    row = table_rows.nth(matches[0])
+    checkbox = row.locator('input[type="checkbox"]')
+    if await checkbox.count() == 0:
+        return False, "Matched row has no checkbox element"
+
+    # This is a visually-hidden native input (width/height 0, opacity 0) with
+    # a custom-styled visual layered on top — the same pattern already
+    # documented for the login page's "Remember me"/Terms checkboxes in
+    # datasift_core.py.login(), which cannot be Locator.click()'d (Playwright
+    # correctly refuses — a 0x0 element is not actionable) and instead needs
+    # dispatch_event('click') to fire React's onChange directly.
+    await checkbox.first.dispatch_event("click")
+    await page.wait_for_timeout(500)
+
+    # Hard verification that clicking accomplished exactly what we intended —
+    # this is the check that would have caught the 2026-08-13 incidents: if
+    # anything other than exactly 1 record is selected right now, refuse to
+    # let the caller proceed to any action button.
+    selected_count = await page.evaluate("""() => {
+        const boxes = document.querySelectorAll('input[type="checkbox"]:checked');
+        let count = 0;
+        for (const b of boxes) {
+            if (b.closest('thead')) continue;  // never count a header checkbox
+            count++;
+        }
+        return count;
+    }""")
+    if selected_count != 1:
+        return False, f"After clicking, {selected_count} checkbox(es) show as selected (expected exactly 1) — not proceeding"
+
+    return True, ""
+
+
+async def _select_all_visible_rows_individually(page: Page, max_pages: int = 50) -> dict:
+    """Click every row's own checkbox, one at a time, across all pages of the
+    CURRENT filtered view — never a header/bulk "select all" control.
+
+    Used only by export_phone_enrichment() (read-only — downloads a CSV,
+    never mutates DataSift), which has no source CSV to verify individual
+    rows against the way enrich/skip trace now do. Instead it accounts for
+    every row it selects and hard-fails on any mismatch between rows seen and
+    checkboxes actually checked, rather than trusting a single bulk gesture.
+    Pagination selectors here are best-effort and unverified against a
+    multi-page Records view — if next-page detection is wrong this simply
+    stops at the current page rather than mis-selecting.
+    """
+    total_seen = 0
+    page_num = 1
+    while page_num <= max_pages:
         await _dismiss_popups(page)
-        await page.wait_for_timeout(1000)
-        await _dismiss_popups(page)
-        await page.wait_for_timeout(500)
+        table_rows = page.locator('[class*="TableRow"]')
+        n = await table_rows.count()
+        if n == 0:
+            break
+        for i in range(n):
+            row = table_rows.nth(i)
+            checkbox = row.locator('input[type="checkbox"]')
+            if await checkbox.count() == 0:
+                continue
+            total_seen += 1
+            if not await checkbox.first.is_checked():
+                await checkbox.first.click(force=True)
+                await page.wait_for_timeout(150)
 
-        # Switch to "All" tab so incomplete/unprocessed records are visible
-        all_tab = page.locator('button:has-text("All"), [role="tab"]:has-text("All")')
-        if await all_tab.count() > 0:
-            await all_tab.first.click()
-            await page.wait_for_timeout(1500)
-            logger.debug("Switched to All tab")
+        next_btn = page.locator(
+            'button[aria-label="Next page"], [class*="Pagination"] button:has-text(">")'
+        )
+        if await next_btn.count() == 0:
+            break
+        if await next_btn.first.is_disabled():
+            break
+        await next_btn.first.click()
+        await page.wait_for_timeout(1500)
+        page_num += 1
 
-        # Wait for records to appear in the table (import may still be processing)
-        for wait_attempt in range(6):
-            row_count = await page.evaluate("""() => {
-                const rows = document.querySelectorAll('table tbody tr, [class*="TableRow"]');
-                return rows.length;
-            }""")
-            if row_count > 0:
-                logger.info("Records table loaded: %d rows visible", row_count)
-                break
-            logger.info("Waiting for records to load (attempt %d/6)...", wait_attempt + 1)
-            await page.wait_for_timeout(10_000)
-            await _dismiss_popups(page)
-        else:
-            logger.warning("Records table still empty after 60s — import may be pending")
+    selected_count = await page.evaluate("""() => {
+        const boxes = document.querySelectorAll('input[type="checkbox"]:checked');
+        let count = 0;
+        for (const b of boxes) {
+            if (b.closest('thead')) continue;
+            count++;
+        }
+        return count;
+    }""")
 
-        await _screenshot(page, "before_select_all")
-
-        # ── Strategy 0: "Select All" checkbox dropdown ────────────────────
-        # DataSift Records has a small chevron/arrow next to the header checkbox
-        # that opens a dropdown with "Select All", "Select Max", "Select Visible" etc.
-        # Try multiple selector patterns — the class name differs between Records
-        # and SiftMap pages.
-        selected_via_dropdown = False
-        _dropdown_candidates = [
-            page.locator('[class*="CheckboxDropdown"]').first,
-            # Arrow/chevron adjacent to header checkbox
-            page.locator('th input[type="checkbox"] ~ [class*="arrow"], '
-                         'th input[type="checkbox"] ~ svg, '
-                         'th [class*="chevron"], th [class*="caret"]').first,
-            # Small button/div to the right of the header checkbox row
-            page.locator('thead [class*="dropdown"], thead [class*="Dropdown"]').first,
-        ]
-        for _dd in _dropdown_candidates:
-            if await _dd.count() > 0:
-                await _dd.click()
-                await page.wait_for_timeout(1000)
-                # Look for any "Select All" / "Select Max" option in the opened menu
-                _select_all_opt = page.get_by_text(
-                    _re.compile(r"Select\s+(All|Max)", _re.IGNORECASE)
-                )
-                if await _select_all_opt.count() > 0:
-                    opt_text = await _select_all_opt.first.text_content() or "Select All"
-                    await _select_all_opt.first.click()
-                    await page.wait_for_timeout(2000)
-                    logger.info("Selected all via dropdown: %s", opt_text.strip())
-                    selected_via_dropdown = True
-                    break
-                else:
-                    await page.keyboard.press("Escape")
-                    await page.wait_for_timeout(500)
-
-        if not selected_via_dropdown:
-            # ── Strategy 1: Header checkbox + "Select all X records" banner ──
-            # Click the table header checkbox (selects current page), which triggers
-            # a DataSift banner letting you extend the selection to all pages.
-            header_pos = await page.evaluate("""() => {
-                // Find the OWNER header text element
-                const allEls = document.querySelectorAll('*');
-                for (const el of allEls) {
-                    const t = el.textContent.trim().toUpperCase();
-                    if ((t === 'OWNER' || t === 'OWNER NAME') && el.children.length === 0) {
-                        const rect = el.getBoundingClientRect();
-                        const checkboxes = document.querySelectorAll('input[type="checkbox"]');
-                        let best = null;
-                        let bestDist = Infinity;
-                        for (const cb of checkboxes) {
-                            if (cb.classList.contains('react-toggle-screenreader-only')) continue;
-                            const cbRect = cb.getBoundingClientRect();
-                            const yDist = Math.abs(cbRect.top - rect.top);
-                            if (yDist < 30 && cbRect.left < rect.left) {
-                                if (yDist < bestDist) {
-                                    bestDist = yDist;
-                                    best = cbRect;
-                                }
-                            }
-                        }
-                        if (best) {
-                            return {x: best.left + best.width/2, y: best.top + best.height/2};
-                        }
-                    }
-                }
-                return null;
-            }""")
-
-            if header_pos:
-                await page.mouse.click(header_pos["x"], header_pos["y"])
-                logger.info("Clicked header checkbox via coordinates: (%.0f, %.0f)",
-                            header_pos["x"], header_pos["y"])
-                await page.wait_for_timeout(1500)
-
-                # DataSift shows a "Select all X records" banner after header click.
-                # Use partial match (text=...) — banner text includes the record count.
-                select_all_link = page.locator('text=Select all')
-                if await select_all_link.count() > 0:
-                    await select_all_link.first.click()
-                    await page.wait_for_timeout(1000)
-                    logger.info("Clicked 'Select all' records banner")
-            else:
-                # ── Strategy 2: Individual JS clicks (visible page only) ───────
-                clicked_count = await page.evaluate("""() => {
-                    const checkboxes = document.querySelectorAll('input[type="checkbox"]');
-                    let clicked = 0;
-                    for (const cb of checkboxes) {
-                        if (cb.classList.contains('react-toggle-screenreader-only')) continue;
-                        cb.click();
-                        clicked++;
-                    }
-                    return clicked;
-                }""")
-                logger.info("Clicked %d checkboxes via JS (visible page only — all-pages "
-                            "selection unavailable)", clicked_count)
-                await page.wait_for_timeout(1500)
-
-        await _screenshot(page, "records_selected_header")
-
-        # Verify: check if Manage or Send To buttons are now visible
-        manage_visible = await page.locator('button:has-text("Manage")').count() > 0
-        send_to_visible = await page.locator('button:has-text("Send To")').count() > 0
-        logger.info("After select: Manage visible=%s, Send To visible=%s", manage_visible, send_to_visible)
-
-        await _screenshot(page, "records_selected")
-        return manage_visible or send_to_visible
-    except Exception as e:
-        logger.warning("Select all records failed: %s", e)
-        await _screenshot(page, "select_all_failed")
-        return False
+    return {
+        "success": selected_count == total_seen and total_seen > 0,
+        "total_seen": total_seen,
+        "selected_count": selected_count,
+    }
 
 
-async def enrich_records(page: Page, list_name: str) -> dict:
+def _read_csv_target_records(csv_paths: list[Path]) -> list[tuple[str, str]]:
+    """Read (owner_last_name, property_street_address) pairs from one or more
+    DataSift-ready CSVs — the exact and only set of records an enrich/skip
+    trace run is allowed to touch."""
+    import csv as _csv
+
+    targets: list[tuple[str, str]] = []
+    for csv_path in csv_paths:
+        csv_path = Path(csv_path)
+        if not csv_path.exists():
+            continue
+        with open(csv_path, newline="", encoding="utf-8") as f:
+            for row in _csv.DictReader(f):
+                street = (row.get("Property Street Address") or "").strip()
+                owner_last = (row.get("Owner Last Name") or "").strip()
+                if street and owner_last:
+                    targets.append((owner_last, street))
+    return targets
+
+
+def _read_csv_absentee_flags(csv_paths: list[Path]) -> dict[str, bool]:
+    """Map owner last name -> whether our source CSV indicates absentee
+    ownership (Mailing Street Address present and different from Property
+    Street Address). Used to carve Swap Owners out for absentee records —
+    see the note in enrich_records() for why.
+    """
+    import csv as _csv
+
+    def _norm(s: str) -> str:
+        return " ".join((s or "").strip().lower().split())
+
+    flags: dict[str, bool] = {}
+    for csv_path in csv_paths:
+        csv_path = Path(csv_path)
+        if not csv_path.exists():
+            continue
+        with open(csv_path, newline="", encoding="utf-8") as f:
+            for row in _csv.DictReader(f):
+                owner_last = (row.get("Owner Last Name") or "").strip()
+                if not owner_last:
+                    continue
+                mail_street = row.get("Mailing Street Address") or ""
+                prop_street = row.get("Property Street Address") or ""
+                flags[owner_last] = bool(mail_street) and _norm(mail_street) != _norm(prop_street)
+    return flags
+
+
+async def enrich_records(page: Page, csv_path: str | Path | list[str | Path]) -> dict:
     """Enrich uploaded records with DataSift's SiftMap property data.
 
-    UI Flow: Records → Filter by list → Select all → Manage → Enrich Data
-    → toggle "Enrich Property Information" ON → click "Enrich"
+    Processes one record at a time: search for it by owner + address, verify
+    exactly one matching row, select only that row's checkbox, run Manage →
+    Enrich Data for that single record, then move to the next. There is no
+    list-filter-then-select-all step — see the note above
+    _select_single_verified_record() for why that was removed.
 
-    Only enriches property info (beds, baths, Zestimate, sqft, sale history).
-    Owner enrichment is OFF to protect our PR/DM contact mapping.
+    Toggles: "Enrich Property Information" and "Enrich Owners" are always ON
+    (per user preference — see [[feedback-enrich-owners-swap-owners-on]]).
+    "Swap Owners" is ON for everyone EXCEPT records our own source CSV
+    indicates are absentee-owned (Mailing Street Address present and
+    different from Property Street Address). Confirmed 2026-08-14: Swap
+    Owners silently overwrote an absentee owner's real mailing address with
+    the property address (and consequently skip-traced an unrelated phone
+    number) when DataSift's own database disagreed — erasing genuine
+    absentee-owner signal, a real lead-qualification data point in this
+    business, not just picking between two equivalent values. User's
+    instruction: keep Swap Owners ON generally (trust DataSift's data), but
+    carve out an exception specifically when our own records already show
+    absentee ownership.
 
     Args:
         page: Logged-in Playwright page.
-        list_name: Name of the list to filter and enrich.
+        csv_path: Path (or list of paths) to the DataSift-ready CSV(s) this
+            run uploaded. This — not a list name — is what scopes which
+            records get enriched.
 
     Returns:
-        Dict with {success, message}.
+        Dict with {success, message, enriched: [...], skipped: [...]}.
     """
-    result = {"success": False, "message": ""}
-    logger.info("Starting DataSift enrichment for list: %s", list_name)
+    csv_paths = [csv_path] if isinstance(csv_path, (str, Path)) else list(csv_path)
+    result: dict = {"success": False, "message": "", "enriched": [], "skipped": []}
 
-    try:
-        # Navigate to Records
-        await _navigate_to_records(page)
+    targets = _read_csv_target_records(csv_paths)
+    if not targets:
+        result["message"] = f"No valid records found in {csv_paths} — nothing to enrich"
+        logger.error(result["message"])
+        return result
+    absentee_by_owner = _read_csv_absentee_flags(csv_paths)
 
-        # Filter to the uploaded list
-        filtered = await _filter_by_list(page, list_name)
-        if not filtered:
-            result["message"] = "Could not filter to list for enrichment"
-            logger.warning(result["message"])
-            # Continue anyway — may enrich whatever is showing
+    logger.info("Starting DataSift enrichment for %d record(s) from %s", len(targets), csv_paths)
 
-        # Select all records
-        selected = await _select_all_records(page)
-        if not selected:
-            result["message"] = "Could not select records for enrichment"
-            logger.error(result["message"])
-            return result
+    await _navigate_to_records(page)
+    await page.wait_for_timeout(2000)
+    await _dismiss_popups(page)
 
-        # Click Manage dropdown
-        await _dismiss_popups(page)
-        manage_btn = page.locator('button:has-text("Manage")')
-        if await manage_btn.count() == 0:
-            manage_btn = page.locator('text="Manage"')
-        if await manage_btn.count() > 0:
+    for owner_last, street in targets:
+        try:
+            ok, reason = await _select_single_verified_record(page, owner_last, street)
+        except Exception as e:
+            ok, reason = False, f"Selection raised an exception: {e}"
+        if not ok:
+            logger.warning("Enrich: skipping %s / %s — %s", owner_last, street, reason)
+            result["skipped"].append({"owner": owner_last, "street": street, "reason": reason})
+            search_box = page.locator('input[placeholder*="Search"]')
+            if await search_box.count() > 0:
+                await search_box.first.fill("")
+                await page.wait_for_timeout(500)
+            continue
+
+        try:
+            await _dismiss_popups(page)
+            manage_btn = page.locator('button:has-text("Manage")')
+            if await manage_btn.count() == 0:
+                manage_btn = page.locator('text="Manage"')
+            if await manage_btn.count() == 0:
+                result["skipped"].append({"owner": owner_last, "street": street, "reason": "Could not find Manage button"})
+                continue
             await manage_btn.first.click()
             await page.wait_for_timeout(1500)
-            logger.debug("Opened Manage dropdown")
-        else:
-            await _screenshot(page, "enrich_no_manage")
-            result["message"] = "Could not find Manage button"
-            logger.error(result["message"])
-            return result
 
-        await _screenshot(page, "enrich_manage_opened")
-
-        # Click "Enrich records" option (exact text from Manage dropdown)
-        enrich_option = page.locator('text="Enrich records"')
-        if await enrich_option.count() == 0:
-            enrich_option = page.locator('text="Enrich Records"')
-        if await enrich_option.count() == 0:
-            enrich_option = page.locator('text="Enrich Data"')
-        if await enrich_option.count() > 0:
+            enrich_option = page.locator('text="Enrich records"')
+            if await enrich_option.count() == 0:
+                enrich_option = page.locator('text="Enrich Records"')
+            if await enrich_option.count() == 0:
+                enrich_option = page.locator('text="Enrich Data"')
+            if await enrich_option.count() == 0:
+                result["skipped"].append({"owner": owner_last, "street": street, "reason": "Could not find 'Enrich records' option in Manage menu"})
+                continue
             await enrich_option.first.click()
             await page.wait_for_timeout(2000)
-            logger.debug("Opened Enrich records modal")
-        else:
-            await _screenshot(page, "enrich_no_option")
-            result["message"] = "Could not find 'Enrich records' option in Manage menu"
-            logger.error(result["message"])
-            return result
+            await _screenshot(page, f"enrich_modal_{owner_last}")
 
-        await _screenshot(page, "enrich_modal")
-
-        # Configure enrichment toggles via JavaScript.
-        # The modal uses react-toggle components with hidden checkbox inputs.
-        # We want: "Enrich Property Information" ON, "Enrich Owners" OFF, "Swap Owners" OFF.
-        # Configure enrichment toggles via JavaScript.
-        # Based on the Enrich Records modal structure, toggles appear next to their label text.
-        # Use previousElementSibling text to identify each toggle.
-        toggle_result = await page.evaluate("""() => {
-            const results = {};
-            const toggles = document.querySelectorAll('.react-toggle');
-            for (const toggle of toggles) {
-                // Check previous sibling for label text
-                const prev = toggle.previousElementSibling;
-                const prevText = prev ? prev.textContent.trim() : '';
-
-                let name = null;
-                if (prevText.includes('Enrich Property Information') || prevText.includes('Property Information')) {
-                    name = 'Enrich Property Information';
-                } else if (prevText.includes('Enrich Owners') || prevText === 'Enrich Owners') {
-                    name = 'Enrich Owners';
-                } else if (prevText.includes('Swap Owners') || prevText === 'Swap Owners') {
-                    name = 'Swap Owners';
+            # Configure enrichment toggles: "Enrich Property Information" and
+            # "Enrich Owners" are always ON. "Swap Owners" is ON UNLESS our
+            # own source CSV indicates this record is absentee-owned — see
+            # the docstring above for why (2026-08-14: Swap Owners silently
+            # overwrote a real absentee mailing address with the property
+            # address, erasing genuine lead-qualification signal).
+            is_absentee = absentee_by_owner.get(owner_last, False)
+            toggle_state = await page.evaluate("""(isAbsentee) => {
+                const toggles = document.querySelectorAll('.react-toggle');
+                const results = {};
+                for (const toggle of toggles) {
+                    const prev = toggle.previousElementSibling;
+                    const prevText = prev ? prev.textContent.trim() : '';
+                    let name = null;
+                    if (prevText.includes('Property Information')) name = 'Enrich Property Information';
+                    else if (prevText.includes('Enrich Owners')) name = 'Enrich Owners';
+                    else if (prevText.includes('Swap Owners')) name = 'Swap Owners';
+                    if (!name) {
+                        const next = toggle.nextElementSibling;
+                        const nextText = next ? next.textContent.trim() : '';
+                        if (nextText.includes('Property Information')) name = 'Enrich Property Information';
+                        else if (nextText.includes('Enrich Owners')) name = 'Enrich Owners';
+                        else if (nextText.includes('Swap Owners')) name = 'Swap Owners';
+                    }
+                    if (!name) continue;
+                    const isChecked = toggle.classList.contains('react-toggle--checked');
+                    const shouldBeOn = (name === 'Swap Owners') ? !isAbsentee : true;
+                    if (isChecked !== shouldBeOn) toggle.click();
+                    results[name] = {before: isChecked, target: shouldBeOn};
                 }
-                if (!name) {
-                    // Also try next sibling or parent's other children
-                    const next = toggle.nextElementSibling;
-                    const nextText = next ? next.textContent.trim() : '';
-                    if (nextText.includes('Property Information')) name = 'Enrich Property Information';
-                    else if (nextText.includes('Enrich Owners')) name = 'Enrich Owners';
-                    else if (nextText.includes('Swap Owners')) name = 'Swap Owners';
-                }
-                if (!name) continue;
+                return results;
+            }""", is_absentee)
+            logger.info("Enrich toggles for %s / %s (absentee=%s): %s",
+                        owner_last, street, is_absentee, toggle_state)
+            await page.wait_for_timeout(1000)
+            await _screenshot(page, f"enrich_toggles_set_{owner_last}")
 
-                const isChecked = toggle.classList.contains('react-toggle--checked');
-                const shouldBeOn = name === 'Enrich Property Information';
-
-                if (shouldBeOn && !isChecked) {
-                    toggle.click();
-                    results[name] = 'turned ON';
-                } else if (!shouldBeOn && isChecked) {
-                    toggle.click();
-                    results[name] = 'turned OFF';
-                } else {
-                    results[name] = shouldBeOn ? 'already ON' : 'already OFF';
-                }
-            }
-            return results;
-        }""")
-        logger.info("Enrichment toggles: %s", toggle_result)
-        await page.wait_for_timeout(1000)
-
-        await _screenshot(page, "enrich_toggles_set")
-
-        # Click "Enrich N Records" button to start processing
-        enrich_btn = page.locator('button:has-text("Enrich")')
-        if await enrich_btn.count() > 1:
-            # Multiple matches — prefer the one with "Records" in text
-            enrich_btn = page.locator('button:has-text("Records")')
-        if await enrich_btn.count() == 0:
-            enrich_btn = page.locator('button:has-text("Start Enrichment")')
-        if await enrich_btn.count() > 0:
+            enrich_btn = page.locator('button:has-text("Enrich")')
+            if await enrich_btn.count() > 1:
+                enrich_btn = page.locator('button:has-text("Records")')
+            if await enrich_btn.count() == 0:
+                enrich_btn = page.locator('button:has-text("Start Enrichment")')
+            if await enrich_btn.count() == 0:
+                result["skipped"].append({"owner": owner_last, "street": street, "reason": "Could not find Enrich button"})
+                continue
             await enrich_btn.first.click()
-            logger.info("Clicked Enrich — processing started")
-            await page.wait_for_timeout(3000)
-        else:
-            await _screenshot(page, "enrich_no_button")
-            result["message"] = "Could not find Enrich button"
-            logger.error(result["message"])
-            return result
+            await page.wait_for_timeout(2000)
+            await _screenshot(page, f"enrich_submitted_{owner_last}")
+            logger.info("Enriched: %s / %s", owner_last, street)
+            result["enriched"].append({"owner": owner_last, "street": street})
 
-        await _screenshot(page, "enrich_submitted")
+        except Exception as e:
+            logger.warning("Enrich step failed for %s / %s: %s", owner_last, street, e)
+            result["skipped"].append({"owner": owner_last, "street": street, "reason": str(e)})
 
-        # Enrichment runs in background — we don't need to wait for completion
-        result["success"] = True
-        result["message"] = "Enrichment started — track progress in Activity → Action Page"
-        logger.info(result["message"])
+        search_box = page.locator('input[placeholder*="Search"]')
+        if await search_box.count() > 0:
+            await search_box.first.fill("")
+            await page.wait_for_timeout(500)
 
-    except Exception as e:
-        result["message"] = f"Enrichment failed: {e}"
-        logger.error(result["message"])
-        await _screenshot(page, "enrich_error")
-
+    result["success"] = len(result["enriched"]) > 0
+    result["message"] = (
+        f"Enriched {len(result['enriched'])}/{len(targets)} record(s)"
+        + (f", {len(result['skipped'])} skipped" if result["skipped"] else "")
+    )
+    logger.info(result["message"])
     return result
 
 
-async def skip_trace_records(page: Page, list_name: str) -> dict:
+async def skip_trace_records(page: Page, csv_path: str | Path | list[str | Path]) -> dict:
     """Skip trace uploaded records for phone numbers + emails.
 
-    UI Flow: Records → Filter by list → Select all → Send To → Skip Trace
-    → agree to terms → add tag → click "Skip Trace Records"
+    Processes one record at a time — same per-record select-then-act pattern
+    as enrich_records() above, for the same reason (no list-filter-then-
+    select-all step; see the note above _select_single_verified_record()).
 
     Uses the unlimited skip trace plan ($97/mo) — no per-record cost.
 
     Args:
         page: Logged-in Playwright page.
-        list_name: Name of the list to filter and skip trace.
+        csv_path: Path (or list of paths) to the DataSift-ready CSV(s) this
+            run uploaded — scopes which records get skip traced.
 
     Returns:
-        Dict with {success, message}.
+        Dict with {success, message, skip_traced: [...], skipped: [...]}.
     """
-    result = {"success": False, "message": ""}
-    logger.info("Starting DataSift skip trace for list: %s", list_name)
+    csv_paths = [csv_path] if isinstance(csv_path, (str, Path)) else list(csv_path)
+    result: dict = {"success": False, "message": "", "skip_traced": [], "skipped": []}
 
-    try:
-        # Navigate to Records (may already be there from enrichment)
-        await _navigate_to_records(page)
+    targets = _read_csv_target_records(csv_paths)
+    if not targets:
+        result["message"] = f"No valid records found in {csv_paths} — nothing to skip trace"
+        logger.error(result["message"])
+        return result
 
-        # Filter to the uploaded list
-        filtered = await _filter_by_list(page, list_name)
-        if not filtered:
-            logger.warning("Could not filter to list for skip trace — continuing anyway")
+    logger.info("Starting DataSift skip trace for %d record(s) from %s", len(targets), csv_paths)
 
-        # Select all records
-        selected = await _select_all_records(page)
-        if not selected:
-            result["message"] = "Could not select records for skip trace"
-            logger.error(result["message"])
-            return result
+    await _navigate_to_records(page)
+    await page.wait_for_timeout(2000)
+    await _dismiss_popups(page)
 
-        # Click "Send To" dropdown
-        send_to_btn = page.locator('button:has-text("Send To")')
-        if await send_to_btn.count() == 0:
-            send_to_btn = page.locator('button:has-text("Send to")')
-        if await send_to_btn.count() == 0:
-            send_to_btn = page.locator('text="Send To"')
-        if await send_to_btn.count() > 0:
+    for owner_last, street in targets:
+        try:
+            ok, reason = await _select_single_verified_record(page, owner_last, street)
+        except Exception as e:
+            ok, reason = False, f"Selection raised an exception: {e}"
+        if not ok:
+            logger.warning("Skip trace: skipping %s / %s — %s", owner_last, street, reason)
+            result["skipped"].append({"owner": owner_last, "street": street, "reason": reason})
+            search_box = page.locator('input[placeholder*="Search"]')
+            if await search_box.count() > 0:
+                await search_box.first.fill("")
+                await page.wait_for_timeout(500)
+            continue
+
+        try:
+            send_to_btn = page.locator('button:has-text("Send To")')
+            if await send_to_btn.count() == 0:
+                send_to_btn = page.locator('button:has-text("Send to")')
+            if await send_to_btn.count() == 0:
+                send_to_btn = page.locator('text="Send To"')
+            if await send_to_btn.count() == 0:
+                result["skipped"].append({"owner": owner_last, "street": street, "reason": "Could not find 'Send To' button"})
+                continue
             await send_to_btn.first.click()
             await page.wait_for_timeout(1500)
-            logger.debug("Opened Send To dropdown")
-        else:
-            await _screenshot(page, "skip_no_send_to")
-            result["message"] = "Could not find 'Send To' button"
-            logger.error(result["message"])
-            return result
 
-        await _screenshot(page, "skip_send_to_opened")
-
-        # Click "Skip Trace" option
-        skip_option = page.locator('text="Skip Trace"')
-        if await skip_option.count() == 0:
-            skip_option = page.locator('text="Skip trace"')
-        if await skip_option.count() > 0:
+            skip_option = page.locator('text="Skip Trace"')
+            if await skip_option.count() == 0:
+                skip_option = page.locator('text="Skip trace"')
+            if await skip_option.count() == 0:
+                result["skipped"].append({"owner": owner_last, "street": street, "reason": "Could not find 'Skip Trace' option in Send To menu"})
+                continue
             await skip_option.first.click()
             await page.wait_for_timeout(2000)
-            logger.debug("Opened Skip Trace modal")
-        else:
-            await _screenshot(page, "skip_no_option")
-            result["message"] = "Could not find 'Skip Trace' option in Send To menu"
-            logger.error(result["message"])
-            return result
 
-        await _screenshot(page, "skip_modal")
-
-        # Skip Trace modal is a 3-step wizard: Terms → Review → Sent!
-        # Step 1: Click "I Agree with the terms" button
-        agree_btn = page.locator('button:has-text("I Agree with the terms")')
-        if await agree_btn.count() == 0:
-            agree_btn = page.locator('button:has-text("I Agree")')
-        if await agree_btn.count() > 0:
+            # Skip Trace modal is a small wizard: Terms → Review → Sent.
+            agree_btn = page.locator('button:has-text("I Agree with the terms")')
+            if await agree_btn.count() == 0:
+                agree_btn = page.locator('button:has-text("I Agree")')
+            if await agree_btn.count() == 0:
+                result["skipped"].append({"owner": owner_last, "street": street, "reason": "Could not find 'I Agree with the terms' button"})
+                continue
             await agree_btn.first.click()
-            logger.info("Clicked 'I Agree with the terms'")
             await page.wait_for_timeout(2000)
-        else:
-            await _screenshot(page, "skip_no_agree")
-            result["message"] = "Could not find 'I Agree with the terms' button"
-            logger.error(result["message"])
-            return result
 
-        await _screenshot(page, "skip_review_step")
+            tag_input = page.locator('input[placeholder*="tag"], input[placeholder*="Tag"], input[placeholder*="Add tag"]')
+            if await tag_input.count() > 0:
+                from datetime import datetime as _dt
+                tag = f"skip_traced_{_dt.now().strftime('%Y-%m')}"
+                await tag_input.first.fill(tag)
+                await page.wait_for_timeout(500)
+                await tag_input.first.press("Enter")
+                await page.wait_for_timeout(500)
 
-        # Step 2: Review step — may have tag input and a "Skip Trace" / confirm button
-        # Add a custom tag (optional — DataSift auto-tags too)
-        tag_input = page.locator('input[placeholder*="tag"], input[placeholder*="Tag"], input[placeholder*="Add tag"]')
-        if await tag_input.count() > 0:
-            from datetime import datetime as _dt
-            tag = f"skip_traced_{_dt.now().strftime('%Y-%m')}"
-            await tag_input.first.fill(tag)
+            clicked = False
+            for btn_text in ["Skip Trace", "Skip Trace Records", "Start Skip Trace", "Submit", "Confirm", "Process"]:
+                skip_btn = page.locator(f'button:has-text("{btn_text}")')
+                if await skip_btn.count() > 0:
+                    await skip_btn.first.click()
+                    await page.wait_for_timeout(2000)
+                    clicked = True
+                    break
+            if not clicked:
+                result["skipped"].append({"owner": owner_last, "street": street, "reason": "Could not find skip trace submit button"})
+                continue
+
+            logger.info("Skip traced: %s / %s", owner_last, street)
+            result["skip_traced"].append({"owner": owner_last, "street": street})
+
+        except Exception as e:
+            logger.warning("Skip trace step failed for %s / %s: %s", owner_last, street, e)
+            result["skipped"].append({"owner": owner_last, "street": street, "reason": str(e)})
+
+        search_box = page.locator('input[placeholder*="Search"]')
+        if await search_box.count() > 0:
+            await search_box.first.fill("")
             await page.wait_for_timeout(500)
-            await tag_input.first.press("Enter")
-            await page.wait_for_timeout(500)
-            logger.info("Added skip trace tag: %s", tag)
 
-        await _screenshot(page, "skip_ready")
-
-        # Click the confirm/submit button to start skip trace
-        # Try multiple possible button texts
-        for btn_text in ["Skip Trace", "Skip Trace Records", "Start Skip Trace", "Submit", "Confirm", "Process"]:
-            skip_btn = page.locator(f'button:has-text("{btn_text}")')
-            if await skip_btn.count() > 0:
-                await skip_btn.first.click()
-                logger.info("Clicked '%s' — processing started", btn_text)
-                await page.wait_for_timeout(3000)
-                break
-        else:
-            await _screenshot(page, "skip_no_button")
-            result["message"] = "Could not find skip trace submit button"
-            logger.error(result["message"])
-            return result
-
-        await _screenshot(page, "skip_submitted")
-
-        # Skip trace runs in background — we don't need to wait
-        result["success"] = True
-        result["message"] = "Skip trace started — track progress in Activity → Skip Trace tab"
-        logger.info(result["message"])
-
-    except Exception as e:
-        result["message"] = f"Skip trace failed: {e}"
-        logger.error(result["message"])
-        await _screenshot(page, "skip_error")
-
+    result["success"] = len(result["skip_traced"]) > 0
+    result["message"] = (
+        f"Skip traced {len(result['skip_traced'])}/{len(targets)} record(s)"
+        + (f", {len(result['skipped'])} skipped" if result["skipped"] else "")
+    )
+    logger.info(result["message"])
     return result
 
 
@@ -1134,16 +1441,64 @@ async def upload_to_datasift(
                 existing_list=existing_list,
             )
 
+            # Verify actual DataSift state whenever the file was submitted —
+            # true whether upload_csv reported success OR an unconfirmed
+            # failure past that point (see result["file_submitted"] guards in
+            # upload_csv). A wizard glitch after file submission can leave a
+            # partial/malformed record even when nothing else looked wrong;
+            # this is what would have caught the 2026-08-13 "Foreclosure"
+            # duplicate at the time it happened instead of days later.
+            if result.get("file_submitted"):
+                verify_result = await verify_uploaded_records(page, csv_path)
+                result["verify_result"] = verify_result
+                if verify_result.get("mismatches"):
+                    from slack_notifier import notify_warning
+                    lines = [
+                        f"DataSift upload verification found "
+                        f"{len(verify_result['mismatches'])} issue(s) for list "
+                        f"'{effective_list_name}':"
+                    ]
+                    for m in verify_result["mismatches"]:
+                        sev = m.get("severity", "error")
+                        lines.append(f"  [{sev}] {m.get('owner', '?')}: {m.get('issue')}")
+                    warning_text = "\n".join(lines)
+                    logger.warning(warning_text)
+                    notify_warning(warning_text, context=f"CSV: {csv_path}")
+
+            # Verification failures gate enrich/skip trace, not just the log —
+            # this is what the 2026-08-14 fresh-batch run was missing: upload_csv
+            # reported "success" (via the confirmation-timeout fallback) even
+            # though verification had already proven neither record existed in
+            # DataSift, and enrich/skip trace ran anyway. An "error"-severity
+            # mismatch (missing/wrong record) blocks; a "warning" one (e.g. an
+            # extra duplicate alongside a good match) does not.
+            verify_result = result.get("verify_result")
+            verify_blocks = bool(
+                verify_result and any(
+                    m.get("severity", "error") == "error"
+                    for m in verify_result.get("mismatches", [])
+                )
+            )
+
+            if result.get("success") and verify_blocks:
+                result["success"] = False
+                result["message"] = (
+                    "Upload reported success but post-upload verification found "
+                    "the records don't actually exist in DataSift as expected — "
+                    "skipping enrich/skip trace rather than acting on unverified data."
+                )
+                logger.error(result["message"])
+
             if result.get("success"):
                 # Enrich property data via SiftMap
                 if enrich:
-                    enrich_result = await enrich_records(page, effective_list_name)
+                    enrich_result = await enrich_records(page, csv_path)
                     result["enrich_result"] = enrich_result
                     logger.info("Enrichment: %s", enrich_result.get("message", ""))
 
                 # Skip trace for phones + emails
                 if skip_trace:
-                    skip_result = await skip_trace_records(page, effective_list_name)
+                    skip_result = await skip_trace_records(page, csv_path)
                     result["skip_trace_result"] = skip_result
                     logger.info("Skip trace: %s", skip_result.get("message", ""))
 
@@ -1243,17 +1598,19 @@ async def upload_datasift_split(
                 "message": f"Uploaded {len(uploads)}/{len(csv_infos)} CSVs",
             }
 
-            # Enrich + skip trace once, using the first list name (has all records)
+            # Enrich + skip trace once, scoped to every CSV actually uploaded
+            # in this split run (not a list name — see the note above
+            # _select_single_verified_record()).
             if all_success and csv_infos:
-                first_list = csv_infos[0]["list_name"]
+                all_csv_paths = [info["path"] for info in csv_infos]
 
                 if enrich:
-                    enrich_result = await enrich_records(page, first_list)
+                    enrich_result = await enrich_records(page, all_csv_paths)
                     combined["enrich_result"] = enrich_result
                     logger.info("Enrichment: %s", enrich_result.get("message", ""))
 
                 if skip_trace:
-                    skip_result = await skip_trace_records(page, first_list)
+                    skip_result = await skip_trace_records(page, all_csv_paths)
                     combined["skip_trace_result"] = skip_result
                     logger.info("Skip trace: %s", skip_result.get("message", ""))
 
@@ -1269,6 +1626,7 @@ async def upload_datasift_split(
 async def export_phone_enrichment(
     page: Page,
     *,
+    csv_path: str | Path | list[str | Path] | None = None,
     list_name: str | None = None,
     preset_folder: str | None = None,
     all_records: bool = False,
@@ -1276,14 +1634,24 @@ async def export_phone_enrichment(
 ) -> dict:
     """Export phone enrichment CSV from DataSift via Playwright.
 
-    Navigates to Records, applies filters (list/preset/none), selects all records,
-    clicks Manage → Export, and downloads the Phone Enrichment CSV.
+    Navigates to Records, selects the target records, clicks Manage → Export,
+    and downloads the Phone Enrichment CSV.
 
     Args:
         page: Logged-in Playwright page.
-        list_name: Filter to a specific list name.
-        preset_folder: Filter using a saved filter preset folder name.
-        all_records: If True, export all records (no filter).
+        csv_path: Preferred targeting mode — path (or list of paths) to the
+            DataSift-ready CSV(s) whose records should be exported. Uses the
+            same per-record verified selection as enrich_records()/
+            skip_trace_records(), with a hard count check before Export is
+            ever clicked (see below) rather than trusting a list filter.
+        list_name: Legacy targeting mode — filter to a specific list name.
+            Still depends on _filter_by_list(), which is exactly the
+            mechanism that silently mis-scoped an action on 2026-08-14; use
+            csv_path instead whenever the source CSV is available.
+        preset_folder: Legacy targeting mode — filter using a saved preset
+            folder name. Same caveat as list_name.
+        all_records: If True, export all records (no filter). Only valid
+            without csv_path/list_name/preset_folder.
         download_dir: Directory for downloads (defaults to output/).
 
     Returns:
@@ -1299,32 +1667,86 @@ async def export_phone_enrichment(
         # Navigate to Records
         await _navigate_to_records(page)
 
-        # Apply filter based on targeting mode
-        if list_name:
-            filtered = await _filter_by_list(page, list_name)
-            if not filtered:
-                result["message"] = f"Could not filter to list: {list_name}"
-                logger.warning(result["message"])
-        elif preset_folder:
-            filtered = await _filter_by_preset(page, preset_folder)
-            if not filtered:
-                result["message"] = f"Could not filter to preset: {preset_folder}"
-                logger.warning(result["message"])
-        elif all_records:
-            logger.info("Exporting all records (no filter)")
+        if csv_path is not None:
+            csv_paths = [csv_path] if isinstance(csv_path, (str, Path)) else list(csv_path)
+            targets = _read_csv_target_records(csv_paths)
+            if not targets:
+                result["message"] = f"No valid records found in {csv_paths} — nothing to export"
+                logger.error(result["message"])
+                return result
+
+            await page.wait_for_timeout(2000)
+            await _dismiss_popups(page)
+
+            # Select each target record individually, WITHOUT clearing search
+            # between them (accumulating selections) — unlike enrich/skip
+            # trace, export is read-only (a bigger-than-intended CSV is an
+            # annoyance, not a data-safety issue), so this is an acceptable
+            # place to rely on selection persisting across a search change.
+            # The hard count check below protects both failure directions:
+            # if persistence turns out not to hold, the count won't match
+            # len(targets) either (it'll undershoot), and this aborts rather
+            # than exporting an unverified set.
+            selected_records = []
+            for owner_last, street in targets:
+                ok, reason = await _select_single_verified_record(page, owner_last, street)
+                if not ok:
+                    logger.warning("Export: could not select %s / %s — %s", owner_last, street, reason)
+                    continue
+                selected_records.append((owner_last, street))
+
+            selected_count = await page.evaluate("""() => {
+                const boxes = document.querySelectorAll('input[type="checkbox"]:checked');
+                let count = 0;
+                for (const b of boxes) { if (!b.closest('thead')) count++; }
+                return count;
+            }""")
+            if selected_count != len(targets):
+                result["message"] = (
+                    f"Expected exactly {len(targets)} record(s) selected for export "
+                    f"(from {len(selected_records)} individually-verified matches), "
+                    f"but {selected_count} checkbox(es) show as checked — aborting "
+                    f"rather than exporting an unverified set"
+                )
+                logger.error(result["message"])
+                return result
+            logger.info("Export: %d record(s) individually verified and selected: %s",
+                        selected_count, selected_records)
+
         else:
-            result["message"] = "No targeting mode specified"
-            logger.error(result["message"])
-            return result
+            # Legacy targeting — see docstring caveat above.
+            if list_name:
+                filtered = await _filter_by_list(page, list_name)
+                if not filtered:
+                    result["message"] = f"Could not filter to list: {list_name} — aborting (refusing to export unfiltered records)"
+                    logger.error(result["message"])
+                    return result
+            elif preset_folder:
+                filtered = await _filter_by_preset(page, preset_folder)
+                if not filtered:
+                    result["message"] = f"Could not filter to preset: {preset_folder} — aborting (refusing to export unfiltered records)"
+                    logger.error(result["message"])
+                    return result
+            elif all_records:
+                logger.info("Exporting all records (no filter)")
+            else:
+                result["message"] = "No targeting mode specified"
+                logger.error(result["message"])
+                return result
 
-        await page.wait_for_timeout(2000)
+            await page.wait_for_timeout(2000)
 
-        # Select all records
-        selected = await _select_all_records(page)
-        if not selected:
-            result["message"] = "Could not select records for export"
-            logger.error(result["message"])
-            return result
+            # Select every row individually (never a bulk/header "select all") —
+            # see _select_all_visible_rows_individually() for why.
+            select_result = await _select_all_visible_rows_individually(page)
+            if not select_result["success"]:
+                result["message"] = (
+                    f"Selection mismatch before export: saw {select_result['total_seen']} "
+                    f"row(s), {select_result['selected_count']} ended up selected — "
+                    f"aborting rather than exporting an uncertain set"
+                )
+                logger.error(result["message"])
+                return result
 
         # Click Manage → Export
         manage_btn = page.locator('button:has-text("Manage")')
@@ -1607,6 +2029,138 @@ async def export_phone_enrichment(
     return result
 
 
+async def read_record_phone_numbers(
+    page: Page, csv_path: str | Path | list[str | Path],
+) -> dict:
+    """Read phone numbers straight off each CSV record's own detail page,
+    one record at a time — the practical replacement for
+    export_phone_enrichment()'s Export wizard, which proved repeatedly
+    unreliable in live testing (2026-08-14: Filter Records panel silently
+    not opening, an initial wrong selector for the row-detail link, a
+    checkbox-persistence assumption that turned out false). Reading a
+    record's own detail page needs no selection, no wizard, and no filter at
+    all — just a search, a verified single match, and a click into that one
+    record.
+
+    Never clicks a checkbox. Never touches more than one record's detail
+    page per CSV row, each individually verified before opening.
+
+    Args:
+        page: Logged-in Playwright page.
+        csv_path: Path (or list of paths) to the DataSift-ready CSV(s) whose
+            records' phone numbers should be read.
+
+    Returns:
+        {"success": bool, "records": {owner_last: [phone_digits, ...]},
+         "skipped": [{"owner", "street", "reason"}, ...]}
+    """
+    import re as _re
+
+    result: dict = {"success": False, "records": {}, "skipped": []}
+    csv_paths = [csv_path] if isinstance(csv_path, (str, Path)) else list(csv_path)
+    targets = _read_csv_target_records(csv_paths)
+    if not targets:
+        result["skipped"].append({"reason": f"No valid records found in {csv_paths}"})
+        return result
+
+    phone_re = _re.compile(r"\(\d{3}\)\s*\d{3}-\d{4}")
+
+    for owner_last, street in targets:
+        await page.goto(DATASIFT_RECORDS_URL, wait_until="domcontentloaded", timeout=20000)
+        await page.wait_for_timeout(4000)
+        await _dismiss_popups(page)
+
+        search_box = page.locator('input[placeholder*="Search"]')
+        if await search_box.count() == 0:
+            result["skipped"].append({"owner": owner_last, "street": street,
+                                       "reason": "Could not find Records search box"})
+            continue
+        await search_box.first.fill(owner_last)
+        await page.wait_for_timeout(2500)
+
+        rows = page.locator('[class*="TableRow"]')
+        n = await rows.count()
+        if n != 1:
+            result["skipped"].append({
+                "owner": owner_last, "street": street,
+                "reason": f"Expected exactly 1 row for this owner, found {n} — not opening",
+            })
+            continue
+
+        # The row itself is the link (an <a class="...TableRowContainer">
+        # wrapping the whole row) — there is no separate inner <a> or
+        # "Owner" class to click. Confirmed 2026-08-14 after the original
+        # selector (row.locator('a, [class*="Owner"]')) matched nothing.
+        try:
+            await rows.first.click(timeout=10000)
+        except Exception as e:
+            result["skipped"].append({"owner": owner_last, "street": street,
+                                       "reason": f"Could not open detail page: {e}"})
+            continue
+        await page.wait_for_timeout(3000)
+        await _dismiss_popups(page)
+
+        try:
+            body_text = await page.locator("body").inner_text(timeout=10000)
+        except Exception as e:
+            result["skipped"].append({"owner": owner_last, "street": street,
+                                       "reason": f"Could not read detail page text: {e}"})
+            continue
+
+        # Scope the phone regex to just the "PHONE NUMBERS ... EMAILS" block
+        # so nothing outside that section (support widgets, etc.) can match.
+        idx_start = body_text.find("PHONE NUMBERS")
+        idx_end = body_text.find("EMAILS", idx_start) if idx_start >= 0 else -1
+        phone_section = (
+            body_text[idx_start:idx_end] if idx_start >= 0 and idx_end > idx_start
+            else body_text
+        )
+        found = phone_re.findall(phone_section)
+        seen: set[str] = set()
+        normalized: list[str] = []
+        for p in found:
+            digits = _re.sub(r"\D", "", p)
+            if digits and digits not in seen:
+                seen.add(digits)
+                normalized.append(digits)
+
+        if not normalized:
+            result["skipped"].append({"owner": owner_last, "street": street,
+                                       "reason": "No phone numbers found on detail page"})
+            continue
+
+        result["records"][owner_last] = normalized
+        logger.info("Read %d phone(s) for %s / %s", len(normalized), owner_last, street)
+
+    result["success"] = len(result["records"]) > 0
+    logger.info("read_record_phone_numbers: %d/%d record(s) read successfully",
+                len(result["records"]), len(targets))
+    return result
+
+
+def write_phone_enrichment_csv(records: dict[str, list[str]], output_path: str | Path) -> Path:
+    """Write phone numbers (as returned by read_record_phone_numbers()'s
+    "records" dict) to a CSV in the "Phone N" column format phone_validator.py
+    expects. Only phone digits are needed — phone_validator detects columns
+    by the "Phone N" header pattern, not by owner name."""
+    import csv as _csv
+
+    output_path = Path(output_path)
+    max_phones = max((len(v) for v in records.values()), default=0)
+    fieldnames = ["Owner Last Name"] + [f"Phone {i}" for i in range(1, max_phones + 1)]
+
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
+        w = _csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for owner_last, phones in records.items():
+            row = {"Owner Last Name": owner_last}
+            for i, p in enumerate(phones, start=1):
+                row[f"Phone {i}"] = p
+            w.writerow(row)
+
+    return output_path
+
+
 async def _filter_by_preset(page: Page, preset_name: str) -> bool:
     """Filter records by a saved filter preset folder name."""
     try:
@@ -1795,10 +2349,26 @@ async def upload_phone_tags(page: Page, csv_path: str | Path) -> dict:
             logger.error(result["message"])
             return result
 
+        # This is a multi-select (checkbox) dropdown — picking an option does NOT
+        # auto-close it, since you can pick more than one. Left open, the option
+        # panel visually overlays the "Next Step" button (same z-order as the
+        # form), so the click below finds it "visible" but never actionable and
+        # times out. Close it explicitly before advancing.
+        await page.keyboard.press("Escape")
+        await page.wait_for_timeout(500)
+        heading = page.locator('text="What are you looking to do?"')
+        if await heading.count() > 0:
+            await heading.first.click(force=True)
+            await page.wait_for_timeout(500)
+
         await _screenshot(page, "phone_tags_option_selected")
 
-        # Click "Next Step" to advance past Setup
-        await _click_next_step(page, timeout=10000)
+        # Click "Next Step" to advance past Setup. No file submitted yet —
+        # safe to hard-abort here.
+        if not await _click_next_step(page, timeout=10000):
+            result["message"] = "Setup step: Next Step click failed — aborting before any data was submitted"
+            logger.error(result["message"])
+            return result
         await page.wait_for_timeout(2000)
         await _screenshot(page, "phone_tags_after_setup")
 
@@ -1821,6 +2391,7 @@ async def upload_phone_tags(page: Page, csv_path: str | Path) -> dict:
         # The columns auto-map (Phone Number → Phone Number, Phone Tag → Phone Tags)
         # so we just click Next Step through mapping and review.
         max_steps = 5
+        finished = False
         for step_num in range(max_steps):
             await _screenshot(page, f"phone_tags_wizard_step{step_num + 1}")
 
@@ -1831,6 +2402,7 @@ async def upload_phone_tags(page: Page, csv_path: str | Path) -> dict:
                 await page.wait_for_timeout(5000)
                 logger.info("Clicked 'Finish Upload' for phone tags")
                 await _screenshot(page, "phone_tags_completed")
+                finished = True
                 break
 
             # Otherwise, click "Next Step" to advance
@@ -1848,8 +2420,19 @@ async def upload_phone_tags(page: Page, csv_path: str | Path) -> dict:
 
         await _screenshot(page, "phone_tags_final")
 
-        result["success"] = True
-        result["message"] = f"Phone tags uploaded: {csv_path.name}"
+        # File was already submitted by this point regardless of outcome, so a
+        # stall here must be reported as unconfirmed, not silently as success —
+        # this is what previously let a stuck wizard report "success: true".
+        if finished:
+            result["success"] = True
+            result["message"] = f"Phone tags uploaded: {csv_path.name}"
+        else:
+            result["success"] = False
+            result["message"] = (
+                f"Phone tags file was submitted but the wizard never reached "
+                f"'Finish Upload' — state is unconfirmed. Verify against "
+                f"DataSift; do not assume the tags were applied."
+            )
         logger.info(result["message"])
 
     except Exception as e:

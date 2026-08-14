@@ -920,6 +920,65 @@ def _build_row(notice: NoticeData, notes_override: str | None = None) -> dict:
     }
 
 
+_PETITION_INFO_FIELDS = [
+    "Date of Mortgage/Note", "Original Loan Amount", "Unpaid Principal Balance",
+    "Interest Rate", "Date of Last Payment", "Date Foreclosure Filed",
+]
+
+
+def _format_petition_notes(rec: dict) -> str:
+    """Format the petition-info-extraction skill's extra columns (if present
+    in this row) into a single Notes-appendable string. Returns "" if none
+    of those columns are present/populated — plain property-template rows
+    (no petition data) are unaffected."""
+
+    def _fmt_date(v) -> str:
+        if v is None or v == "":
+            return ""
+        if isinstance(v, datetime):
+            return v.strftime("%m/%d/%Y")
+        return str(v).strip()
+
+    def _fmt_currency(v) -> str:
+        if v is None or v == "":
+            return ""
+        try:
+            return f"${float(v):,.2f}"
+        except (TypeError, ValueError):
+            return str(v).strip()
+
+    def _fmt_rate(v) -> str:
+        if v is None or v == "":
+            return ""
+        try:
+            # Stored as a fraction (0.07125) per the extraction skill's own
+            # spec, not already a percent (7.125).
+            return f"{float(v) * 100:.3f}%"
+        except (TypeError, ValueError):
+            return str(v).strip()
+
+    formatters = {
+        "Date of Mortgage/Note": _fmt_date,
+        "Original Loan Amount": _fmt_currency,
+        "Unpaid Principal Balance": _fmt_currency,
+        "Interest Rate": _fmt_rate,
+        "Date of Last Payment": _fmt_date,
+        "Date Foreclosure Filed": _fmt_date,
+    }
+
+    parts = []
+    for field in _PETITION_INFO_FIELDS:
+        if field not in rec:
+            continue
+        formatted = formatters[field](rec.get(field))
+        if formatted:
+            parts.append(f"{field}: {formatted}")
+
+    if not parts:
+        return ""
+    return "Petition info -- " + " | ".join(parts) + "."
+
+
 def build_datasift_csv_from_template(
     template_rows: list[dict],
     trace_results: list[dict],
@@ -1010,6 +1069,20 @@ def build_datasift_csv_from_template(
         if source_url:
             notes_parts.append(f"Source: {source_url}.")
         notes_parts.append("Skip traced via Tracerfy.")
+
+        # Extra petition-info columns (from petition-info-extraction skill
+        # output — Date of Mortgage/Note, Original Loan Amount, Unpaid
+        # Principal Balance, Interest Rate, Date of Last Payment, Date
+        # Foreclosure Filed) ride along in Notes rather than needing a
+        # separate Message Board post: DataSift auto-posts a record's Notes
+        # field as a Message Board comment on upload (confirmed 2026-08-14 —
+        # no extra automation needed, and it sidesteps a Tagify input that
+        # doesn't sync typed text the way a plain textarea would). Only adds
+        # this block when the source file actually has these columns, so
+        # plain property templates are unaffected.
+        petition_note = _format_petition_notes(rec)
+        if petition_note:
+            notes_parts.append(petition_note)
 
         row = {c: "" for c in DATASIFT_COLUMNS}
         row.update({

@@ -1104,9 +1104,15 @@ def _run_skip_and_score_upload(args) -> None:
     from the 2026-08-13/14 session — every step below reuses the same
     functions proven live that session (upload_to_datasift(),
     read_record_phone_numbers(), run_phone_validation(), upload_phone_tags()),
-    not a reimplementation. Two cost-confirmation checkpoints (before
-    Tracerfy, before Trestle) are interactive prompts by default; pass --yes
-    to run unattended once you're comfortable skipping them.
+    not a reimplementation.
+
+    Runs fully unattended by default — no confirmation prompts. Tracerfy
+    cost is per-record and known upfront, so it never gates. Trestle only
+    pauses for confirmation if some record comes back with more than
+    MAX_PHONES_PER_RECORD_BEFORE_CONFIRM (12) phone numbers — an unusually
+    high count that's more likely a common-name mismatch or data-quality
+    issue than routine skip-trace results. --yes bypasses that check too,
+    for guaranteed no-prompt runs (e.g. scheduled jobs).
     """
     import asyncio as _asyncio
 
@@ -1142,14 +1148,12 @@ def _run_skip_and_score_upload(args) -> None:
         )
         return
 
-    if not auto_yes:
-        resp = input(
-            f"About to Tracerfy-trace {len(template_rows)} record(s) (~${tracerfy_cost:.2f}) "
-            f"and upload to DataSift list '{list_name}'. Proceed? [y/N]: "
-        ).strip().lower()
-        if resp != "y":
-            logging.info("Cancelled.")
-            return
+    # Tracerfy cost is per-record, small, and known upfront — no confirmation
+    # gate here. Per-record phone-count risk (the thing actually worth a
+    # human check) can only be evaluated later, once real phone numbers
+    # exist — see the MAX_PHONES_PER_RECORD_BEFORE_CONFIRM check below.
+    logging.info("Tracerfy: tracing %d record(s), ~$%.2f — proceeding automatically",
+                  len(template_rows), tracerfy_cost)
 
     from tracerfy_skip_tracer import trace_contacts
     contacts = [
@@ -1214,14 +1218,33 @@ def _run_skip_and_score_upload(args) -> None:
                 logging.info("Trestle estimate: %d unique phone(s) x $0.015 = $%.2f",
                              est["unique_phones"], est["estimated_cost"])
 
-                if not auto_yes:
-                    resp = input(f"Proceed with Trestle scoring (~${est['estimated_cost']:.2f})? [y/N]: ").strip().lower()
+                # Confirmation gate is conditional, not blanket: proceed
+                # automatically unless some record came back with an
+                # unusually large phone count (>12), which is a real signal
+                # worth a human look — e.g. a common-name mismatch or a data
+                # quality issue — rather than routine skip-trace results.
+                # --yes always bypasses this too, for genuinely unattended runs.
+                MAX_PHONES_PER_RECORD_BEFORE_CONFIRM = 12
+                max_phones = max((len(v) for v in phone_result["records"].values()), default=0)
+                if max_phones > MAX_PHONES_PER_RECORD_BEFORE_CONFIRM and not auto_yes:
+                    over_limit = {
+                        owner: len(phones) for owner, phones in phone_result["records"].items()
+                        if len(phones) > MAX_PHONES_PER_RECORD_BEFORE_CONFIRM
+                    }
+                    resp = input(
+                        f"Record(s) with unusually many phone numbers found: {over_limit} "
+                        f"(threshold: {MAX_PHONES_PER_RECORD_BEFORE_CONFIRM}/record). "
+                        f"Proceed with Trestle scoring (~${est['estimated_cost']:.2f})? [y/N]: "
+                    ).strip().lower()
                     if resp != "y":
                         logging.info(
                             "Skipped Trestle scoring. Phone data saved to %s — "
                             "re-run skip-and-score-upload later to resume from here.", phone_csv,
                         )
                         return
+                else:
+                    logging.info("Trestle: proceeding automatically (max %d phone(s)/record, "
+                                 "threshold %d)", max_phones, MAX_PHONES_PER_RECORD_BEFORE_CONFIRM)
 
                 validation_result = run_phone_validation(str(phone_csv))
                 if not validation_result.get("success"):
@@ -2277,9 +2300,10 @@ def cli_main() -> None:
     parser.add_argument(
         "--yes",
         action="store_true",
-        help="Skip interactive cost-confirmation prompts and run the full pipeline "
-             "unattended (skip-and-score-upload mode). Off by default — without it, "
-             "you'll be asked to confirm before Tracerfy and before Trestle spend.",
+        help="Guarantee zero confirmation prompts (skip-and-score-upload mode). "
+             "The pipeline already runs unattended by default; this only matters if "
+             "some record comes back with more than 12 phone numbers, which would "
+             "otherwise pause once for confirmation before Trestle spend.",
     )
     parser.add_argument(
         "--estimate",

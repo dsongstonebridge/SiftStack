@@ -1065,6 +1065,185 @@ def _run_phone_validate(args) -> None:
         sys.exit(1)
 
 
+def _read_property_template(path: Path) -> list[dict]:
+    """Read a raw property-upload-template file (.xlsx or .csv) with columns
+    Property Street, Property City, Property State, Property Zip, First
+    Name, Last Name[, Record Link]. Skips blank template rows (these
+    templates are typically shipped as a fixed-size sheet with only the
+    first few rows actually filled in)."""
+    rows: list[dict] = []
+    if path.suffix.lower() in (".xlsx", ".xls"):
+        import openpyxl
+        wb = openpyxl.load_workbook(path, data_only=True)
+        ws = wb.active
+        headers = None
+        for row in ws.iter_rows(values_only=True):
+            if headers is None:
+                headers = [str(h).strip() if h else "" for h in row]
+                continue
+            if not any(row):
+                continue
+            row_dict = {k: ("" if v is None else v) for k, v in zip(headers, row)}
+            if row_dict.get("Property Street") and row_dict.get("Last Name"):
+                rows.append(row_dict)
+    else:
+        import csv as _csv
+        with open(path, newline="", encoding="utf-8") as f:
+            for row_dict in _csv.DictReader(f):
+                if row_dict.get("Property Street") and row_dict.get("Last Name"):
+                    rows.append(row_dict)
+    return rows
+
+
+def _run_skip_and_score_upload(args) -> None:
+    """Full pipeline, single command: raw property-template CSV/xlsx ->
+    Tracerfy skip trace -> DataSift upload/enrich/skip-trace -> phone read ->
+    Trestle scoring -> tag push back.
+
+    This is the saved, repeatable version of the manual trial-run pipeline
+    from the 2026-08-13/14 session — every step below reuses the same
+    functions proven live that session (upload_to_datasift(),
+    read_record_phone_numbers(), run_phone_validation(), upload_phone_tags()),
+    not a reimplementation. Two cost-confirmation checkpoints (before
+    Tracerfy, before Trestle) are interactive prompts by default; pass --yes
+    to run unattended once you're comfortable skipping them.
+    """
+    import asyncio as _asyncio
+
+    csv_path = getattr(args, "csv_path", None)
+    if not csv_path:
+        logging.error("skip-and-score-upload requires --csv-path (raw property template .xlsx or .csv)")
+        sys.exit(1)
+    csv_path = Path(csv_path)
+    if not csv_path.exists():
+        logging.error("File not found: %s", csv_path)
+        sys.exit(1)
+
+    notice_type = getattr(args, "notice_type", "foreclosure") or "foreclosure"
+    county = getattr(args, "county", "") or ""
+    trial_tag = getattr(args, "trial_tag", None)
+    list_name = getattr(args, "list_name", None) or f"SiftStack {datetime.now().strftime('%Y-%m-%d')}"
+    auto_yes = getattr(args, "yes", False)
+    estimate_only = getattr(args, "estimate", False)
+
+    template_rows = _read_property_template(csv_path)
+    if not template_rows:
+        logging.error("No valid rows found in %s (need Property Street + Last Name at minimum)", csv_path)
+        sys.exit(1)
+    logging.info("Read %d record(s) from %s", len(template_rows), csv_path.name)
+
+    tracerfy_cost = len(template_rows) * 0.02
+    if estimate_only:
+        logging.info(
+            "Estimate: %d record(s) x $0.02 Tracerfy = $%.2f. "
+            "(Trestle cost isn't known until after DataSift skip trace returns real phone "
+            "numbers — that estimate is shown mid-run.)",
+            len(template_rows), tracerfy_cost,
+        )
+        return
+
+    if not auto_yes:
+        resp = input(
+            f"About to Tracerfy-trace {len(template_rows)} record(s) (~${tracerfy_cost:.2f}) "
+            f"and upload to DataSift list '{list_name}'. Proceed? [y/N]: "
+        ).strip().lower()
+        if resp != "y":
+            logging.info("Cancelled.")
+            return
+
+    from tracerfy_skip_tracer import trace_contacts
+    contacts = [
+        {
+            "first_name": r.get("First Name", ""), "last_name": r.get("Last Name", ""),
+            "address": r.get("Property Street", ""), "city": r.get("Property City", ""),
+            "state": r.get("Property State", ""), "zip": str(r.get("Property Zip", "")),
+        }
+        for r in template_rows
+    ]
+    trace_results = trace_contacts(contacts)
+    logging.info("Tracerfy: %d/%d record(s) matched", len(trace_results), len(contacts))
+
+    from datasift_formatter import build_datasift_csv_from_template
+    datasift_csv = build_datasift_csv_from_template(
+        template_rows, trace_results,
+        notice_type=notice_type, county=county, trial_tag=trial_tag,
+    )
+
+    from datasift_uploader import upload_to_datasift
+    upload_result = _asyncio.run(upload_to_datasift(
+        csv_path=datasift_csv, headless=False, enrich=True, skip_trace=True,
+        mode="add", list_name=list_name,
+    ))
+    logging.info("DataSift upload: %s", upload_result.get("message", ""))
+    if not upload_result.get("success"):
+        logging.error("Upload did not succeed — stopping before phone scoring. "
+                       "Check DataSift and re-run once the underlying issue is fixed.")
+        sys.exit(1)
+
+    async def _finish_pipeline() -> None:
+        from playwright.async_api import async_playwright
+        from datasift_core import login
+        from datasift_uploader import (
+            read_record_phone_numbers, write_phone_enrichment_csv, upload_phone_tags,
+        )
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=False)
+            context = await browser.new_context(viewport={"width": 1280, "height": 900})
+            page = await context.new_page()
+            try:
+                logged_in = await login(page)
+                if not logged_in:
+                    logging.error("DataSift login failed — cannot read phone data")
+                    return
+
+                phone_result = await read_record_phone_numbers(page, datasift_csv)
+                if not phone_result["success"]:
+                    logging.warning("No phone data read from any record: %s", phone_result.get("skipped"))
+                    return
+                if phone_result["skipped"]:
+                    logging.warning("Some records skipped during phone read: %s", phone_result["skipped"])
+
+                phone_csv = write_phone_enrichment_csv(
+                    phone_result["records"],
+                    OUTPUT_DIR / f"phone_enrichment_{notice_type}_{datetime.now().strftime('%Y-%m-%d')}.csv",
+                )
+
+                from phone_validator import estimate_cost, run_phone_validation
+                est = estimate_cost(phone_csv)
+                logging.info("Trestle estimate: %d unique phone(s) x $0.015 = $%.2f",
+                             est["unique_phones"], est["estimated_cost"])
+
+                if not auto_yes:
+                    resp = input(f"Proceed with Trestle scoring (~${est['estimated_cost']:.2f})? [y/N]: ").strip().lower()
+                    if resp != "y":
+                        logging.info(
+                            "Skipped Trestle scoring. Phone data saved to %s — "
+                            "re-run skip-and-score-upload later to resume from here.", phone_csv,
+                        )
+                        return
+
+                validation_result = run_phone_validation(str(phone_csv))
+                if not validation_result.get("success"):
+                    logging.error("Trestle scoring failed: %s", validation_result.get("message"))
+                    return
+                logging.info("Trestle: %d scored, %d error(s)",
+                             validation_result.get("results_count", 0),
+                             validation_result.get("errors_count", 0))
+                for tier, count in validation_result.get("tier_counts", {}).items():
+                    logging.info("  %s: %d", tier, count)
+
+                tag_csv = validation_result.get("tag_csv_path")
+                if tag_csv:
+                    tag_result = await upload_phone_tags(page, tag_csv)
+                    logging.info("Tag push: %s", tag_result.get("message", ""))
+            finally:
+                await browser.close()
+
+    _asyncio.run(_finish_pipeline())
+    logging.info("skip-and-score-upload complete.")
+
+
 def _run_daily_obits(args) -> None:
     """Run the pre-probate obituary pipeline.
 
@@ -1746,7 +1925,7 @@ def cli_main() -> None:
         choices=[
             "daily", "historical", "pdf-import", "photo-import", "dropbox-watch",
             "csv-import", "phone-validate", "manage-sold", "manage-presets", "manage-list",
-            "daily-obits",
+            "daily-obits", "skip-and-score-upload",
             # New analysis & workflow modes
             "comp", "rehab", "analyze-deal", "market-analysis", "buyer-prospect",
             "deep-prospect", "lead-manage", "setup-sequences", "niche-sequential",
@@ -1757,6 +1936,8 @@ def cli_main() -> None:
             "pdf-import/photo-import = import from files; "
             "dropbox-watch = poll Dropbox; csv-import = re-enrich CSV; "
             "phone-validate = Trestle scoring; manage-sold/manage-presets = DataSift ops; "
+            "skip-and-score-upload = full pipeline: raw property template -> Tracerfy -> "
+            "DataSift upload/enrich/skip-trace -> Trestle scoring -> tag push; "
             "comp = comparable sales ARV; rehab = rehab cost estimate; "
             "analyze-deal = full deal analysis; market-analysis = zip code scoring; "
             "buyer-prospect = cash buyer lists; deep-prospect = 4-level research; "
@@ -2071,6 +2252,34 @@ def cli_main() -> None:
         "--all-records",
         action="store_true",
         help="Export all DataSift records for phone validation (phone-validate mode)",
+    )
+
+    # skip-and-score-upload arguments
+    parser.add_argument(
+        "--notice-type",
+        type=str,
+        default="foreclosure",
+        help="Notice type for the batch, e.g. foreclosure, probate (skip-and-score-upload mode, default: foreclosure)",
+    )
+    parser.add_argument(
+        "--county",
+        type=str,
+        default="",
+        help="County to tag/set on the batch (skip-and-score-upload mode)",
+    )
+    parser.add_argument(
+        "--trial-tag",
+        type=str,
+        default=None,
+        help='Tag/note marking this as a test batch, e.g. "Pipeline_Trial_2026-08-14" '
+             "(skip-and-score-upload mode). Omit for real production runs.",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip interactive cost-confirmation prompts and run the full pipeline "
+             "unattended (skip-and-score-upload mode). Off by default — without it, "
+             "you'll be asked to confirm before Tracerfy and before Trestle spend.",
     )
     parser.add_argument(
         "--estimate",
@@ -2471,6 +2680,10 @@ def cli_main() -> None:
     # Phone validation mode — separate pipeline
     if args.mode == "phone-validate":
         _run_phone_validate(args)
+        return
+
+    if args.mode == "skip-and-score-upload":
+        _run_skip_and_score_upload(args)
         return
 
     # Manage presets mode — filter preset + sequence management

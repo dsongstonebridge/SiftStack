@@ -306,6 +306,26 @@ python src/main.py daily --notify-slack            # send run summary to Slack/D
 python src/main.py daily --deep-heirs               # resolve deceased-owner heirs via Enformion (~$0.35/match)
 ```
 
+### Single-Command Pipeline: `skip-and-score-upload` (build 1.0.33+)
+
+Runs the full raw-CSV-to-scored-and-tagged pipeline in one command: Tracerfy skip trace → DataSift upload/enrich/skip-trace → phone read → Trestle scoring → tag push. Built from the manual trial-run pipeline proven live in the 2026-08-13/14 session; every step reuses the same functions (`upload_to_datasift()`, `read_record_phone_numbers()`, `run_phone_validation()`, `upload_phone_tags()`), not a reimplementation.
+
+```bash
+# Estimate only (Tracerfy cost, no spend, no DataSift contact)
+python src/main.py skip-and-score-upload --csv-path "Property Records.xlsx" --estimate
+
+# Full run — prompts to confirm before Tracerfy spend and again before Trestle spend
+python src/main.py skip-and-score-upload --csv-path "Property Records.xlsx" --notice-type foreclosure --county Tulsa
+
+# Unattended (skips both confirmation prompts — only once you trust the batch/cost)
+python src/main.py skip-and-score-upload --csv-path "Property Records.xlsx" --yes
+
+# Mark a batch as a test run (tagged/noted so it's easy to find and distinguish from real leads)
+python src/main.py skip-and-score-upload --csv-path "Property Records.xlsx" --trial-tag "Pipeline_Trial_2026-08-14"
+```
+
+Input file: a raw property-upload-template `.xlsx` or `.csv` with columns `Property Street, Property City, Property State, Property Zip, First Name, Last Name[, Record Link]` — no phone numbers, no DataSift formatting. Blank template rows (these ship as fixed-size sheets, e.g. 300 rows with only a couple filled in) are skipped automatically.
+
 ### Environment Variables
 - `DATASIFT_EMAIL` — DataSift login email
 - `DATASIFT_PASSWORD` — DataSift login password
@@ -391,6 +411,28 @@ python src/extract_market_finder.py --state "Tennessee" --county "Knox,Blount" -
 
 # Output: JSON file in output/market_finder_{state}_{county}_{timestamp}.json
 ```
+
+**Per-Record Selection Pattern — no bulk "select all", ever (2026-08-13/14 incident)**
+
+`_select_all_records()` was permanently deleted from `datasift_uploader.py`. Two live incidents on the user's real DataSift account — a silently-failed list filter causing a bulk action to select 78 unrelated existing records instead of the run's own 2, caught only because the user manually intervened — mean this codebase must never reintroduce any header/bulk/"select all" checkbox primitive. Every DataSift action that touches records now:
+
+1. Reads the exact target records from the CSV actually being processed for this run (never a list name or filter alone — those have proven unreliable).
+2. For each record: searches, requires an **exact 1-row match** (owner last name + property street number), selects only that row's own checkbox, then independently re-verifies via a fresh DOM query that exactly 1 checkbox is checked before proceeding to any action button. 0 or 2+ matches → skip that record, never guess.
+3. Acts on that one record, then moves to the next. No batch selection step exists anywhere in this flow.
+
+See `_select_single_verified_record()`, `enrich_records()`, `skip_trace_records()` in `datasift_uploader.py`. `manage-list` CLI mode is disabled — it had no source CSV to scope selection by, so there's no safe way to run it under this pattern.
+
+**Checkbox clicks need `dispatch_event`, not `.click()`** — DataSift's row checkboxes are visually-hidden native `<input>` elements (width/height 0, opacity 0) with a custom-styled visual layered on top, same pattern as the login page's "Remember me"/Terms checkboxes. `Locator.click()` correctly refuses a 0×0 element ("outside of the viewport"); use `checkbox.dispatch_event("click")` instead to fire React's onChange directly.
+
+**A table row IS the link** — clicking into a record's detail page is `row.click()` on the row itself (`<a class="...TableRowContainer">` wraps the whole row), not a nested `<a>` or `[class*="Owner"]` element inside it — there isn't one. The visible name text is a plain styled `<div>`.
+
+**Export wizard is unreliable — read phone data off the record detail page instead.** `export_phone_enrichment()`'s Manage → Export wizard repeatedly failed in live testing (Filter Records panel silently not opening, multi-strategy download fallback maze). `read_record_phone_numbers()` sidesteps it entirely: search → verify exactly 1 match → open that one record → read the "PHONE NUMBERS ... EMAILS" block directly off the page. No selection, no wizard, no filter.
+
+**`dismiss_popups()`'s JS fallback must never remove an active wizard.** Its overlay-removal selector (`[class*="ModalOverlay"]`, meant for stray notification popups) also matches DataSift's own step-wizard container — calling it mid-wizard silently deleted the wizard itself, and every step after that ran blind against whatever was actually on screen. Fixed by skipping any element containing "Next Step" or "Finish Upload" text, but be aware this is a generically-scoped selector shared by every automation flow in this file — if a future DataSift UI change adds another overlay containing those exact words, re-check this guard.
+
+**DataSift's search index lags behind a just-completed upload.** A record can read as "not found" immediately after upload and then show up correctly, address and all, after nothing more than a page reload. `verify_uploaded_records()` retries with a hard reload before treating a miss as a real mismatch — don't remove that retry to "simplify" the function; it's covering a real, confirmed CRM behavior, not defensive over-engineering.
+
+**Enrich toggles: Property Info + Owners always ON, Swap Owners ON except CSV-indicated absentee owners.** User preference (2026-08-13/14): trusts DataSift's own ownership/contact data over the pipeline's — except Swap Owners was found to silently overwrite a real absentee owner's mailing address with the property address when DataSift's database disagreed, erasing genuine lead-qualification signal. `_read_csv_absentee_flags()` detects absentee status structurally (Mailing Street Address present and different from Property Street Address in the source CSV) and carves out the exception per record.
 
 ## REI Skill Library (13 Skills)
 

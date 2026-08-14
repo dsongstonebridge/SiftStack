@@ -40,6 +40,107 @@ TRACERFY_TRACE_URL = "https://tracerfy.com/v1/api/trace/"
 TRACERFY_QUEUE_URL = "https://tracerfy.com/v1/api/queue/"
 
 
+def trace_contacts(contacts: list[dict], timeout_sec: int = 300) -> list[dict]:
+    """Batch skip-trace a list of plain contact dicts — not tied to the
+    NoticeData scraper pipeline. Built for raw property-template CSVs
+    (Property Street/City/State/Zip, First Name, Last Name) fed in through
+    the csv-pipeline CLI mode.
+
+    Args:
+        contacts: list of {"first_name", "last_name", "address", "city",
+            "state", "zip"} dicts. Extra keys are ignored.
+        timeout_sec: max seconds to poll for results before giving up.
+
+    Returns:
+        Tracerfy's raw result records (list of dicts with primary_phone,
+        mobile_1-5, landline_1-3, email_1-5, etc. — see PHONE_FIELDS/
+        EMAIL_FIELDS). Matched back to the input by first_name/last_name.
+        Empty list on failure (never raises).
+    """
+    if not cfg.TRACERFY_API_KEY:
+        logger.error("TRACERFY_API_KEY not set — cannot skip trace")
+        return []
+    if not contacts:
+        return []
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["first_name", "last_name", "address", "city", "state",
+                      "zip", "mail_address", "mail_city", "mail_state"])
+    for c in contacts:
+        writer.writerow([
+            c.get("first_name", ""), c.get("last_name", ""),
+            c.get("address", ""), c.get("city", ""), c.get("state", ""),
+            c.get("zip", ""), "", "", "",
+        ])
+    csv_content = buf.getvalue()
+    buf.close()
+
+    logger.info("Tracerfy: submitting %d contact(s) — est. cost $%.2f",
+                len(contacts), len(contacts) * 0.02)
+
+    try:
+        resp = requests.post(
+            TRACERFY_TRACE_URL,
+            headers={"Authorization": f"Bearer {cfg.TRACERFY_API_KEY}"},
+            data={
+                "first_name_column": "first_name",
+                "last_name_column": "last_name",
+                "address_column": "address",
+                "city_column": "city",
+                "state_column": "state",
+                "zip_column": "zip",
+                "mail_address_column": "mail_address",
+                "mail_city_column": "mail_city",
+                "mail_state_column": "mail_state",
+                "mailing_zip_column": "zip",
+            },
+            files={"csv_file": ("contacts.csv", csv_content, "text/csv")},
+            timeout=30,
+        )
+        if resp.status_code == 402:
+            logger.error("Tracerfy: insufficient credits")
+            return []
+        resp.raise_for_status()
+        queue_data = resp.json()
+        queue_id = queue_data.get("queue_id")
+        if not queue_id:
+            logger.warning("Tracerfy batch returned no queue_id")
+            return []
+
+        elapsed = 0
+        poll_interval = 5
+        while elapsed < timeout_sec:
+            time.sleep(poll_interval)
+            elapsed += poll_interval
+            rr = requests.get(
+                f"{TRACERFY_QUEUE_URL}{queue_id}",
+                headers={"Authorization": f"Bearer {cfg.TRACERFY_API_KEY}"},
+                timeout=15,
+            )
+            rr.raise_for_status()
+            result_data = rr.json()
+            if isinstance(result_data, list):
+                if not result_data:
+                    continue
+                logger.info("Tracerfy: %d record(s) returned", len(result_data))
+                return result_data
+            elif isinstance(result_data, dict):
+                status = result_data.get("status", "")
+                if status == "completed":
+                    records = result_data.get("records", [])
+                    logger.info("Tracerfy: %d record(s) returned", len(records))
+                    return records
+                if status == "failed":
+                    logger.warning("Tracerfy batch job %s failed", queue_id)
+                    return []
+        logger.warning("Tracerfy batch job %s timed out after %ds", queue_id, timeout_sec)
+        return []
+    except Exception as e:
+        logger.warning("Tracerfy trace_contacts failed: %s", e)
+        return []
+
+
 def _get_contacts_for_trace(
     notice: NoticeData, max_signing_traces: int = 5,
 ) -> list[tuple[str, str, str, str, str, str]]:

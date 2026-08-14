@@ -920,6 +920,139 @@ def _build_row(notice: NoticeData, notes_override: str | None = None) -> dict:
     }
 
 
+def build_datasift_csv_from_template(
+    template_rows: list[dict],
+    trace_results: list[dict],
+    *,
+    notice_type: str = "foreclosure",
+    county: str = "",
+    trial_tag: str | None = None,
+    output_path: str | Path | None = None,
+) -> Path:
+    """Build a DataSift-ready CSV from a raw property-template CSV/xlsx
+    (Property Street, Property City, Property State, Property Zip, First
+    Name, Last Name[, Record Link]) plus Tracerfy trace_contacts() results.
+
+    This is the reusable version of the CSV-building step that was
+    previously hand-written inline for every trial run in the 2026-08-13/14
+    session — see the skip-and-score-upload CLI mode in main.py.
+
+    Args:
+        template_rows: rows from the raw template, each with at least
+            "Property Street", "Property City", "Property State",
+            "Property Zip", "First Name", "Last Name" (and optionally
+            "Record Link" for the source URL).
+        trace_results: trace_contacts()'s return value — matched to
+            template_rows by (first_name, last_name), case-insensitive.
+        notice_type: e.g. "foreclosure" — drives the Lists column via
+            NOTICE_TYPE_TO_LIST and gets tagged directly.
+        county: tagged and set in the County column if provided.
+        trial_tag: if given, appended to Tags and noted (e.g.
+            "Pipeline_Trial_2026-08-14") — use for test/trial runs so
+            they're easy to find and distinguish from real leads.
+        output_path: where to write the CSV. Defaults to
+            output/datasift_ready_{notice_type}_{today}.csv.
+
+    Returns:
+        Path to the written CSV.
+    """
+    from tracerfy_skip_tracer import PHONE_FIELDS, EMAIL_FIELDS
+
+    trace_by_name = {
+        (t.get("first_name", "").strip().lower(), t.get("last_name", "").strip().lower()): t
+        for t in trace_results
+    }
+
+    today = datetime.now().strftime("%m/%d/%Y")
+    list_name = NOTICE_TYPE_TO_LIST.get(notice_type, notice_type.title())
+
+    rows = []
+    for rec in template_rows:
+        street = (rec.get("Property Street") or "").strip()
+        city = (rec.get("Property City") or "").strip()
+        state = (rec.get("Property State") or "").strip()
+        zip_code = str(rec.get("Property Zip") or "").strip()
+        first = (rec.get("First Name") or "").strip()
+        last = (rec.get("Last Name") or "").strip()
+        source_url = (rec.get("Record Link") or "").strip()
+        if not (street and last):
+            continue
+
+        t = trace_by_name.get((first.lower(), last.lower()), {})
+        phones = []
+        for k in PHONE_FIELDS:
+            v = (t.get(k) or "").strip()
+            if v and v not in phones:
+                phones.append(v)
+        phones = phones[:9]
+        emails = [(t.get(k) or "").strip() for k in EMAIL_FIELDS]
+        emails = [e for e in emails if e][:5]
+
+        mail_street = (t.get("mail_address") or "").strip() or street
+        mail_city = (t.get("mail_city") or "").strip() or city
+        mail_state = (t.get("mail_state") or "").strip() or state
+        mail_zip = (t.get("mail_zip") or "").strip() or zip_code
+        is_absentee = bool(mail_street) and mail_street.lower() != street.lower()
+
+        tags = ["Courthouse Data", notice_type]
+        if county:
+            tags.append(county.lower())
+        tags.append(datetime.now().strftime("%Y-%m"))
+        tags.append("living")
+        if is_absentee:
+            tags.append("Absentee Owner")
+        if trial_tag:
+            tags.append(trial_tag)
+
+        notes_parts = []
+        if trial_tag:
+            notes_parts.append(f"TEST RUN -- {trial_tag}, verify before treating as a live lead.")
+        if source_url:
+            notes_parts.append(f"Source: {source_url}.")
+        notes_parts.append("Skip traced via Tracerfy.")
+
+        row = {c: "" for c in DATASIFT_COLUMNS}
+        row.update({
+            "Property Street Address": street,
+            "Property City": city,
+            "Property State": state,
+            "Property ZIP Code": zip_code,
+            "Owner First Name": first,
+            "Owner Last Name": last,
+            "Owner Type": "Person",
+            "Mailing Street Address": mail_street,
+            "Mailing City": mail_city,
+            "Mailing State": mail_state,
+            "Mailing ZIP Code": mail_zip,
+            "Tags": ", ".join(tags),
+            "Lists": list_name,
+            "Notes": " ".join(notes_parts),
+            "Notice Type": notice_type,
+            "County": county,
+            "Date Added": today,
+            "Owner Deceased": "no",
+            "Source URL": source_url,
+        })
+        for i, p in enumerate(phones, start=1):
+            row[f"Phone {i}"] = p
+        for i, e in enumerate(emails, start=1):
+            row[f"Email {i}"] = e
+        rows.append(row)
+
+    if output_path is None:
+        output_path = OUTPUT_DIR / f"datasift_ready_{notice_type}_{datetime.now().strftime('%Y-%m-%d')}.csv"
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=DATASIFT_COLUMNS)
+        w.writeheader()
+        w.writerows(rows)
+
+    logger.info("Wrote %d record(s) to %s", len(rows), output_path)
+    return output_path
+
+
 def _slugify_source(source_label: str) -> str:
     """Sanitize a scraper/source name for use in a filename.
 

@@ -863,32 +863,50 @@ def update_custom_field_values(property_uuid: str, values: dict[str, str]) -> di
 
 # ── Skip trace ────────────────────────────────────────────────────────
 
-def submit_skip_trace(property_uuids: list[str]) -> dict:
-    """Submit properties for skip tracing. Runs asynchronously — poll
-    get_skip_trace_stats() or re-read the record's `skiptraced`/`has_phones`.
+#: Set True only after the scope bug below is proven fixed. See the docstring.
+ALLOW_ACCOUNT_WIDE_SKIP_TRACE = False
 
-    *** BILLED ACTION — SPENDS PREPAID CREDITS. ***
 
-    This account is NOT on an unlimited plan (CLAUDE.md claimed one until
-    2026-08-21; it was wrong). Every uuid in this list draws down a finite
-    prepaid balance, and there is no refund and no server-side balance check to
-    pre-flight against. So:
+def submit_skip_trace(property_uuids: list[str], *, i_understand_this_is_account_wide: bool = False) -> dict:
+    """*** DISABLED BY DEFAULT — THIS ENDPOINT IGNORES `property_uuids`. ***
 
-      - Never submit speculatively, and never submit throwaway/test records.
-        Doing exactly that cost $10.20 on fake addresses once already.
-      - Never re-submit a batch to "make sure" it worked. Re-read
-        `skiptraced`/`has_phones` on the records instead — a re-submit is a
-        second charge for data you may already have.
-      - Callers should filter to records that actually need tracing (no phones
-        yet, owner known to be contactable) rather than passing everything.
+    **It skip-traces the ENTIRE ACCOUNT, not the uuids you pass**, and it
+    spends prepaid credits doing so. Proven live 2026-08-21: a submission of
+    exactly 2 property uuids returned
+    `{"cost": 19.32, "number_of_records": 161, "cost_per_owner": 0.12}` —
+    161 being the whole account — and the stats deltas confirmed ~29 owners
+    were actually processed (total_owners 210 -> 239, no_result +20, both +8,
+    emails_only +1) for $1.08. It appears to have stopped early only because
+    the credit balance ran out. Had the balance been larger, the whole account
+    would have been traced and billed.
 
-    The count logged below is the only pre-flight cost signal available.
+    This is the same failure mode as `/api/internal/property/enrich/`, which
+    also reports a count of every property in the account regardless of input.
+    Treat any DataSift endpoint that accepts a record list as account-wide
+    until proven otherwise, and prove it on a cheap/free endpoint first.
+
+    Raises unless BOTH `ALLOW_ACCOUNT_WIDE_SKIP_TRACE` is set and the caller
+    passes `i_understand_this_is_account_wide=True` — deliberately two gates,
+    so this cannot be re-enabled by a single careless edit.
+
+    To scope a skip trace to specific records today: use the DataSift UI, or
+    Tracerfy (`tracerfy_skip_tracer.trace_contacts`), which is genuinely
+    per-record at ~$0.02.
     """
     if not property_uuids:
         logger.info("submit_skip_trace: nothing to submit")
         return {}
-    logger.warning("BILLED: submitting %d record(s) for DataSift skip trace "
-                    "(prepaid credits, not unlimited)", len(property_uuids))
+
+    if not (ALLOW_ACCOUNT_WIDE_SKIP_TRACE and i_understand_this_is_account_wide):
+        raise DataSiftAPIError(
+            f"submit_skip_trace() is disabled: this endpoint ignores its "
+            f"properties list and skip-traces the ENTIRE ACCOUNT ({len(property_uuids)} "
+            f"uuid(s) requested), spending prepaid credits. See its docstring. "
+            f"Use Tracerfy for per-record tracing, or the DataSift UI."
+        )
+
+    logger.warning("BILLED + ACCOUNT-WIDE: submitting DataSift skip trace. The "
+                    "%d uuid(s) passed will NOT limit scope.", len(property_uuids))
     return _request("POST", f"{CORE_BASE}/api/internal/property/skip-trace/",
                      json_body={"properties": property_uuids})
 
@@ -963,13 +981,17 @@ def set_phone_tags(number_to_tags: dict[str, list[str]]) -> dict:
     """
     items, wanted = [], {}
     for number, titles in number_to_tags.items():
-        uuids = []
-        for t in titles:
-            uuids.append(get_or_create_phone_tag(t)["uuid"])
-        if not uuids:
+        titles = [t for t in titles if t]
+        if not titles:
             continue
-        items.append({"number": number, "tags": uuids})
-        wanted[number] = set(uuids)
+        # TITLES, not uuids. Sending uuids does not fail — it CREATES a new
+        # phone tag whose NAME is the uuid string, leaving four pieces of
+        # garbage in the namespace and the real tag unapplied. Confirmed the
+        # hard way on 2026-08-21. A correctly-tagged phone reads back as
+        # ["Dial Third"], which is what the shape should have been inferred
+        # from in the first place.
+        items.append({"number": number, "tags": titles})
+        wanted[number] = set(titles)
     if not items:
         return {"tagged": 0}
 
@@ -990,18 +1012,21 @@ def add_phone_tag(phone_numbers: list[str], tag_title: str) -> dict:
 def verify_phone_tags(owner_uuid: str, number_to_tags: dict[str, list[str]]) -> dict:
     """Read the owner back and confirm each number carries the tags requested.
 
-    Necessary because the tag endpoint returns an empty body on both success
-    and no-op — the only trustworthy signal is the record itself. Note the
-    read-back lists tag UUIDs (titles resolve later), so this compares uuids.
+    Necessary because the tag endpoint returns an empty body whether it worked
+    or silently did nothing — the record is the only trustworthy signal.
+
+    Compares TITLES against what the record reports, deliberately. An earlier
+    version resolved each title to its uuid and compared uuids, which made the
+    check circular: it "confirmed" tags that had in fact been created as junk
+    tags named after a uuid. Compare the human-readable thing you asked for.
     """
     owner = get_owner(owner_uuid) or {}
     on_record = {(p.get("number") or ""): set(p.get("tags") or [])
                  for p in (owner.get("phones") or [])}
     missing = {}
     for number, titles in number_to_tags.items():
-        want = {get_or_create_phone_tag(t)["uuid"] for t in titles}
         have = on_record.get(number, set())
-        gap = want - have
+        gap = {t for t in titles if t not in have}
         if gap:
             missing[number] = sorted(gap)
     if missing:

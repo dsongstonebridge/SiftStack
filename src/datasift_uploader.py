@@ -121,7 +121,7 @@ async def upload_to_datasift(
     password: str | None = None,
     headless: bool = True,
     enrich: bool = True,
-    skip_trace: bool = True,
+    skip_trace: bool = False,
     mode: str = "add",
     list_name: str | None = None,
     batch_tag: str = "Courthouse Data",
@@ -336,7 +336,7 @@ async def upload_datasift_split(
     password: str | None = None,
     headless: bool = True,
     enrich: bool = True,
-    skip_trace: bool = True,
+    skip_trace: bool = False,
     existing_list: bool = False,
 ) -> dict:
     """API-based split upload — same csv_infos shape as
@@ -1968,7 +1968,7 @@ async def upload_to_datasift_playwright(
     password: str | None = None,
     headless: bool = True,
     enrich: bool = True,
-    skip_trace: bool = True,
+    skip_trace: bool = False,
     mode: str = "add",
     list_name: str | None = None,
     batch_tag: str = "Courthouse Data",
@@ -2119,7 +2119,7 @@ async def upload_datasift_split_playwright(
     password: str | None = None,
     headless: bool = True,
     enrich: bool = True,
-    skip_trace: bool = True,
+    skip_trace: bool = False,
     existing_list: bool = False,
 ) -> dict:
     """Upload multiple CSVs sequentially for split Message Board entries.

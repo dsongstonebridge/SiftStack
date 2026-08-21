@@ -238,15 +238,141 @@ def property_exists(*, reapi_id: str | None = None, sift_id: str | None = None) 
     return _request("POST", f"{CORE_BASE}/api/internal/property/exists/", json_body=body) or None
 
 
-def find_property_by_address(street: str, city: str, state: str) -> dict | None:
-    """Fallback dedupe by address text when no reapi_id/sift_id is known yet."""
-    body = _request("GET", f"{CORE_BASE}/api/internal/property/",
-                     params={"search": f"{street} {city} {state}", "limit": 5}) or {}
-    for rec in _page_items(body):
-        addr = rec.get("address") or {}
-        if (addr.get("street", "").strip().lower() == street.strip().lower()
-                and addr.get("city", "").strip().lower() == city.strip().lower()):
-            return rec
+def search_by_address(address_prefix: str, *, limit: int = 10, offset: int = 0,
+                       ordering: str = "-list_count",
+                       property_type: str = "clean") -> list[dict]:
+    """Search properties by address prefix. **This actually works** — verified
+    live 2026-08-21 with a control: a real prefix returns exactly its record,
+    a gibberish prefix returns 0.
+
+    Uses the undocumented POST-as-GET pattern: POST to the list endpoint with
+    header `x-http-method-override: GET` and an Elasticsearch-style body. Found
+    in Tyler Austin's FCRE crm_api.py, where it runs in production.
+
+    This supersedes the long-standing claim that no address search exists. That
+    claim was true of the `search=` *query parameter*, which the endpoint
+    silently ignores (returning the same unfiltered page for any value — which
+    is exactly why it looked like a lagging index for so long). The POST body
+    form is a different mechanism and genuinely filters.
+
+    Consequences worth acting on:
+      - Cross-run dedupe is solved. A record created in an earlier process can
+        now be found by address.
+      - Prefer this over the duplicate-400 trick in create_property(), which
+        CREATES an invisible orphan when the address does not already exist.
+      - Prefer this over the local uuid map in datasift_uploader.
+
+    `property_type` filters server-side: "clean" will NOT match records that
+    failed address validation — pass "incomplete" for those, or None to skip
+    the filter. Match is a PREFIX, so pass the leading portion of the street
+    ("17642 S Tacoma"), not a full normalized address.
+    """
+    must: dict = {"search": f"address_prefix:{address_prefix}"}
+    if property_type:
+        must["property_type"] = property_type
+    body = {"limit": limit, "offset": offset, "ordering": ordering,
+            "query": {"must": must}}
+    headers = _headers(has_body=True, auth="api_key")
+    headers["x-http-method-override"] = "GET"
+    _pace()
+    resp = requests.post(f"{CORE_BASE}/api/internal/property/",
+                         headers=headers, json=body, timeout=45)
+    if not resp.ok:
+        raise DataSiftAPIError(
+            f"search_by_address({address_prefix!r}) -> {resp.status_code}: {resp.text[:300]}")
+    return _page_items(resp.json() or {})
+
+
+def _pick_best(results: list[dict]) -> dict:
+    """Duplicate resolution: prefer a record with a non-null `status` — those
+    are the actively managed leads. Tyler's rule; adopted as-is."""
+    with_status = [r for r in results if r.get("status")]
+    return (with_status or results)[0]
+
+
+#: The server rewrites streets on write — "4920 South Troost Avenue" is stored
+#: as "4920 S Troost Ave", "17642 S Tacoma Ave" as "17642 S Tacoma St". So a
+#: prefix built from the caller's own wording will miss. Normalize both sides
+#: and match on the house number, which is the one stable token.
+_STREET_ABBR = {
+    "NORTH": "N", "SOUTH": "S", "EAST": "E", "WEST": "W",
+    "NORTHEAST": "NE", "NORTHWEST": "NW", "SOUTHEAST": "SE", "SOUTHWEST": "SW",
+    "STREET": "ST", "AVENUE": "AVE", "DRIVE": "DR", "ROAD": "RD",
+    "PLACE": "PL", "LANE": "LN", "COURT": "CT", "BOULEVARD": "BLVD",
+    "CIRCLE": "CIR", "TERRACE": "TER", "PARKWAY": "PKWY", "TRAIL": "TRL",
+    "HIGHWAY": "HWY", "SUITE": "STE", "APARTMENT": "APT",
+}
+
+
+_STREET_SUFFIXES = {"ST", "AVE", "DR", "RD", "PL", "LN", "CT", "BLVD", "CIR",
+                    "TER", "PKWY", "TRL", "HWY", "WAY", "LOOP", "PT", "RUN"}
+
+
+def _norm_street(street: str) -> str:
+    toks = re.sub(r"[^\w\s]", " ", (street or "").upper()).split()
+    return " ".join(_STREET_ABBR.get(t, t) for t in toks)
+
+
+def _strip_suffix(normalized: str) -> str:
+    """Drop a trailing street-type token ("17642 S TACOMA ST" -> "17642 S TACOMA")."""
+    toks = normalized.split()
+    if len(toks) > 2 and toks[-1] in _STREET_SUFFIXES:
+        toks = toks[:-1]
+    return " ".join(toks)
+
+
+def find_property_by_address(street: str, city: str = "", state: str = "") -> dict | None:
+    """Resolve one property by address, or None. Read-only — unlike the
+    duplicate-400 trick, it never creates anything on a miss.
+
+    Searches on the house number (the only token the server leaves alone) and
+    then matches the full street client-side after normalizing both sides
+    through _STREET_ABBR. Matching the caller's raw wording against the stored
+    form fails on exactly the cases you would most want it to catch — verified
+    live: "4920 South Troost Avenue" is stored as "4920 S Troost Ave".
+
+    Checks both `property_type` buckets: "clean" first, then "incomplete",
+    since a record whose address failed validation is invisible to the former.
+    """
+    if not street or not street.split():
+        return None
+    house = street.split()[0]
+    want = _norm_street(street)
+
+    for ptype in ("clean", "incomplete"):
+        try:
+            results = search_by_address(house, property_type=ptype, limit=50)
+        except DataSiftAPIError as e:
+            logger.warning("search_by_address failed for %r: %s", house, e)
+            return None
+
+        def city_ok(addr):
+            return (not city
+                    or (addr.get("city") or "").strip().lower() == city.strip().lower())
+
+        # Tier 1 — exact match on the normalized street.
+        exact = [r for r in results
+                 if _norm_street((r.get("address") or {}).get("street")) == want
+                 and city_ok(r.get("address") or {})]
+        if exact:
+            return _pick_best(exact)
+
+        # Tier 2 — ignore the street-type suffix. The server GEOCODES on write
+        # and will correct a wrong one: "17642 S Tacoma Ave" was stored as
+        # "17642 S Tacoma St" (verified live). Requiring the suffix to match
+        # would miss exactly the records whose address we got slightly wrong,
+        # which is the case worth catching. House number + street name + city
+        # is specific enough to be safe; the suffix is the only thing dropped.
+        loose = [r for r in results
+                 if _strip_suffix(_norm_street((r.get("address") or {}).get("street"))) ==
+                 _strip_suffix(want)
+                 and city_ok(r.get("address") or {})]
+        if loose:
+            stored = (loose[0].get("address") or {}).get("street")
+            logger.info("find_property_by_address: matched %r to stored %r "
+                         "by ignoring the street suffix (server corrected it)",
+                         street, stored)
+            return _pick_best(loose)
     return None
 
 

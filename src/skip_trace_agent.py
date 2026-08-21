@@ -119,10 +119,22 @@ def resolve_subjects(rows: Iterable[dict]) -> tuple[list[dict], list[dict]]:
             unresolved.append({**row, "reason": "no street"})
             continue
 
-        rec = _api.find_property_by_address(street, city)
-        if not rec:
+        hit = _api.find_property_by_address(street, city)
+        if not hit:
             unresolved.append({**row, "reason": "no CRM record matched"})
             logger.warning("resolve: no record for %r / %r", street, city)
+            continue
+
+        # The search result is a LIST object and does NOT carry the owner's
+        # phones — re-read the detail. Skipping this makes an already-traced
+        # record look like it has no numbers, which silently drops existing
+        # phones from the merge and posts a "no numbers returned" board post
+        # over real data. Caught by a dry run 2026-08-21.
+        try:
+            rec = _api.get_property(hit["uuid"])
+        except _api.DataSiftAPIError as e:
+            logger.warning("resolve: detail read failed for %s: %s", hit.get("uuid"), e)
+            unresolved.append({**row, "reason": f"detail read failed: {e}"})
             continue
 
         addr = rec.get("address") or {}
@@ -359,9 +371,23 @@ def merge_sources(subjects: list[dict],
                 existing["relationship"] = existing["relationship"] or incoming["relationship"]
 
     for subj in subjects:
-        # Pre-existing record numbers join the owner's person, tagged DataSift,
-        # so they get scored and tiered along with everything else.
+        # Pre-existing record numbers join the owner's person so they get
+        # scored and tiered along with everything else.
         primary = next((p for p in subj["people"] if p["is_primary"]), None)
+        if primary is None and subj.get("existing_phones"):
+            # No source returned this owner (a miss, or a dry run), but the
+            # record already HAS numbers. Synthesize the owner as a person so
+            # they are not dropped — otherwise the board posts "no numbers
+            # returned" over a record that has some. Caught by a dry run
+            # 2026-08-21.
+            primary = {
+                "first": subj["first"], "last": subj["last"], "name": subj["name"],
+                "key": person_key(subj["first"], subj["last"]),
+                "relationship": None, "age": "", "deceased": False,
+                "is_primary": True, "mailing_street": "", "mailing_city": "",
+                "mailing_state": "", "sources": [], "phones": [], "emails": [],
+            }
+            subj["people"].append(primary)
         for ph in subj.get("existing_phones", []):
             if primary is None:
                 break

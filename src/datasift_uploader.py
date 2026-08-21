@@ -1,13 +1,31 @@
-"""Upload CSV files to DataSift.ai (REISift) via Playwright browser automation.
+"""Upload records to DataSift.ai (REISift).
 
-DataSift has no public REST API, so we automate the web UI:
-1. Upload wizard: "Upload File" → Add data → organize → tags → upload → map → finish
-2. Enrich: Manage → Enrich Data → Enrich Property Information (SiftMap)
-3. Skip Trace: Send To → Skip Trace → agree terms → process (unlimited plan)
+As of 2026-08-19, upload/tag/notes/custom-fields/skip-trace/phone-tags go
+through the real REST API (apiv2.reisift.io, Open API key auth) instead of
+Playwright. Two workflows still have no API and stay on browser automation:
+1. Enrich: Manage → Enrich Data → Enrich Property Information (SiftMap).
+   An endpoint DOES exist — `POST /api/internal/property/enrich/` — but its
+   trigger contract is undocumented and an empty POST reports a count of
+   EVERY property in the account, so calling it wrong risks running *owner*
+   enrichment account-wide and replacing the personal representative on every
+   probate record with the deceased owner of record. Ty's run_enrich_lists.py
+   reached the same conclusion and stays on the browser path deliberately.
+   Do not "migrate" this to the API without first establishing how to scope
+   it to specific records. (Corrects an earlier claim here that no such
+   endpoint existed at all.)
+2. Presets/sequences/SiftMap sold-tagging — separate migration, see
+   run_manage_presets_workflow() / run_manage_sold_workflow().
 
-Requires: DATASIFT_EMAIL and DATASIFT_PASSWORD in .env or environment.
+The original Playwright implementations of upload/skip-trace/phone-read/
+phone-tags are kept as *_playwright() functions — a rollback path, not dead
+code — in case the API path needs to be bypassed for a specific run.
+
+Requires: DATASIFT_API_KEY (new path) or DATASIFT_EMAIL/DATASIFT_PASSWORD
+(Playwright fallback and the still-Playwright-only enrich step) in .env.
 """
 
+import csv as _csv
+import json as _json
 import logging
 import os
 from pathlib import Path
@@ -15,6 +33,8 @@ from pathlib import Path
 import config
 from playwright.async_api import Page, TimeoutError as PwTimeout, async_playwright
 
+import datasift_api as _api
+from datasift_formatter import build_api_payload as _build_api_payload
 from datasift_core import (
     save_cookies as _save_cookies,
     login,
@@ -25,6 +45,468 @@ from datasift_core import (
 logger = logging.getLogger(__name__)
 
 DATASIFT_UPLOAD_URL = "https://app.reisift.io/records/properties"
+API_CUSTOM_FIELD_GROUP = "SiftStack"
+
+
+def _read_csv_rows(csv_path: str | Path | list[str | Path]) -> list[dict]:
+    paths = [csv_path] if isinstance(csv_path, (str, Path)) else list(csv_path)
+    rows: list[dict] = []
+    for p in paths:
+        with open(p, newline="", encoding="utf-8") as f:
+            rows.extend(list(_csv.DictReader(f)))
+    return rows
+
+
+def _row_owner_street(row: dict) -> tuple[str, str]:
+    owner_last = (row.get("Owner Last Name") or row.get("Company Name") or "").strip()
+    street = (row.get("Property Street Address") or "").strip()
+    return owner_last, street
+
+
+# ── UUID map: the reliable replacement for find_property_by_address() ──
+#
+# Confirmed live 2026-08-19: GET /api/internal/property/ only declares
+# `limit`/`offset` in its real schema — there is no `search` parameter, and
+# the endpoint silently ignores one if sent (a gibberish search term and a
+# real one return the identical, unfiltered page). find_property_by_address()
+# was built on the general "list endpoints accept search=" doc, never
+# verified against this specific endpoint's real parameters, and was
+# effectively non-functional the whole time it was in use — it only ever
+# matched a record that happened to already be in the account's small
+# default first-page slice, which is why every phone-read/skip-trace-retry
+# on a record we'd JUST created via the API kept coming back "not found" no
+# matter how long we waited. It was never a timing/indexing lag.
+#
+# The reliable fix: since upload_to_datasift() already knows each record's
+# real uuid the moment it creates it, persist that mapping to a small local
+# file and have every later, separate function call read it back instead of
+# re-deriving the uuid through a broken search. This sidecar file is NOT
+# tied to any one CSV path (a retry pass runs against a narrower filtered
+# CSV with a different filename than the original upload), so entries
+# accumulate in one well-known location keyed by owner+street.
+_UUID_MAP_FILENAME = ".datasift_uuid_map.json"
+
+
+def _uuid_map_path() -> Path:
+    return config.OUTPUT_DIR / _UUID_MAP_FILENAME
+
+
+def _uuid_map_key(owner_last: str, street: str) -> str:
+    return f"{(owner_last or '').strip().lower()}|{(street or '').strip().lower()}"
+
+
+def _load_uuid_map() -> dict[str, str]:
+    path = _uuid_map_path()
+    if not path.exists():
+        return {}
+    try:
+        return _json.loads(path.read_text(encoding="utf-8"))
+    except (_json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_uuid_map_entries(entries: dict[str, str]) -> None:
+    if not entries:
+        return
+    path = _uuid_map_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    current = _load_uuid_map()
+    current.update(entries)
+    path.write_text(_json.dumps(current, indent=2), encoding="utf-8")
+
+
+async def upload_to_datasift(
+    csv_path: Path,
+    email: str | None = None,
+    password: str | None = None,
+    headless: bool = True,
+    enrich: bool = True,
+    skip_trace: bool = True,
+    mode: str = "add",
+    list_name: str | None = None,
+    batch_tag: str = "Courthouse Data",
+    skip_trace_csv_path: str | Path | None = None,
+) -> dict:
+    """Upload a DataSift-formatted CSV entirely over the REST API — no browser
+    for creation. Same signature/return shape as the Playwright-only original
+    (upload_to_datasift_playwright) so daily --upload-datasift, dropbox-watch,
+    and skip-and-score-upload need no call-site changes.
+
+    Flow:
+      1. bulk_create_properties() in chunks  — the ONLY creation path that
+         reaches the index the CRM UI reads. See datasift_api's module
+         docstring for the tests behind that; individual creates return a
+         convincing 201 and stay invisible forever.
+      2. wait_for_properties()               — poll until each address shows
+         up. Records appearing IS the completion signal; bulk-create's job
+         activity is not retrievable.
+      3. One retry of ONLY the missing addresses, never the whole batch.
+      4. Per-uuid notes + custom fields.
+      5. Skip trace (API).
+      6. Enrich (still Playwright — an enrich endpoint exists but its trigger
+         contract is unknown and calling it wrong risks enriching the whole
+         account; see the module docstring).
+
+    The browser is only launched if enrich=True.
+
+    Deliberately does NOT pre-check addresses with the duplicate-400 trick:
+    on an address that does not already exist that call CREATES an invisible
+    DB-only orphan and squats the address so the bulk job's own row is then
+    rejected as a duplicate. Dedupe of genuinely pre-existing records is a
+    known gap, called out in `skipped` rather than papered over.
+    """
+    result: dict = {
+        "success": False, "records_uploaded": 0, "errors": 0, "message": "",
+        "uuids": [], "skipped": [],
+    }
+    rows = _read_csv_rows(csv_path)
+    if not rows:
+        result["message"] = f"No records found in {csv_path}"
+        logger.error(result["message"])
+        return result
+
+    if mode == "update":
+        logger.warning(
+            "upload_to_datasift: mode='update' requested but there is no reliable "
+            "existing-record lookup available (see _uuid_map_key doc above) — "
+            "every row will be created fresh, not matched to a prior record."
+        )
+
+    payload_by_key: dict[str, dict] = {}
+    for row in rows:
+        owner_last, street = _row_owner_street(row)
+        payload_by_key[_uuid_map_key(owner_last, street)] = _build_api_payload(row)
+
+    uuid_by_owner_last: dict[str, str] = {}
+
+    # ── 1. Create, in bulk. The only path that reaches the CRM's index. ──
+    def _addr_key(payload: dict) -> str:
+        a = payload["address"]
+        return f"{(a.get('street') or '').strip().lower()}|{(a.get('city') or '').strip().lower()}"
+
+    create_records = [
+        {k: v for k, v in payload.items()
+         if k in ("address", "owner", "tags", "lists") and v not in (None, "", [])}
+        for payload in payload_by_key.values()
+    ]
+    if batch_tag:
+        for rec in create_records:
+            rec["tags"] = sorted(set(rec.get("tags", [])) | {batch_tag})
+
+    try:
+        jobs = _api.bulk_create_properties(create_records)
+    except _api.DataSiftAPIError as e:
+        result["message"] = f"bulk-create failed: {e}"
+        result["errors"] = len(rows)
+        logger.error(result["message"])
+        return result
+
+    submitted = sum(j.get("total") or 0 for j in jobs)
+    accepted = sum(j.get("accepted") or 0 for j in jobs)
+    logger.info("bulk-create: %d job(s), submitted=%d accepted=%d",
+                 len(jobs), submitted, accepted)
+
+    # ── 2. Wait for them to land, then 3. retry ONLY what is missing. ──
+    wanted = [(p["address"].get("street"), p["address"].get("city"))
+              for p in payload_by_key.values()]
+    found = _api.wait_for_properties(wanted)
+
+    missing = [p for p in payload_by_key.values() if _addr_key(p) not in found]
+    if missing:
+        logger.warning("%d record(s) did not land; retrying only those", len(missing))
+        retry_records = [
+            {k: v for k, v in p.items()
+             if k in ("address", "owner", "tags", "lists") and v not in (None, "", [])}
+            for p in missing
+        ]
+        if batch_tag:
+            for rec in retry_records:
+                rec["tags"] = sorted(set(rec.get("tags", [])) | {batch_tag})
+        try:
+            _api.bulk_create_properties(retry_records)
+            found.update(_api.wait_for_properties(
+                [(p["address"].get("street"), p["address"].get("city")) for p in missing]))
+        except _api.DataSiftAPIError as e:
+            logger.warning("retry bulk-create failed: %s", e)
+
+    # ── 4. Per-record follow-up writes, keyed by resolved uuid. ──
+    new_uuid_entries: dict[str, str] = {}
+    for row in rows:
+        owner_last, street = _row_owner_street(row)
+        key = _uuid_map_key(owner_last, street)
+        payload = payload_by_key[key]
+
+        record = found.get(_addr_key(payload))
+        if not record:
+            result["errors"] += 1
+            result["skipped"].append({
+                "owner": owner_last, "street": street,
+                "reason": "never appeared in the index after bulk-create + one retry "
+                          "— not created, or an address that already existed",
+            })
+            continue
+        prop_uuid = record.get("uuid")
+
+        try:
+            if payload["notes"]:
+                _api.add_notes(prop_uuid, payload["notes"])
+                owner_uuid = (record.get("owner") or {}).get("uuid")
+                if owner_uuid:
+                    _api.post_message_board(owner_uuid, payload["notes"])
+
+            if payload["custom_fields"]:
+                _api.update_custom_field_values(prop_uuid, payload["custom_fields"])
+
+            uuid_by_owner_last[owner_last] = prop_uuid
+            new_uuid_entries[key] = prop_uuid
+            result["uuids"].append(prop_uuid)
+            result["records_uploaded"] += 1
+        except _api.DataSiftAPIError as e:
+            # The property is real and indexed — only follow-up writes failed.
+            # Keep it in the uuid map and flag the incomplete work rather than
+            # calling the whole record a failure.
+            logger.warning("Follow-up writes failed for %s / %s (record %s exists): %s",
+                            owner_last, street, prop_uuid, e)
+            uuid_by_owner_last[owner_last] = prop_uuid
+            new_uuid_entries[key] = prop_uuid
+            result["uuids"].append(prop_uuid)
+            result["records_uploaded"] += 1
+            result["skipped"].append({"owner": owner_last, "street": street,
+                                       "reason": f"created ({prop_uuid}) but notes/custom-fields incomplete: {e}"})
+
+    _save_uuid_map_entries(new_uuid_entries)
+
+    result["success"] = result["records_uploaded"] > 0
+    result["message"] = (
+        f"Uploaded {result['records_uploaded']}/{len(rows)} record(s) via bulk-create"
+        + (f", {result['errors']} error(s)" if result["errors"] else "")
+    )
+    logger.info(result["message"])
+
+    # ── 6. Enrich is the one step with no usable API route. ──
+    if result["success"] and enrich:
+        eff_email = email or os.environ.get("DATASIFT_EMAIL", "")
+        eff_password = password or os.environ.get("DATASIFT_PASSWORD", "")
+        if not eff_email or not eff_password:
+            logger.warning("Skipping enrichment - DATASIFT_EMAIL/PASSWORD not set")
+        else:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=headless)
+                context = await browser.new_context(viewport={"width": 1280, "height": 900})
+                page = await context.new_page()
+                try:
+                    if await login(page, eff_email, eff_password):
+                        result["enrich_result"] = await enrich_records(page, csv_path)
+                    else:
+                        logger.warning("Skipping enrichment - DataSift login failed")
+                finally:
+                    await browser.close()
+
+    if result["success"] and skip_trace:
+        target_rows = _read_csv_rows(skip_trace_csv_path) if skip_trace_csv_path else rows
+        target_uuids: list[str] = []
+        st_skipped: list[dict] = []
+        for row in target_rows:
+            r_owner, r_street = _row_owner_street(row)
+            u = uuid_by_owner_last.get(r_owner)
+            if u:
+                target_uuids.append(u)
+            else:
+                st_skipped.append(
+                    {"owner": r_owner, "street": r_street, "reason": "not uploaded this run"})
+        skip_trace_result = {"success": False, "message": "", "skip_traced": [], "skipped": st_skipped}
+        if target_uuids:
+            try:
+                _api.submit_skip_trace(target_uuids)
+                skip_trace_result["success"] = True
+                skip_trace_result["skip_traced"] = target_uuids
+                skip_trace_result["message"] = f"Submitted {len(target_uuids)} record(s) for skip trace"
+            except _api.DataSiftAPIError as e:
+                skip_trace_result["message"] = str(e)
+                logger.warning("Skip trace submit failed: %s", e)
+        result["skip_trace_result"] = skip_trace_result
+        logger.info("Skip trace: %s", skip_trace_result["message"])
+
+    return result
+
+
+async def upload_datasift_split(
+    csv_infos: list[dict],
+    email: str | None = None,
+    password: str | None = None,
+    headless: bool = True,
+    enrich: bool = True,
+    skip_trace: bool = True,
+    existing_list: bool = False,
+) -> dict:
+    """API-based split upload — same csv_infos shape as
+    upload_datasift_split_playwright(): each dict has "path", "label",
+    "list_name". The first CSV creates/updates the records (full
+    upload_to_datasift() behavior); each subsequent CSV targets the SAME
+    records by address and adds its Notes as one more Message Board post —
+    the explicit API equivalent of the old CSV-merge-by-address quirk that
+    produced multiple Message Board comments from split uploads.
+    """
+    if not csv_infos:
+        return {"success": False, "message": "No CSVs to upload", "uploads": []}
+
+    main_info = csv_infos[0]
+    main_result = await upload_to_datasift(
+        csv_path=main_info["path"], email=email, password=password, headless=headless,
+        enrich=enrich, skip_trace=skip_trace, mode="update" if existing_list else "add",
+        list_name=main_info.get("list_name"),
+    )
+    main_result["label"] = main_info["label"]
+    uploads = [main_result]
+
+    uuid_map = _load_uuid_map()
+    for info in csv_infos[1:]:
+        extra_rows = _read_csv_rows(info["path"])
+        posted, skipped = 0, []
+        for row in extra_rows:
+            owner_last, street = _row_owner_street(row)
+            notes = (row.get("Notes") or "").strip()
+            if not notes:
+                continue
+            prop_uuid = uuid_map.get(_uuid_map_key(owner_last, street))
+            if not prop_uuid:
+                skipped.append({"owner": owner_last, "street": street, "reason": "not found"})
+                continue
+            _api.add_notes(prop_uuid, notes)
+            owner_uuid = (_api.get_property(prop_uuid).get("owner") or {}).get("uuid")
+            if owner_uuid:
+                _api.post_message_board(owner_uuid, notes)
+            posted += 1
+        uploads.append({
+            "label": info["label"], "success": posted > 0,
+            "message": f"Posted {posted} additional note(s), {len(skipped)} skipped",
+            "skipped": skipped,
+        })
+
+    return {
+        "success": main_result["success"],
+        "message": main_result["message"],
+        "uploads": uploads,
+        "enrich_result": main_result.get("enrich_result"),
+        "skip_trace_result": main_result.get("skip_trace_result"),
+    }
+
+
+async def skip_trace_records(page, csv_path: str | Path | list[str | Path]) -> dict:
+    """API-based skip trace — same (page, csv_path) call signature as
+    skip_trace_records_playwright() so _retry_skipped_step() and existing
+    call sites need no changes; `page` is accepted but unused (the API needs
+    no browser). Resolves each row's property uuid from the local uuid map
+    (see _uuid_map_key doc — there is no working server-side address search
+    to fall back on), then submits skip trace for the resolved uuids in one
+    batch call."""
+    result: dict = {"success": False, "message": "", "skip_traced": [], "skipped": []}
+    rows = _read_csv_rows(csv_path)
+    if not rows:
+        result["skipped"].append({"reason": f"No valid records found in {csv_path}"})
+        return result
+
+    uuid_map = _load_uuid_map()
+    uuids: list[str] = []
+    for row in rows:
+        owner_last, street = _row_owner_street(row)
+        prop_uuid = uuid_map.get(_uuid_map_key(owner_last, street))
+        if not prop_uuid:
+            result["skipped"].append({"owner": owner_last, "street": street, "reason": "not found"})
+            continue
+        uuids.append(prop_uuid)
+        result["skip_traced"].append({"owner": owner_last, "street": street})
+
+    if uuids:
+        try:
+            _api.submit_skip_trace(uuids)
+            result["success"] = True
+        except _api.DataSiftAPIError as e:
+            result["success"] = False
+            result["skipped"].extend(result.pop("skip_traced"))
+            result["skip_traced"] = []
+            result["message"] = str(e)
+            logger.warning("Skip trace submit failed: %s", e)
+            return result
+
+    result["message"] = (
+        f"Skip traced {len(result['skip_traced'])}/{len(rows)} record(s)"
+        + (f", {len(result['skipped'])} skipped" if result["skipped"] else "")
+    )
+    logger.info(result["message"])
+    return result
+
+
+async def read_record_phone_numbers(page, csv_path: str | Path | list[str | Path]) -> dict:
+    """API-based phone read — same (page, csv_path) signature as
+    read_record_phone_numbers_playwright(); `page` accepted but unused.
+    Resolves each row's property uuid from the local uuid map (see
+    _uuid_map_key doc), then reads the owner's phones straight off the
+    record via GET, no page-scraping and no server-side search needed."""
+    result: dict = {"success": False, "records": {}, "skipped": []}
+    rows = _read_csv_rows(csv_path)
+    if not rows:
+        result["skipped"].append({"reason": f"No valid records found in {csv_path}"})
+        return result
+
+    uuid_map = _load_uuid_map()
+    for row in rows:
+        owner_last, street = _row_owner_street(row)
+        prop_uuid = uuid_map.get(_uuid_map_key(owner_last, street))
+        if not prop_uuid:
+            result["skipped"].append({"owner": owner_last, "street": street, "reason": "not found"})
+            continue
+        existing = _api.get_property(prop_uuid)
+        owner_uuid = (existing.get("owner") or {}).get("uuid")
+        if not owner_uuid:
+            result["skipped"].append({"owner": owner_last, "street": street, "reason": "no owner on record"})
+            continue
+        owner = _api.get_owner(owner_uuid)
+        phones = [p.get("number") for p in (owner.get("phones") or []) if p.get("number")]
+        if not phones:
+            result["skipped"].append({"owner": owner_last, "street": street, "reason": "no phones on record"})
+            continue
+        result["records"][owner_last] = phones
+
+    result["success"] = bool(result["records"])
+    return result
+
+
+async def upload_phone_tags(page, csv_path: str | Path) -> dict:
+    """API-based phone tag push — same (page, csv_path) signature as
+    upload_phone_tags_playwright(); `page` accepted but unused. csv_path is
+    the Trestle-scored "Phone Number | Phone Tag" CSV; groups numbers by tag
+    and applies each tag in one batch call per tag."""
+    result = {"success": False, "message": ""}
+    csv_path = Path(csv_path)
+    if not csv_path.exists():
+        result["message"] = f"Phone tags CSV not found: {csv_path}"
+        logger.error(result["message"])
+        return result
+
+    by_tag: dict[str, list[str]] = {}
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        for row in _csv.DictReader(f):
+            number, tag = row.get("Phone Number"), row.get("Phone Tag")
+            if number and tag:
+                by_tag.setdefault(tag, []).append(number)
+
+    if not by_tag:
+        result["message"] = f"No phone/tag pairs found in {csv_path}"
+        return result
+
+    total = 0
+    for tag, numbers in by_tag.items():
+        try:
+            _api.add_phone_tag(numbers, tag)
+            total += len(numbers)
+        except _api.DataSiftAPIError as e:
+            logger.warning("Phone tag %r failed for %d number(s): %s", tag, len(numbers), e)
+
+    result["success"] = total > 0
+    result["message"] = f"Tagged {total} phone number(s) across {len(by_tag)} tag(s)"
+    logger.info(result["message"])
+    return result
 
 
 async def _click_next_step(page: Page, timeout: int = 20000, attempts: int = 2) -> bool:
@@ -86,6 +568,7 @@ async def upload_csv(
     mode: str = "add",
     list_name: str | None = None,
     existing_list: bool = False,
+    batch_tag: str = "Courthouse Data",
 ) -> dict:
     """Upload a CSV file to DataSift via the 7-step upload wizard.
 
@@ -105,6 +588,8 @@ async def upload_csv(
         list_name: Target list name. Required when existing_list=True.
         existing_list: If True, select "Adding properties to an existing list"
             instead of creating a new list. The list must already exist in DataSift.
+        batch_tag: Batch-level tag applied to every record in this upload via
+            the wizard's Step 3 Custom Tags input (default "Courthouse Data").
 
     Returns:
         Dict with upload results: {success, records_uploaded, errors, message}
@@ -383,12 +868,12 @@ async def upload_csv(
         await page.wait_for_timeout(1500)
 
     # ── Wizard Step 3: Add tags ──
-    logger.info("Wizard Step 3: Adding 'Courthouse Data' tag...")
+    logger.info("Wizard Step 3: Adding '%s' tag...", batch_tag)
     await page.wait_for_timeout(1000)
     await _dismiss_popups(page)
     await _screenshot(page, "step3_tags")
 
-    # Add "Courthouse Data" tag via the Custom Tags input on the right side
+    # Add the batch tag via the Custom Tags input on the right side
     try:
         await _dismiss_popups(page)
         tag_input = page.locator('input[placeholder*="Search or add a new tag"]')
@@ -397,26 +882,26 @@ async def upload_csv(
             await page.wait_for_timeout(500)
             await tag_input.first.fill("")
             await page.wait_for_timeout(300)
-            await tag_input.first.type("Courthouse Data", delay=50)
+            await tag_input.first.type(batch_tag, delay=50)
             await page.wait_for_timeout(1500)
             await _dismiss_popups(page)
             await _screenshot(page, "step3_tag_typed")
 
-            # Check if "Courthouse Data" appears in autocomplete dropdown — click it
-            tag_option = page.locator('[role="option"]:has-text("Courthouse Data"), li:has-text("Courthouse Data")')
+            # Check if the tag appears in autocomplete dropdown — click it
+            tag_option = page.locator(f'[role="option"]:has-text("{batch_tag}"), li:has-text("{batch_tag}")')
             if await tag_option.count() > 0:
                 await tag_option.first.click(force=True)
                 await page.wait_for_timeout(1000)
-                logger.info("Selected 'Courthouse Data' from dropdown")
+                logger.info("Selected '%s' from dropdown", batch_tag)
             else:
                 # No dropdown option — press Enter to create the tag
                 await tag_input.first.press("Enter")
                 await page.wait_for_timeout(1000)
-                logger.info("Added 'Courthouse Data' tag via Enter")
+                logger.info("Added '%s' tag via Enter", batch_tag)
 
             await _screenshot(page, "step3_tag_added")
         else:
-            logger.warning("Tag input not found — 'Courthouse Data' tag NOT added")
+            logger.warning("Tag input not found — '%s' tag NOT added", batch_tag)
     except Exception as e:
         logger.warning("Tag addition failed: %s", e)
 
@@ -800,6 +1285,28 @@ async def _navigate_to_records(page: Page) -> None:
     await _dismiss_popups(page)
 
 
+async def _hard_reload_records(page: Page) -> None:
+    """Force an actual page reload of Records, unlike _navigate_to_records()
+    above — that one no-ops the navigation whenever the URL already contains
+    "/records" (true for the whole duration of a long enrich/skip-trace run,
+    since none of those actions change the URL), so it can never recover a
+    degraded SPA client state. Confirmed live 2026-08-18: after ~58
+    consecutive select/act cycles in one skip-and-score-upload run (56
+    enrich + a couple of skip trace attempts), the Records search input
+    silently stopped existing in the DOM at all ("Could not find Records
+    search box") for every remaining record — a single successful skip
+    trace by itself did not reproduce this in isolation, so it reads as
+    accumulated long-session SPA degradation rather than a per-action
+    modal/overlay left open. A real reload is the only thing in this file
+    that resets that state; used as a one-shot recovery attempt inside
+    _select_single_verified_record() below rather than proactively on a
+    schedule, since normal short runs never need it.
+    """
+    await page.reload(wait_until="domcontentloaded")
+    await page.wait_for_timeout(5000)
+    await _dismiss_popups(page)
+
+
 async def _filter_by_list(page: Page, list_name: str) -> bool:
     """Filter records page by list name. Returns True if filter applied.
 
@@ -936,54 +1443,119 @@ async def _select_single_verified_record(
     def _looks_like_address(text: str) -> bool:
         return bool(_re.search(r"\d", text or ""))
 
+    await _dismiss_popups(page)
+
     search_box = page.locator('input[placeholder*="Search"]')
     if await search_box.count() == 0:
-        return False, "Could not find Records search box"
+        # One-shot recovery: a real reload (not _navigate_to_records(), which
+        # no-ops while already on /records) sometimes brings the search box
+        # back after long-session SPA degradation — see _hard_reload_records().
+        # If it's still missing after that, give up for real.
+        await _hard_reload_records(page)
+        search_box = page.locator('input[placeholder*="Search"]')
+        if await search_box.count() == 0:
+            return False, "Could not find Records search box (still missing after reload recovery attempt)"
 
-    await search_box.first.fill(owner_last)
+    # The search box can also exist in the DOM but be non-interactable for a
+    # few seconds — confirmed live 2026-08-18 (Kennedy: a 30s default-timeout
+    # Locator.fill() hang), consistent with a lingering overlay from the
+    # PRIOR record's action rather than a missing element. Fail fast (5s)
+    # instead of eating Playwright's 30s default, dismiss popups + hard
+    # reload, then give it one real try.
+    try:
+        await search_box.first.fill(owner_last, timeout=5000)
+    except Exception:
+        await _dismiss_popups(page)
+        await _hard_reload_records(page)
+        search_box = page.locator('input[placeholder*="Search"]')
+        if await search_box.count() == 0:
+            return False, "Could not find Records search box (still missing after reload recovery attempt)"
+        await search_box.first.fill(owner_last)
     await page.wait_for_timeout(2000)
     await _dismiss_popups(page)
 
-    table_rows = page.locator('[class*="TableRow"]')
-    n = await table_rows.count()
-    street_number = street.split()[0] if street else ""
+    async def _scan_matches() -> tuple[list[int], int]:
+        table_rows = page.locator('[class*="TableRow"]')
+        n = await table_rows.count()
+        street_number = street.split()[0] if street else ""
+        matches = []
+        for i in range(n):
+            txt = await table_rows.nth(i).inner_text()
+            if street_number and street_number in txt and _looks_like_address(txt):
+                matches.append(i)
+        return matches, n
 
-    matches = []
-    for i in range(n):
-        txt = await table_rows.nth(i).inner_text()
-        if street_number and street_number in txt and _looks_like_address(txt):
-            matches.append(i)
+    matches, n = await _scan_matches()
+
+    if len(matches) == 0:
+        # One-shot recovery for a specific timing race confirmed live
+        # 2026-08-18: right after a prior record's skip-trace submission,
+        # the very next search sometimes lands mid-re-render and comes back
+        # with "0 of 0 rows" even though the record genuinely exists — a
+        # second attempt a couple seconds later reliably finds it. Only
+        # retry the true empty case; 2+ matches is a real ambiguity, not a
+        # timing issue, and must still be refused outright.
+        await page.wait_for_timeout(2500)
+        await search_box.first.fill("")
+        await page.wait_for_timeout(300)
+        await search_box.first.fill(owner_last)
+        await page.wait_for_timeout(2000)
+        matches, n = await _scan_matches()
 
     if len(matches) != 1:
         return False, f"Expected exactly 1 matching row for '{owner_last}' / '{street}', found {len(matches)} (of {n} rows for this search)"
 
+    table_rows = page.locator('[class*="TableRow"]')
     row = table_rows.nth(matches[0])
     checkbox = row.locator('input[type="checkbox"]')
     if await checkbox.count() == 0:
         return False, "Matched row has no checkbox element"
 
-    # This is a visually-hidden native input (width/height 0, opacity 0) with
-    # a custom-styled visual layered on top — the same pattern already
-    # documented for the login page's "Remember me"/Terms checkboxes in
-    # datasift_core.py.login(), which cannot be Locator.click()'d (Playwright
-    # correctly refuses — a 0x0 element is not actionable) and instead needs
-    # dispatch_event('click') to fire React's onChange directly.
-    await checkbox.first.dispatch_event("click")
-    await page.wait_for_timeout(500)
+    async def _click_and_count() -> int:
+        # This is a visually-hidden native input (width/height 0, opacity 0)
+        # with a custom-styled visual layered on top — the same pattern
+        # already documented for the login page's "Remember me"/Terms
+        # checkboxes in datasift_core.py.login(), which cannot be
+        # Locator.click()'d (Playwright correctly refuses — a 0x0 element is
+        # not actionable) and instead needs dispatch_event('click') to fire
+        # React's onChange directly.
+        await checkbox.first.dispatch_event("click")
+        await page.wait_for_timeout(500)
+        return await page.evaluate("""() => {
+            const boxes = document.querySelectorAll('input[type="checkbox"]:checked');
+            let count = 0;
+            for (const b of boxes) {
+                if (b.closest('thead')) continue;
+                count++;
+            }
+            return count;
+        }""")
+
+    selected_count = await _click_and_count()
+    if selected_count == 0:
+        # Same timing race as the 0-matches case above — the click can land
+        # while the row is mid-re-render right after a prior submission.
+        # Retry once; a 2nd stray click naturally toggles back to 0 if the
+        # first one actually DID register late, so re-scanning after a wait
+        # (rather than blindly clicking again) is the safe way to recover.
+        await page.wait_for_timeout(1500)
+        selected_count = await page.evaluate("""() => {
+            const boxes = document.querySelectorAll('input[type="checkbox"]:checked');
+            let count = 0;
+            for (const b of boxes) {
+                if (b.closest('thead')) continue;
+                count++;
+            }
+            return count;
+        }""")
+        if selected_count == 0:
+            selected_count = await _click_and_count()
 
     # Hard verification that clicking accomplished exactly what we intended —
     # this is the check that would have caught the 2026-08-13 incidents: if
-    # anything other than exactly 1 record is selected right now, refuse to
-    # let the caller proceed to any action button.
-    selected_count = await page.evaluate("""() => {
-        const boxes = document.querySelectorAll('input[type="checkbox"]:checked');
-        let count = 0;
-        for (const b of boxes) {
-            if (b.closest('thead')) continue;  // never count a header checkbox
-            count++;
-        }
-        return count;
-    }""")
+    # anything other than exactly 1 record is selected right now (including
+    # after the timing-race retry above), refuse to let the caller proceed
+    # to any action button.
     if selected_count != 1:
         return False, f"After clicking, {selected_count} checkbox(es) show as selected (expected exactly 1) — not proceeding"
 
@@ -1072,8 +1644,13 @@ def _read_csv_target_records(csv_paths: list[Path]) -> list[tuple[str, str]]:
 def _read_csv_absentee_flags(csv_paths: list[Path]) -> dict[str, bool]:
     """Map owner last name -> whether our source CSV indicates absentee
     ownership (Mailing Street Address present and different from Property
-    Street Address). Used to carve Swap Owners out for absentee records —
-    see the note in enrich_records() for why.
+    Street Address).
+
+    NO LONGER CALLED as of 2026-08-21: it existed to carve Swap Owners out
+    per-record, and Swap Owners is now OFF for everyone (see enrich_records()).
+    Kept because it is the only structural absentee detector in the codebase
+    and is the right building block if owner enrichment is ever re-enabled
+    per notice type.
     """
     import csv as _csv
 
@@ -1105,19 +1682,26 @@ async def enrich_records(page: Page, csv_path: str | Path | list[str | Path]) ->
     list-filter-then-select-all step — see the note above
     _select_single_verified_record() for why that was removed.
 
-    Toggles: "Enrich Property Information" and "Enrich Owners" are always ON
-    (per user preference — see [[feedback-enrich-owners-swap-owners-on]]).
-    "Swap Owners" is ON for everyone EXCEPT records our own source CSV
-    indicates are absentee-owned (Mailing Street Address present and
-    different from Property Street Address). Confirmed 2026-08-14: Swap
-    Owners silently overwrote an absentee owner's real mailing address with
-    the property address (and consequently skip-traced an unrelated phone
-    number) when DataSift's own database disagreed — erasing genuine
-    absentee-owner signal, a real lead-qualification data point in this
-    business, not just picking between two equivalent values. User's
-    instruction: keep Swap Owners ON generally (trust DataSift's data), but
-    carve out an exception specifically when our own records already show
-    absentee ownership.
+    Toggles (set 2026-08-21 to match Ty's run_enrich_lists.py exactly):
+
+        Enrich Property Information   ON    beds, baths, AVM, sqft, sale history
+        Enrich Owners                 OFF
+        Swap Owners                   OFF
+
+    Owners/Swap are OFF because they overwrite our contact mapping with
+    DataSift's owner of record. On probate that is actively destructive: it
+    replaces the personal representative with the *deceased* owner, undoing
+    the entire point of the PR contact mapping — the recurring bug tracked in
+    [[feedback-dm-contact-pattern]]. Ty's uploader takes the same position.
+
+    This REVERSES the earlier ON/ON setting from 2026-08-13/14
+    ([[feedback-enrich-owners-swap-owners-on]], now superseded), which came
+    from trusting DataSift's ownership data over the pipeline's. That
+    reasoning holds for a living absentee owner and fails for a deceased one,
+    and the absentee carve-out built for it (_read_csv_absentee_flags) only
+    ever protected the mailing address, never the PR mapping. If owner
+    enrichment is wanted again, do it per notice type — ON for
+    foreclosure/tax, never for probate — not as a global default.
 
     Args:
         page: Logged-in Playwright page.
@@ -1136,7 +1720,6 @@ async def enrich_records(page: Page, csv_path: str | Path | list[str | Path]) ->
         result["message"] = f"No valid records found in {csv_paths} — nothing to enrich"
         logger.error(result["message"])
         return result
-    absentee_by_owner = _read_csv_absentee_flags(csv_paths)
 
     logger.info("Starting DataSift enrichment for %d record(s) from %s", len(targets), csv_paths)
 
@@ -1181,14 +1764,10 @@ async def enrich_records(page: Page, csv_path: str | Path | list[str | Path]) ->
             await page.wait_for_timeout(2000)
             await _screenshot(page, f"enrich_modal_{owner_last}")
 
-            # Configure enrichment toggles: "Enrich Property Information" and
-            # "Enrich Owners" are always ON. "Swap Owners" is ON UNLESS our
-            # own source CSV indicates this record is absentee-owned — see
-            # the docstring above for why (2026-08-14: Swap Owners silently
-            # overwrote a real absentee mailing address with the property
-            # address, erasing genuine lead-qualification signal).
-            is_absentee = absentee_by_owner.get(owner_last, False)
-            toggle_state = await page.evaluate("""(isAbsentee) => {
+            # Configure enrichment toggles — Property Information ON, Enrich
+            # Owners and Swap Owners OFF. See the docstring for why owner
+            # enrichment is off entirely rather than carved out per record.
+            toggle_state = await page.evaluate("""() => {
                 const toggles = document.querySelectorAll('.react-toggle');
                 const results = {};
                 for (const toggle of toggles) {
@@ -1207,14 +1786,15 @@ async def enrich_records(page: Page, csv_path: str | Path | list[str | Path]) ->
                     }
                     if (!name) continue;
                     const isChecked = toggle.classList.contains('react-toggle--checked');
-                    const shouldBeOn = (name === 'Swap Owners') ? !isAbsentee : true;
+                    // Property Information ON; Owners and Swap Owners OFF.
+                    const shouldBeOn = (name === 'Enrich Property Information');
                     if (isChecked !== shouldBeOn) toggle.click();
                     results[name] = {before: isChecked, target: shouldBeOn};
                 }
                 return results;
-            }""", is_absentee)
-            logger.info("Enrich toggles for %s / %s (absentee=%s): %s",
-                        owner_last, street, is_absentee, toggle_state)
+            }""")
+            logger.info("Enrich toggles for %s / %s: %s",
+                        owner_last, street, toggle_state)
             await page.wait_for_timeout(1000)
             await _screenshot(page, f"enrich_toggles_set_{owner_last}")
 
@@ -1250,7 +1830,7 @@ async def enrich_records(page: Page, csv_path: str | Path | list[str | Path]) ->
     return result
 
 
-async def skip_trace_records(page: Page, csv_path: str | Path | list[str | Path]) -> dict:
+async def skip_trace_records_playwright(page: Page, csv_path: str | Path | list[str | Path]) -> dict:
     """Skip trace uploaded records for phone numbers + emails.
 
     Processes one record at a time — same per-record select-then-act pattern
@@ -1351,6 +1931,19 @@ async def skip_trace_records(page: Page, csv_path: str | Path | list[str | Path]
             logger.info("Skip traced: %s / %s", owner_last, street)
             result["skip_traced"].append({"owner": owner_last, "street": street})
 
+            # Confirmed live 2026-08-18: the record immediately following a
+            # real skip-trace submission fails its search/select far more
+            # often than chance (a near-exact success/fail alternation across
+            # two full batch runs) — reads as some async DataSift-side effect
+            # of the submission itself (e.g. a credits/record refresh) that
+            # briefly desyncs the next interaction, not a client rendering
+            # glitch the earlier per-record retries alone were fixing. A
+            # longer pause after success specifically (not after every
+            # record) cut the failure rate substantially without slowing
+            # down runs that hit fewer real submissions.
+            await page.wait_for_timeout(4000)
+            await _dismiss_popups(page)
+
         except Exception as e:
             logger.warning("Skip trace step failed for %s / %s: %s", owner_last, street, e)
             result["skipped"].append({"owner": owner_last, "street": street, "reason": str(e)})
@@ -1369,7 +1962,7 @@ async def skip_trace_records(page: Page, csv_path: str | Path | list[str | Path]
     return result
 
 
-async def upload_to_datasift(
+async def upload_to_datasift_playwright(
     csv_path: Path,
     email: str | None = None,
     password: str | None = None,
@@ -1378,6 +1971,8 @@ async def upload_to_datasift(
     skip_trace: bool = True,
     mode: str = "add",
     list_name: str | None = None,
+    batch_tag: str = "Courthouse Data",
+    skip_trace_csv_path: str | Path | None = None,
 ) -> dict:
     """Full DataSift workflow: launch browser → login → upload CSV → enrich → skip trace.
 
@@ -1390,6 +1985,13 @@ async def upload_to_datasift(
         skip_trace: Run "Skip Trace" after upload (default True, uses unlimited plan).
         mode: "add" (new/existing) or "update" (update existing records in place).
         list_name: Target list name. Required when mode="update"; auto-generated otherwise.
+        batch_tag: Batch-level tag applied via the upload wizard (default "Courthouse Data").
+        skip_trace_csv_path: If given, scopes the skip-trace step to just the
+            records in this (narrower) CSV instead of csv_path — everything
+            in csv_path still gets uploaded and enriched. Use this to exclude
+            records with no living contact (e.g. a deceased owner with no
+            named heir/spouse) from being skip traced, while still landing
+            them in DataSift. Defaults to csv_path (all uploaded records).
 
     Returns:
         Dict with upload results including enrich_result and skip_trace_result.
@@ -1439,6 +2041,7 @@ async def upload_to_datasift(
                 mode=mode,
                 list_name=effective_list_name,
                 existing_list=existing_list,
+                batch_tag=batch_tag,
             )
 
             # Verify actual DataSift state whenever the file was submitted —
@@ -1496,9 +2099,11 @@ async def upload_to_datasift(
                     result["enrich_result"] = enrich_result
                     logger.info("Enrichment: %s", enrich_result.get("message", ""))
 
-                # Skip trace for phones + emails
+                # Skip trace for phones + emails — scoped to skip_trace_csv_path
+                # when given, so records with no living contact never get
+                # skip traced even though they were uploaded/enriched above.
                 if skip_trace:
-                    skip_result = await skip_trace_records(page, csv_path)
+                    skip_result = await skip_trace_records_playwright(page, skip_trace_csv_path or csv_path)
                     result["skip_trace_result"] = skip_result
                     logger.info("Skip trace: %s", skip_result.get("message", ""))
 
@@ -1508,7 +2113,7 @@ async def upload_to_datasift(
             await browser.close()
 
 
-async def upload_datasift_split(
+async def upload_datasift_split_playwright(
     csv_infos: list[dict],
     email: str | None = None,
     password: str | None = None,
@@ -1610,7 +2215,7 @@ async def upload_datasift_split(
                     logger.info("Enrichment: %s", enrich_result.get("message", ""))
 
                 if skip_trace:
-                    skip_result = await skip_trace_records(page, all_csv_paths)
+                    skip_result = await skip_trace_records_playwright(page, all_csv_paths)
                     combined["skip_trace_result"] = skip_result
                     logger.info("Skip trace: %s", skip_result.get("message", ""))
 
@@ -2029,7 +2634,7 @@ async def export_phone_enrichment(
     return result
 
 
-async def read_record_phone_numbers(
+async def read_record_phone_numbers_playwright(
     page: Page, csv_path: str | Path | list[str | Path],
 ) -> dict:
     """Read phone numbers straight off each CSV record's own detail page,
@@ -2213,7 +2818,7 @@ async def _filter_by_preset(page: Page, preset_name: str) -> bool:
         return False
 
 
-async def upload_phone_tags(page: Page, csv_path: str | Path) -> dict:
+async def upload_phone_tags_playwright(page: Page, csv_path: str | Path) -> dict:
     """Upload phone tags CSV to DataSift via "Update Data → Tag phones by phone number".
 
     Args:
@@ -3265,7 +3870,37 @@ async def run_manage_sold_workflow(
 DATASIFT_SEQUENCES_URL = "https://app.reisift.io/sequences"
 
 
-async def discover_presets(page: Page) -> dict:
+async def discover_presets(page=None) -> dict:
+    """API-based preset discovery — same return shape as discover_presets_playwright()
+    (`page` accepted but unused). Lists every real filter-preset folder and the
+    presets inside it directly from the API, so it never goes stale the way the
+    old Playwright version's hardcoded `known_folders` list did.
+
+    Confirmed live 2026-08-19: the account's real preset structure (64 presets
+    across 14 folders — "01. HOTTEST - CALL", "05. TIER 1 - FTM - CALL",
+    "11. DEEP PROSPECTING (ALL TIERS)", etc.) no longer matches CLAUDE.md's
+    documented 21-preset/2-folder "00 Niche Sequential Marketing" /
+    "01. Bulk Sequential Marketing" layout that update_all_presets_sold_exclusion()
+    and create_sold_sequence() target — that structure appears to have been
+    rebuilt outside this codebase. Those two functions are left on Playwright,
+    unchanged, rather than ported against folder names that no longer exist;
+    see CLAUDE.md for the open follow-up.
+
+    Sequences have no API (confirmed — no route in the 323-path spec or the
+    endpoint index) and are left empty here; use the Sequences page in-app or
+    create_sold_sequence()'s Playwright pattern for sequence work.
+    """
+    folders = _api.list_filter_preset_folders()
+    presets = _api.list_filter_presets()
+    by_folder: dict[str, list[str]] = {f["title"]: [] for f in folders}
+    folder_title_by_uuid = {f["uuid"]: f["title"] for f in folders}
+    for p in presets:
+        folder_title = folder_title_by_uuid.get(p.get("folder"), "(no folder)")
+        by_folder.setdefault(folder_title, []).append(p.get("title") or p.get("uuid"))
+    return {"preset_folders": by_folder, "sequences": [], "success": True}
+
+
+async def discover_presets_playwright(page: Page) -> dict:
     """Discover all filter preset folders and presets, plus existing sequences.
 
     Navigates to Records → Filter Records to scrape preset folder structure,

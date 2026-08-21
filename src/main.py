@@ -1095,6 +1095,51 @@ def _read_property_template(path: Path) -> list[dict]:
     return rows
 
 
+def _filter_csv_by_owners(csv_path: Path, owner_last_names: set[str], output_path: Path) -> Path:
+    """Write a copy of a DataSift-ready CSV containing only rows whose 'Owner
+    Last Name' matches one of owner_last_names (case-insensitive). Scopes a
+    single automatic retry pass to just the records that fell through a
+    per-record verified-selection step on the first pass. Plain utf-8, no
+    BOM — a BOM here silently breaks _read_csv_target_records's column
+    lookup (confirmed live 2026-08-17)."""
+    import csv as _csv
+    wanted = {name.strip().lower() for name in owner_last_names}
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        reader = _csv.DictReader(f)
+        fieldnames = reader.fieldnames
+        rows = [r for r in reader if (r.get("Owner Last Name") or "").strip().lower() in wanted]
+    with open(output_path, "w", newline="", encoding="utf-8") as f:
+        writer = _csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    return output_path
+
+
+async def _retry_skipped_step(page, step_fn, csv_path: Path, skipped: list[dict],
+                               retry_csv_path: Path, step_name: str) -> dict:
+    """One automatic retry pass for a per-record DataSift step (enrich or
+    skip trace) against whatever fell through the first pass — same
+    per-record verified-selection safety as the first pass, just re-run once
+    on the narrower subset. Never loops: a record still unresolved after
+    this single retry is left in the returned 'skipped' list for the final
+    run summary rather than retried again."""
+    if not skipped:
+        return {"skipped": []}
+    owner_lasts = {s["owner"] for s in skipped if s.get("owner")}
+    if not owner_lasts:
+        return {"skipped": skipped}
+    _filter_csv_by_owners(csv_path, owner_lasts, retry_csv_path)
+    logging.info("%s: retrying %d record(s) skipped on the first pass", step_name, len(owner_lasts))
+    retry_result = await step_fn(page, retry_csv_path)
+    still_skipped = retry_result.get("skipped", [])
+    if still_skipped:
+        logging.warning("%s: %d record(s) still unresolved after retry: %s",
+                         step_name, len(still_skipped), still_skipped)
+    else:
+        logging.info("%s: all previously-skipped record(s) resolved on retry", step_name)
+    return retry_result
+
+
 def _run_skip_and_score_upload(args) -> None:
     """Full pipeline, single command: raw property-template CSV/xlsx ->
     Tracerfy skip trace -> DataSift upload/enrich/skip-trace -> phone read ->
@@ -1138,13 +1183,33 @@ def _run_skip_and_score_upload(args) -> None:
         sys.exit(1)
     logging.info("Read %d record(s) from %s", len(template_rows), csv_path.name)
 
-    tracerfy_cost = len(template_rows) * 0.02
+    # "Owner Alive" (from petition-info-extraction) == "No" means the source
+    # document names no living heir/spouse/co-borrower/representative at all
+    # for that owner — never trace those, at either Tracerfy (below) or
+    # DataSift's own skip trace (after upload). They still get uploaded and
+    # enriched, just flagged instead of traced — see
+    # [[feedback-petition-deceased-owner-no-skip-trace]].
+    deceased_no_contact = [
+        r for r in template_rows
+        if str(r.get("Owner Alive") or "").strip().lower() == "no"
+    ]
+    alive_rows = [r for r in template_rows if r not in deceased_no_contact]
+    if deceased_no_contact:
+        logging.info(
+            "%d record(s) flagged Owner Alive=No — will upload/enrich but skip "
+            "Tracerfy and DataSift skip trace for: %s",
+            len(deceased_no_contact),
+            ", ".join(f"{r.get('First Name', '')} {r.get('Last Name', '')}".strip() for r in deceased_no_contact),
+        )
+
+    tracerfy_cost = len(alive_rows) * 0.02
     if estimate_only:
         logging.info(
-            "Estimate: %d record(s) x $0.02 Tracerfy = $%.2f. "
+            "Estimate: %d record(s) x $0.02 Tracerfy = $%.2f (%d deceased-no-contact "
+            "record(s) excluded from tracing). "
             "(Trestle cost isn't known until after DataSift skip trace returns real phone "
             "numbers — that estimate is shown mid-run.)",
-            len(template_rows), tracerfy_cost,
+            len(alive_rows), tracerfy_cost, len(deceased_no_contact),
         )
         return
 
@@ -1153,7 +1218,7 @@ def _run_skip_and_score_upload(args) -> None:
     # human check) can only be evaluated later, once real phone numbers
     # exist — see the MAX_PHONES_PER_RECORD_BEFORE_CONFIRM check below.
     logging.info("Tracerfy: tracing %d record(s), ~$%.2f — proceeding automatically",
-                  len(template_rows), tracerfy_cost)
+                  len(alive_rows), tracerfy_cost)
 
     from tracerfy_skip_tracer import trace_contacts
     contacts = [
@@ -1162,9 +1227,9 @@ def _run_skip_and_score_upload(args) -> None:
             "address": r.get("Property Street", ""), "city": r.get("Property City", ""),
             "state": r.get("Property State", ""), "zip": str(r.get("Property Zip", "")),
         }
-        for r in template_rows
+        for r in alive_rows
     ]
-    trace_results = trace_contacts(contacts)
+    trace_results = trace_contacts(contacts) if contacts else []
     logging.info("Tracerfy: %d/%d record(s) matched", len(trace_results), len(contacts))
 
     from datasift_formatter import build_datasift_csv_from_template
@@ -1173,10 +1238,23 @@ def _run_skip_and_score_upload(args) -> None:
         notice_type=notice_type, county=county, trial_tag=trial_tag,
     )
 
+    # Everything in template_rows (including deceased-no-contact records)
+    # gets uploaded and enriched, but the DataSift-side skip trace must only
+    # touch the alive ones — scope it to a filtered copy of the CSV rather
+    # than the full upload CSV.
+    skip_trace_csv = datasift_csv
+    if deceased_no_contact:
+        alive_last_names = {(r.get("Last Name") or "").strip() for r in alive_rows}
+        skip_trace_csv = _filter_csv_by_owners(
+            datasift_csv, alive_last_names,
+            OUTPUT_DIR / f"skip_trace_scope_{notice_type}_{datetime.now().strftime('%Y-%m-%d')}.csv",
+        )
+
     from datasift_uploader import upload_to_datasift
     upload_result = _asyncio.run(upload_to_datasift(
         csv_path=datasift_csv, headless=False, enrich=True, skip_trace=True,
-        mode="add", list_name=list_name,
+        mode="add", list_name=list_name, batch_tag="FTM",
+        skip_trace_csv_path=skip_trace_csv,
     ))
     logging.info("DataSift upload: %s", upload_result.get("message", ""))
     if not upload_result.get("success"):
@@ -1189,6 +1267,7 @@ def _run_skip_and_score_upload(args) -> None:
         from datasift_core import login
         from datasift_uploader import (
             read_record_phone_numbers, write_phone_enrichment_csv, upload_phone_tags,
+            enrich_records, skip_trace_records,
         )
 
         async with async_playwright() as p:
@@ -1201,12 +1280,52 @@ def _run_skip_and_score_upload(args) -> None:
                     logging.error("DataSift login failed — cannot read phone data")
                     return
 
+                # One automatic retry pass each for enrich and skip trace —
+                # same per-record verified-selection safety, just re-run once
+                # on whatever fell through the first pass (e.g. a search that
+                # briefly returned 0 or 2+ rows). Skip trace must retry before
+                # phone read: a record only has phone data to read once its
+                # own skip trace has actually succeeded.
+                still_unresolved: dict[str, list[str]] = {}
+                enrich_skipped = upload_result.get("enrich_result", {}).get("skipped", [])
+                if enrich_skipped:
+                    retry = await _retry_skipped_step(
+                        page, enrich_records, datasift_csv, enrich_skipped,
+                        OUTPUT_DIR / f"retry_enrich_{notice_type}.csv", "Enrich",
+                    )
+                    if retry.get("skipped"):
+                        still_unresolved["enrich"] = [s["owner"] for s in retry["skipped"] if s.get("owner")]
+
+                skip_trace_skipped = upload_result.get("skip_trace_result", {}).get("skipped", [])
+                if skip_trace_skipped:
+                    retry = await _retry_skipped_step(
+                        page, skip_trace_records, datasift_csv, skip_trace_skipped,
+                        OUTPUT_DIR / f"retry_skip_trace_{notice_type}.csv", "Skip trace",
+                    )
+                    if retry.get("skipped"):
+                        still_unresolved["skip_trace"] = [s["owner"] for s in retry["skipped"] if s.get("owner")]
+
                 phone_result = await read_record_phone_numbers(page, datasift_csv)
+                if phone_result["skipped"]:
+                    retry = await _retry_skipped_step(
+                        page, read_record_phone_numbers, datasift_csv, phone_result["skipped"],
+                        OUTPUT_DIR / f"retry_phone_read_{notice_type}.csv", "Phone read",
+                    )
+                    phone_result["records"].update(retry.get("records", {}))
+                    if retry.get("skipped"):
+                        still_unresolved["phone_read"] = [s["owner"] for s in retry["skipped"] if s.get("owner")]
+                    phone_result["success"] = bool(phone_result["records"])
+
+                if still_unresolved:
+                    logging.warning(
+                        "skip-and-score-upload: record(s) still needing manual attention after "
+                        "automatic retry — %s. Everything else completed end to end.",
+                        still_unresolved,
+                    )
+
                 if not phone_result["success"]:
                     logging.warning("No phone data read from any record: %s", phone_result.get("skipped"))
                     return
-                if phone_result["skipped"]:
-                    logging.warning("Some records skipped during phone read: %s", phone_result["skipped"])
 
                 phone_csv = write_phone_enrichment_csv(
                     phone_result["records"],

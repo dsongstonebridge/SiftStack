@@ -920,10 +920,135 @@ def _build_row(notice: NoticeData, notes_override: str | None = None) -> dict:
     }
 
 
-_PETITION_INFO_FIELDS = [
-    "Date of Mortgage/Note", "Original Loan Amount", "Unpaid Principal Balance",
-    "Interest Rate", "Date of Last Payment", "Date Foreclosure Filed",
+_API_CORE_COLUMNS = {
+    "Property Street Address", "Property City", "Property State", "Property ZIP Code",
+    "Owner First Name", "Owner Last Name", "Owner Type", "Company Name",
+    "Mailing Street Address", "Mailing City", "Mailing State", "Mailing ZIP Code",
+    "Phone 1", "Phone 2", "Phone 3", "Phone 4", "Phone 5",
+    "Phone 6", "Phone 7", "Phone 8", "Phone 9",
+    "Email 1", "Email 2", "Email 3", "Email 4", "Email 5",
+    "Tags", "Lists", "Notes",
+}
+
+
+def build_api_payload(row: dict) -> dict:
+    """Map a DATASIFT_COLUMNS CSV row (as built by _build_row) to the REST API's
+    request shapes: address, owner, tags (array), lists, notes, phones, emails,
+    and a flat {column_name: value} dict of everything else for
+    datasift_api.update_custom_field_values().
+
+    Handles two API requirements the CSV shape itself doesn't need to satisfy
+    (confirmed live against the API 2026-08-19, not documented in the
+    reference):
+      - owner.address is required — falls back to property address, same as
+        the CSV's own mailing-address fallback in _get_contact_info().
+      - Entity owners must omit first_name/last_name entirely rather than
+        send "" — the API 400s on a blank first_name. _build_row() already
+        leaves these blank (not omitted) for entities, which the CSV importer
+        tolerates but this API will not; this function is where that gets fixed.
+
+    The remaining ~46 non-core columns (the 18 "built-in" fields plus the 16
+    SiftStack + 10 deep-prospecting + 3 entity-research custom columns) are
+    all routed through the custom-fields mechanism for now, not split into
+    "native property field vs. genuine custom field": Phase A's empirical
+    check found an existing real property with every candidate native field
+    (estimate_value, sqft, bedrooms, ...) already null, so there's no proven
+    mapping to a native key yet, and guessing wrong risks a silent drop. A
+    custom field write is visible and correctable later; a wrong native-field
+    guess is not.
+    """
+    is_entity = row.get("Owner Type") == "Company"
+
+    phones = [{"number": p} for p in
+              (row.get(f"Phone {i}") for i in range(1, 10)) if p and p.strip()]
+    emails = [{"email": e} for e in
+              (row.get(f"Email {i}") for i in range(1, 6)) if e and e.strip()]
+
+    owner_address = {
+        "street": row.get("Mailing Street Address") or row.get("Property Street Address"),
+        "city": row.get("Mailing City") or row.get("Property City"),
+        "state": row.get("Mailing State") or row.get("Property State"),
+        "postal_code": row.get("Mailing ZIP Code") or row.get("Property ZIP Code"),
+        "country": "US",
+    }
+    owner: dict = {"address": owner_address, "phones": phones, "emails": emails}
+    if is_entity:
+        owner["company"] = row.get("Company Name") or ""
+    else:
+        owner["first_name"] = row.get("Owner First Name") or ""
+        owner["last_name"] = row.get("Owner Last Name") or ""
+
+    # Tags MUST be an array — a comma string creates one tag literally named
+    # "Courthouse Data, foreclosure, Knox".
+    tags = [t.strip() for t in (row.get("Tags") or "").split(",") if t.strip()]
+    # Lists, deliberately, is NOT split. Ty's production uploader
+    # (datasift_api_upload.py:152) sends `lists` as a bare string one line
+    # after splitting tags into an array — the asymmetry is intentional and
+    # matches the OpenAPI spec, which types `lists` as a plain string. Our
+    # Lists column only ever holds a single list name (see _build_row), so
+    # the multi-list case this could theoretically mangle never arises.
+
+    custom_fields = {
+        col: row[col] for col in DATASIFT_COLUMNS
+        if col not in _API_CORE_COLUMNS and row.get(col) not in (None, "")
+    }
+
+    return {
+        "address": {
+            "street": row.get("Property Street Address"),
+            "city": row.get("Property City"),
+            "state": row.get("Property State"),
+            "postal_code": row.get("Property ZIP Code"),
+            "country": "US",
+        },
+        "owner": owner,
+        "tags": tags,
+        "lists": row.get("Lists") or "",
+        "notes": row.get("Notes") or "",
+        "custom_fields": custom_fields,
+    }
+
+
+"""Petition fields rendered into Notes / Message Board, in display order.
+
+Extended 2026-08-21 at the user's request: the original six were the loan
+figures alone, which left out most of what actually drives a decision on a
+foreclosure lead. The additions — legal description, lender/plaintiff,
+modification history, junior lienholders, owner status — came from reading two
+real Tulsa petitions end to end and noting what mattered and wasn't captured.
+
+Grouped so the note reads as sections rather than one long pipe-delimited run.
+Any field absent from the row is skipped, so older/plainer rows still work.
+"""
+_PETITION_SECTIONS: list[tuple[str, list[str]]] = [
+    ("CASE", [
+        "Date Foreclosure Filed", "Case Number", "Court County",
+        "Plaintiff", "Co-Defendants",
+    ]),
+    ("PROPERTY", [
+        "Legal Description", "Plat Number",
+    ]),
+    ("LOAN", [
+        "Date of Mortgage/Note", "Original Lender", "Original Loan Amount",
+        "Initial Interest Rate", "Original Monthly Payment",
+        "Mortgage Recorded Date", "Mortgage Document Number",
+        "Unpaid Principal Balance", "Interest Rate",
+        "Date of Default", "Date of Last Payment",
+    ]),
+    ("MODIFICATIONS", [
+        "Loan Modification Count", "Loan Modification History",
+    ]),
+    ("OWNER", [
+        "Owner Status", "Owner Alive",
+    ]),
+    ("LIENS", [
+        "Junior Lienholders",
+    ]),
 ]
+
+#: Flat list, kept for callers that just want to know which columns are
+#: petition-derived (e.g. deciding whether a row has petition data at all).
+_PETITION_INFO_FIELDS = [f for _, fields in _PETITION_SECTIONS for f in fields]
 
 
 def _format_petition_notes(rec: dict) -> str:
@@ -957,26 +1082,55 @@ def _format_petition_notes(rec: dict) -> str:
         except (TypeError, ValueError):
             return str(v).strip()
 
+    def _fmt_text(v) -> str:
+        return "" if v is None else str(v).strip()
+
     formatters = {
         "Date of Mortgage/Note": _fmt_date,
-        "Original Loan Amount": _fmt_currency,
-        "Unpaid Principal Balance": _fmt_currency,
-        "Interest Rate": _fmt_rate,
+        "Mortgage Recorded Date": _fmt_date,
+        "Date of Default": _fmt_date,
         "Date of Last Payment": _fmt_date,
         "Date Foreclosure Filed": _fmt_date,
+        "Original Loan Amount": _fmt_currency,
+        "Unpaid Principal Balance": _fmt_currency,
+        "Original Monthly Payment": _fmt_currency,
+        "Interest Rate": _fmt_rate,
+        "Initial Interest Rate": _fmt_rate,
     }
 
-    parts = []
-    for field in _PETITION_INFO_FIELDS:
-        if field not in rec:
-            continue
-        formatted = formatters[field](rec.get(field))
-        if formatted:
-            parts.append(f"{field}: {formatted}")
+    sections: list[str] = []
+    for heading, fields in _PETITION_SECTIONS:
+        lines = []
+        for field in fields:
+            if field not in rec:
+                continue
+            formatted = formatters.get(field, _fmt_text)(rec.get(field))
+            if formatted:
+                lines.append(f"  {field}: {formatted}")
+        if lines:
+            sections.append(heading + "\n" + "\n".join(lines))
 
-    if not parts:
+    if not sections:
         return ""
-    return "Petition info -- " + " | ".join(parts) + "."
+
+    note = "FORECLOSURE PETITION\n" + "\n\n".join(sections)
+
+    # Underwriting flag worth surfacing, not buried in the figures: when the
+    # balance owed exceeds the original loan, arrears have been capitalized
+    # through repeated modifications and equity may be thin or negative.
+    try:
+        upb = float(rec.get("Unpaid Principal Balance") or 0)
+        orig = float(rec.get("Original Loan Amount") or 0)
+        if upb and orig and upb > orig:
+            # ASCII only: this string can reach a Windows cp1252 console via
+            # logging, where a non-ASCII dash raises UnicodeEncodeError.
+            note += (f"\n\nCAUTION: balance owed (${upb:,.2f}) exceeds the original "
+                     f"loan (${orig:,.2f}) by ${upb - orig:,.2f} - arrears capitalized "
+                     f"through modification. Verify total payoff before underwriting.")
+    except (TypeError, ValueError):
+        pass
+
+    return note
 
 
 def build_datasift_csv_from_template(
@@ -1003,6 +1157,15 @@ def build_datasift_csv_from_template(
             "Record Link" for the source URL).
         trace_results: trace_contacts()'s return value — matched to
             template_rows by (first_name, last_name), case-insensitive.
+            Ignored for any row whose "Owner Alive" column is "No" (see
+            below), even if a match exists — that owner is never traced.
+        (optional per-row) "Owner Alive": "Yes"/"No"/blank. "No" means the
+            source document names no living heir/spouse/co-borrower/
+            representative for this owner — the record is still built and
+            uploaded (tagged "deceased", Owner Deceased=yes, and flagged in
+            Notes/Message Board) but is never given phone/email data here,
+            and the caller (see skip-and-score-upload in main.py) must also
+            exclude it from Tracerfy and DataSift's own skip trace.
         notice_type: e.g. "foreclosure" — drives the Lists column via
             NOTICE_TYPE_TO_LIST and gets tagged directly.
         county: tagged and set in the County column if provided.
@@ -1037,7 +1200,18 @@ def build_datasift_csv_from_template(
         if not (street and last):
             continue
 
-        t = trace_by_name.get((first.lower(), last.lower()), {})
+        # "Owner Alive" is an optional column from the petition-info-extraction
+        # skill (Yes/No/blank). "No" means the petition names no living
+        # heir/spouse/co-borrower/representative for this owner at all —
+        # skip tracing a dead person wastes money and a resulting phone
+        # number sitting next to their name in DataSift reads as a live,
+        # dialable contact, which it isn't. Blank/missing (plain property
+        # templates with no petition data) is treated as alive, unchanged
+        # from prior behavior.
+        owner_alive_raw = str(rec.get("Owner Alive") or "").strip().lower()
+        is_deceased_no_contact = owner_alive_raw == "no"
+
+        t = {} if is_deceased_no_contact else trace_by_name.get((first.lower(), last.lower()), {})
         phones = []
         for k in PHONE_FIELDS:
             v = (t.get(k) or "").strip()
@@ -1057,7 +1231,7 @@ def build_datasift_csv_from_template(
         if county:
             tags.append(county.lower())
         tags.append(datetime.now().strftime("%Y-%m"))
-        tags.append("living")
+        tags.append("deceased" if is_deceased_no_contact else "living")
         if is_absentee:
             tags.append("Absentee Owner")
         if trial_tag:
@@ -1068,7 +1242,17 @@ def build_datasift_csv_from_template(
             notes_parts.append(f"TEST RUN -- {trial_tag}, verify before treating as a live lead.")
         if source_url:
             notes_parts.append(f"Source: {source_url}.")
-        notes_parts.append("Skip traced via Tracerfy.")
+        if is_deceased_no_contact:
+            notes_parts.append(
+                "OWNER DECEASED -- the petition names no living heir, spouse, "
+                "co-borrower, or estate representative for this owner. NOT "
+                "skip traced (would waste spend tracing someone who no longer "
+                "exists, and a resulting phone number would misleadingly read "
+                "as a live contact). Needs deep prospecting / heir research "
+                "before any outreach."
+            )
+        else:
+            notes_parts.append("Skip traced via Tracerfy.")
 
         # Extra petition-info columns (from petition-info-extraction skill
         # output — Date of Mortgage/Note, Original Loan Amount, Unpaid
@@ -1103,7 +1287,7 @@ def build_datasift_csv_from_template(
             "Notice Type": notice_type,
             "County": county,
             "Date Added": today,
-            "Owner Deceased": "no",
+            "Owner Deceased": "yes" if is_deceased_no_contact else "no",
             "Source URL": source_url,
         })
         for i, p in enumerate(phones, start=1):

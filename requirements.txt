@@ -1,4 +1,5 @@
 playwright>=1.40.0
+requests>=2.31.0
 2captcha-python>=1.2.0
 scrapfly-sdk>=0.8.0
 python-dotenv>=1.0.0
@@ -7,6 +8,7 @@ google-api-python-client>=2.0.0
 google-auth>=2.0.0
 anthropic>=0.40.0
 pdfminer.six>=20221105
+pypdfium2>=4.30.0        # PDF page -> image rendering for pdf_importer.py (was imported but unlisted)
 smartystreets-python-sdk>=4.11.0
 beautifulsoup4>=4.12.0
 ddgs>=9.0.0

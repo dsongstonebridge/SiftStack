@@ -1140,6 +1140,60 @@ async def _retry_skipped_step(page, step_fn, csv_path: Path, skipped: list[dict]
     return retry_result
 
 
+def _run_skip_trace(args) -> None:
+    """`skip-trace` mode — the proven DataSift pipeline for records already in
+    the CRM: resolve -> Tracerfy -> DataSift -> Trestle -> tags -> board.
+
+    DRY RUN BY DEFAULT. Every step is free until --commit is passed, and the
+    run prints its estimated spend first. See skip_trace_agent.run_pipeline().
+
+        python src/main.py skip-trace --csv-path leads.csv
+        python src/main.py skip-trace --csv-path leads.csv --commit
+        python src/main.py skip-trace --street "7405 S Chestnut Ave" --city "Broken Arrow"
+    """
+    import csv as _csv
+    import json as _json
+
+    from skip_trace_agent import run_pipeline
+
+    rows: list[dict] = []
+    if getattr(args, "csv_path", None):
+        with open(args.csv_path, encoding="utf-8-sig", newline="") as fh:
+            for r in _csv.DictReader(fh):
+                street = (r.get("Property Street Address") or r.get("Property Street")
+                          or r.get("street") or "").strip()
+                if not street:
+                    continue
+                rows.append({
+                    "street": street,
+                    "city": (r.get("Property City") or r.get("city") or "").strip(),
+                    "first": (r.get("Owner First Name") or r.get("First Name")
+                              or r.get("first") or "").strip(),
+                    "last": (r.get("Owner Last Name") or r.get("Last Name")
+                             or r.get("last") or "").strip(),
+                })
+    elif getattr(args, "street", None):
+        rows = [{"street": args.street, "city": getattr(args, "city", "") or "",
+                 "first": getattr(args, "first", "") or "",
+                 "last": getattr(args, "last", "") or ""}]
+
+    if not rows:
+        logger.error("skip-trace: need --csv-path or --street")
+        return
+
+    dry = not getattr(args, "commit", False)
+    logger.info("skip-trace: %d record(s), %s", len(rows),
+                "DRY RUN (nothing billed)" if dry else "COMMIT - THIS SPENDS MONEY")
+    res = run_pipeline(rows, dry_run=dry)
+
+    logger.info("resolved %d, unresolved %d, est. spend $%.3f",
+                len(res["subjects"]), len(res["unresolved"]), res["spend_estimate"])
+    for u in res["unresolved"]:
+        logger.warning("  unresolved: %s", _json.dumps(u)[:160])
+    if dry:
+        logger.info("Nothing was billed. Re-run with --commit to execute.")
+
+
 def _run_skip_and_score_upload(args) -> None:
     """Full pipeline, single command: raw property-template CSV/xlsx ->
     Tracerfy skip trace -> DataSift upload/enrich/skip-trace -> phone read ->
@@ -2067,7 +2121,7 @@ def cli_main() -> None:
         choices=[
             "daily", "historical", "pdf-import", "photo-import", "dropbox-watch",
             "csv-import", "phone-validate", "manage-sold", "manage-presets", "manage-list",
-            "daily-obits", "skip-and-score-upload",
+            "daily-obits", "skip-and-score-upload", "skip-trace",
             # New analysis & workflow modes
             "comp", "rehab", "analyze-deal", "market-analysis", "buyer-prospect",
             "deep-prospect", "lead-manage", "setup-sequences", "niche-sequential",
@@ -2216,6 +2270,25 @@ def cli_main() -> None:
         type=str,
         default=None,
         help="Path to existing CSV file to re-enrich (required for csv-import mode)",
+    )
+    # skip-trace mode: single-record targeting + the spend gate
+    parser.add_argument(
+        "--street", type=str, default=None,
+        help="skip-trace: property street for a single record (alternative to --csv-path)",
+    )
+    parser.add_argument(
+        "--first", type=str, default=None,
+        help="skip-trace: owner first name (optional; falls back to the CRM record)",
+    )
+    parser.add_argument(
+        "--last", type=str, default=None,
+        help="skip-trace: owner last name (optional; falls back to the CRM record)",
+    )
+    parser.add_argument(
+        "--commit", action="store_true",
+        help=("skip-trace: actually run it. WITHOUT this the run is a DRY RUN and "
+              "bills nothing. Spends real money: Tracerfy ~$0.02/record, DataSift "
+              "~$0.12/owner, Trestle ~$0.015/number."),
     )
     parser.add_argument(
         "--csv-county",
@@ -2827,6 +2900,10 @@ def cli_main() -> None:
 
     if args.mode == "skip-and-score-upload":
         _run_skip_and_score_upload(args)
+        return
+
+    if args.mode == "skip-trace":
+        _run_skip_trace(args)
         return
 
     # Manage presets mode — filter preset + sequence management

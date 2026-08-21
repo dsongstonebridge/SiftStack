@@ -302,31 +302,12 @@ async def upload_to_datasift(
                 finally:
                     await browser.close()
 
-    # DataSift skip trace needs a browser — the API route is account-wide (see
-    # skip_trace_records()). `skip_trace` defaults to False precisely because
-    # this is billed and cannot be scoped without one.
+    # Scoped over the REST API — no browser. `skip_trace` still defaults to
+    # False because it is BILLED (prepaid credits, ~$0.12/owner) and the user's
+    # standing instruction is to ask before every metered call.
     if result["success"] and skip_trace:
         st_csv = skip_trace_csv_path or csv_path
-        eff_email = email or os.environ.get("DATASIFT_EMAIL", "")
-        eff_password = password or os.environ.get("DATASIFT_PASSWORD", "")
-        if not eff_email or not eff_password:
-            result["skip_trace_result"] = {
-                "success": False, "skip_traced": [], "skipped": [],
-                "message": "Skip trace needs DATASIFT_EMAIL/PASSWORD (browser path)"}
-        else:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=headless)
-                context = await browser.new_context(viewport={"width": 1280, "height": 900})
-                page = await context.new_page()
-                try:
-                    if await login(page, eff_email, eff_password):
-                        result["skip_trace_result"] = await skip_trace_records(page, st_csv)
-                    else:
-                        result["skip_trace_result"] = {
-                            "success": False, "skip_traced": [], "skipped": [],
-                            "message": "DataSift login failed - skip trace not run"}
-                finally:
-                    await browser.close()
+        result["skip_trace_result"] = await skip_trace_records(None, st_csv)
         logger.info("Skip trace: %s", result["skip_trace_result"].get("message"))
 
     return result
@@ -395,29 +376,54 @@ async def upload_datasift_split(
 
 
 async def skip_trace_records(page, csv_path: str | Path | list[str | Path]) -> dict:
-    """Scoped DataSift skip trace. Delegates to the Playwright implementation,
-    which is the ONLY way to skip trace specific records.
+    """Scoped DataSift skip trace over the REST API. No browser.
 
-    The API route cannot do it: `POST /api/internal/property/skip-trace/`
-    ignores its `properties` list and traces the whole account (proven live
-    2026-08-21 — 2 uuids submitted, 161 reported, ~29 owners billed), there is
-    no per-record mount, and OPTIONS on it returns 405 so the real schema can't
-    be read. Driving the UI one record at a time is the genuine answer, not a
-    legacy fallback.
+    `page` is accepted for signature compatibility with
+    skip_trace_records_playwright() and `_retry_skipped_step()`, and is unused.
 
-    Keeps the (page, csv_path) signature so `_retry_skipped_step()` and every
-    existing call site are unchanged — but `page` must now be a REAL logged-in
-    Playwright page, not the ignored placeholder the API version accepted.
+    Scoping works — `datasift_api.submit_skip_trace()` nests `properties` inside
+    `query.must`, runs the FREE estimate first, and refuses if the count exceeds
+    what was asked for. (An earlier version of this function delegated to
+    Playwright on the belief that the API could not scope. That was wrong: the
+    payload was nested incorrectly, not unscopeable.)
 
-    BILLED: prepaid credits, ~$0.12/owner. Ask before running.
+    BILLED: prepaid credits, ~$0.12/owner. Ask the user before running.
+    Asynchronous — the job took 12s on one record and 150s on another, so poll
+    `skiptrace_attempts` rather than concluding failure early. Never re-submit
+    to "make sure"; that is a second charge.
     """
-    if page is None:
-        return {"success": False,
-                "message": ("skip_trace_records() needs a logged-in Playwright page — "
-                            "the API route is account-wide and disabled. See "
-                            "skip_trace_records_playwright()."),
-                "skip_traced": [], "skipped": []}
-    return await skip_trace_records_playwright(page, csv_path)
+    result: dict = {"success": False, "message": "", "skip_traced": [], "skipped": []}
+    rows = _read_csv_rows(csv_path)
+    if not rows:
+        result["skipped"].append({"reason": f"No valid records found in {csv_path}"})
+        return result
+
+    targets, uuids = [], []
+    for row in rows:
+        owner_last, street = _row_owner_street(row)
+        rec = _api.find_property_by_address(street, row.get("Property City") or "")
+        if not rec:
+            result["skipped"].append({"owner": owner_last, "street": street,
+                                       "reason": "no CRM record matched"})
+            continue
+        uuids.append(rec["uuid"])
+        targets.append({"owner": owner_last, "street": street})
+
+    if not uuids:
+        result["message"] = "No records resolved — nothing submitted"
+        return result
+
+    try:
+        _api.submit_skip_trace(uuids, max_records=len(uuids),
+                                address_prefix=targets[0]["street"] if len(uuids) == 1 else "")
+        result["success"] = True
+        result["skip_traced"] = targets
+        result["message"] = f"Skip trace submitted for {len(uuids)} record(s)"
+    except _api.DataSiftAPIError as e:
+        result["message"] = str(e)
+        result["skipped"].extend(targets)
+        logger.warning("Skip trace failed: %s", e)
+    return result
 
 
 async def _skip_trace_records_api_DISABLED(page, csv_path: str | Path | list[str | Path]) -> dict:
@@ -1865,22 +1871,20 @@ async def skip_trace_records_playwright(page: Page, csv_path: str | Path | list[
     as enrich_records() above, for the same reason (no list-filter-then-
     select-all step; see the note above _select_single_verified_record()).
 
-    *** THIS IS THE ONLY WAY TO SKIP TRACE SPECIFIC RECORDS IN DATASIFT. ***
+    LEGACY / ROLLBACK ONLY — prefer `skip_trace_records()`, which does this
+    over the REST API with no browser and a free cost estimate first.
 
-    The REST endpoint cannot do it. `POST /api/internal/property/skip-trace/`
-    ignores its `properties` list and traces the ENTIRE ACCOUNT (proven live
-    2026-08-21: 2 uuids submitted, 161 records reported, ~29 owners processed),
-    which is why `datasift_api.submit_skip_trace()` is disabled behind two
-    gates. There is no per-record mount either — the full per-property action
-    list has add-tags/add-notes/assign/status/sms-attempts but nothing for skip
-    trace — and OPTIONS on the bulk endpoint returns 405, so its real schema
-    can't be read. Driving the UI one record at a time is genuinely the scoped
-    option, not a legacy fallback.
+    Kept because it is a working independent path if the API route ever breaks,
+    and because the UI is still the only way to inspect a skip trace's progress
+    interactively. Two claims that used to be in this docstring were WRONG and
+    are corrected here so nobody re-derives them:
+      - "the only way to skip trace specific records" — false. The REST
+        endpoint scopes fine once `properties` is nested inside `query.must`;
+        it was the payload shape that was wrong, not the capability.
+      - "uses the unlimited skip trace plan ($97/mo) — no per-record cost" —
+        false. The account runs on PREPAID CREDITS at roughly $0.12/owner.
 
-    BILLED — and NOT unlimited. This docstring claimed "the unlimited skip
-    trace plan ($97/mo) — no per-record cost" until 2026-08-21; that was wrong.
-    The account runs on PREPAID CREDITS at roughly $0.12/owner. Ask before
-    running it, and scope it to records that actually need tracing.
+    BILLED. Ask before running, and scope it to records that need tracing.
 
     Args:
         page: Logged-in Playwright page.

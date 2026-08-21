@@ -300,6 +300,15 @@ petition PDF (scanned)
 One call runs it: `skip_trace_agent.run_pipeline(rows, dry_run=False)`.
 `dry_run=True` does every free step and bills nothing.
 
+```bash
+# DRY RUN by default - free, prints what it would do and what it would cost
+python src/main.py skip-trace --street "7405 S Chestnut Ave" --city "Broken Arrow"
+python src/main.py skip-trace --csv-path leads.csv
+
+# Actually run it. SPENDS MONEY - ask the user first.
+python src/main.py skip-trace --csv-path leads.csv --commit
+```
+
 **THE DOUBLE SKIP TRACE IS REAL — run both sources.** They return different
 numbers. On the proving run Tracerfy found two live Tulsa mobiles (both scored
 100 / `Dial First`) and DataSift found an Oklahoma City number Tracerfy missed

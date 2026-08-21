@@ -67,6 +67,7 @@ THE CREATION RULE, settled by single-variable tests 2026-08-21:
   fixable by switching seats; that mount is simply not available here.
 """
 
+import json as _json
 import logging
 import re
 import time
@@ -139,11 +140,50 @@ def _pace() -> None:
     _last_request_at = time.monotonic()
 
 
+_DRY_RUN = False
+
+
+def set_dry_run(enabled: bool) -> None:
+    """Global kill-switch for every mutating call in this module.
+
+    When on, writes are logged and return a `{"_dry_run": True, ...}` descriptor
+    instead of touching the CRM; reads pass through normally. Adopted from
+    Tyler Austin's crm_api.py, which defaults every write to dry_run=True.
+
+    Implemented as one interception point in _request() rather than a kwarg on
+    thirty functions, so a new write function is covered automatically instead
+    of being safe only if its author remembered.
+    """
+    global _DRY_RUN
+    _DRY_RUN = enabled
+    logger.warning("DataSift API dry-run mode %s", "ENABLED" if enabled else "DISABLED")
+
+
+def is_dry_run() -> bool:
+    return _DRY_RUN
+
+
+_MUTATING_METHODS = {"POST", "PATCH", "PUT", "DELETE"}
+
+
 def _request(method: str, url: str, *, json_body: Any = None,
              params: dict | None = None, max_retries: int = 5,
-             timeout: int = 30, auth: str = "api_key") -> dict | list | None:
+             timeout: int = 30, auth: str = "api_key",
+             mutating: bool | None = None) -> dict | list | None:
     """One paced, retried HTTP call. Returns parsed JSON, or None for empty/204 bodies.
-    auth="jwt" for the handful of endpoints (bulk-create) that reject the Api-Key scheme."""
+    auth="jwt" for the handful of endpoints (bulk-create) that reject the Api-Key scheme.
+
+    `mutating` overrides the method-based guess — pass False for the read-only
+    endpoints that happen to use POST (exists/, compile-filter/), so dry-run
+    mode doesn't stub out a lookup the caller needs a real answer from.
+    """
+    if mutating is None:
+        mutating = method.upper() in _MUTATING_METHODS
+    if _DRY_RUN and mutating:
+        logger.info("DRY RUN - would %s %s%s", method, url,
+                     f" body={_json.dumps(json_body)[:300]}" if json_body is not None else "")
+        return {"_dry_run": True, "method": method, "url": url, "body": json_body}
+
     delay = 2.0
     for attempt in range(1, max_retries + 1):
         _pace()
@@ -235,7 +275,7 @@ def property_exists(*, reapi_id: str | None = None, sift_id: str | None = None) 
         body["reapi_id"] = reapi_id
     if sift_id:
         body["sift_id"] = sift_id
-    return _request("POST", f"{CORE_BASE}/api/internal/property/exists/", json_body=body) or None
+    return _request("POST", f"{CORE_BASE}/api/internal/property/exists/", json_body=body, mutating=False) or None
 
 
 def search_by_address(address_prefix: str, *, limit: int = 10, offset: int = 0,
@@ -618,6 +658,10 @@ def add_tags(property_uuid: str, tags: list[str]) -> dict:
     """Add tags and verify they landed by reading the record back."""
     result = _request("POST", f"{CORE_BASE}/api/internal/property/{property_uuid}/add-tags/",
                        json_body={"tags": tags})
+    if _DRY_RUN:
+        # Nothing was written, so reading back would always "fail" — don't emit
+        # a warning that reads like a real problem during a rehearsal.
+        return result
     record = get_property(property_uuid)
     landed = {t.get("title") if isinstance(t, dict) else t for t in record.get("tags", [])}
     missing = [t for t in tags if t not in landed]
@@ -897,20 +941,73 @@ def phone_tag_properties_count(tag_uuid: str) -> int:
     return body.get("count", 0)
 
 
+def set_phone_tags(number_to_tags: dict[str, list[str]]) -> dict:
+    """Apply tags to numbers — `{number: [tag_title, ...]}` — in one call.
+
+    CORRECTED 2026-08-21. The previous payload (`{"number": n, "tag_uuid": u}`)
+    was accepted with an empty 200 and applied NOTHING; it had been recorded as
+    "confirmed live", but that only ever confirmed it did not error. The real
+    schema, from `OPTIONS /api/internal/phone/add-phone-tag/`, is a LIST whose
+    items carry a **`tags` array of tag UUIDs** (not `tag_uuid`):
+
+        [{"number": "9183107469", "tags": ["<uuid>", "<uuid>"]}]
+
+    Verified semantics, each tested live:
+      - `type` is OPTIONAL, and omitting it PRESERVES the phone's existing type.
+        Do not send a guessed type — this endpoint upserts the phone object, so
+        a wrong `type` would overwrite the real one.
+      - Tags APPEND. Existing tags on the number survive, so this is safe to
+        call repeatedly and safe on numbers that already carry source tags.
+      - Multiple tags per number in ONE item work, which is why this function
+        takes a mapping rather than one tag at a time.
+    """
+    items, wanted = [], {}
+    for number, titles in number_to_tags.items():
+        uuids = []
+        for t in titles:
+            uuids.append(get_or_create_phone_tag(t)["uuid"])
+        if not uuids:
+            continue
+        items.append({"number": number, "tags": uuids})
+        wanted[number] = set(uuids)
+    if not items:
+        return {"tagged": 0}
+
+    result = _request("POST", f"{CORE_BASE}/api/internal/phone/add-phone-tag/",
+                       json_body=items)
+    if _DRY_RUN:
+        return {"tagged": len(items), "dry_run": True}
+    logger.info("set_phone_tags: applied tags to %d number(s)", len(items))
+    return {"tagged": len(items), "result": result, "wanted": wanted}
+
+
 def add_phone_tag(phone_numbers: list[str], tag_title: str) -> dict:
-    """Apply a phone tag to one or more numbers; logs the properties-count delta as
-    a cheap sanity check (not a hard verification — counts can lag writes)."""
-    tag = get_or_create_phone_tag(tag_title)
-    before = phone_tag_properties_count(tag["uuid"])
-    # Schema note: takes a bare list of {number, tag_uuid} objects, not a
-    # {"phones": [...], "tag_uuid": ...} wrapper — confirmed live 2026-08-19.
-    # "number" wants a real-area-code phone string (dash-formatted), not "phone".
-    result = _request("POST", f"{CORE_BASE}/api/internal/phone/add-phone-tag/", json_body=[
-        {"number": n, "tag_uuid": tag["uuid"]} for n in phone_numbers
-    ])
-    after = phone_tag_properties_count(tag["uuid"])
-    logger.info("add_phone_tag %r: properties-count %d -> %d", tag_title, before, after)
-    return result
+    """Apply ONE tag to several numbers. Thin wrapper over set_phone_tags();
+    prefer that when a number needs more than one tag, so they go in one call."""
+    return set_phone_tags({n: [tag_title] for n in phone_numbers})
+
+
+def verify_phone_tags(owner_uuid: str, number_to_tags: dict[str, list[str]]) -> dict:
+    """Read the owner back and confirm each number carries the tags requested.
+
+    Necessary because the tag endpoint returns an empty body on both success
+    and no-op — the only trustworthy signal is the record itself. Note the
+    read-back lists tag UUIDs (titles resolve later), so this compares uuids.
+    """
+    owner = get_owner(owner_uuid) or {}
+    on_record = {(p.get("number") or ""): set(p.get("tags") or [])
+                 for p in (owner.get("phones") or [])}
+    missing = {}
+    for number, titles in number_to_tags.items():
+        want = {get_or_create_phone_tag(t)["uuid"] for t in titles}
+        have = on_record.get(number, set())
+        gap = want - have
+        if gap:
+            missing[number] = sorted(gap)
+    if missing:
+        logger.warning("verify_phone_tags: %d number(s) missing tags: %s",
+                        len(missing), missing)
+    return {"ok": not missing, "missing": missing}
 
 
 # ── Filter presets ────────────────────────────────────────────────────
@@ -932,7 +1029,7 @@ def get_filter_preset(preset_uuid: str) -> dict:
 def compile_filter(filter_data: dict) -> dict:
     """Pre-flight validation: resolve a filter definition server-side before creating it."""
     return _request("POST", f"{CORE_BASE}/api/internal/filter-preset/compile/",
-                     json_body={"filter_data": filter_data})
+                     json_body={"filter_data": filter_data}, mutating=False)
 
 
 def create_filter_preset(*, name: str, filter_data: dict, folder_uuid: str | None = None) -> dict:

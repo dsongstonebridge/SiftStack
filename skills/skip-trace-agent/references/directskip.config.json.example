@@ -1,0 +1,4 @@
+{
+  "directskip_api_key": "YOUR_DIRECTSKIP_KEY_HERE",
+  "_note": "Copy to config.json and fill in. config.json is read automatically by directskip_trace.py. Keep the real key out of any shared/committed copy of this skill. The CRM Bearer token is read separately from Shared/clients/config/reisift_auth.json (account 'fcre')."
+}

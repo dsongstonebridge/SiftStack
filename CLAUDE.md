@@ -247,22 +247,80 @@ The default obituary path extracts survivors/heirs from obituary text with an LL
 
 ## DataSift.ai (REISift) Integration
 
-DataSift.ai (formerly REISift) is the CRM where scraped records land for niche sequential marketing campaigns. There is **no REST API** — upload is via Playwright browser automation of the web UI.
+DataSift.ai (formerly REISift) is the CRM where scraped records land for niche sequential marketing campaigns.
 
-**Domain:** `app.reisift.io` (NOT `app.datasift.ai`). API at `apiv2.reisift.io`.
+**As of build 1.0.34 (2026-08-19), a real REST API is live** (early access — see "REST API" section below) and handles upload, tags, lists, notes, custom fields, skip trace, and phone tags. **As of 2026-08-21 the upload path is API-only — no browser in record creation.** Playwright remains for two things: the **Sequence builder** (no API anywhere in the 323-path spec) and **Enrich Property Information** (an endpoint exists, but calling it wrong risks enriching the whole account — a deliberate choice, not a missing route).
+
+**Domain:** `app.reisift.io` (NOT `app.datasift.ai`). Core API at `apiv2.reisift.io`, SiftMap API at `map.reisift.io`.
 
 ### Key Files
-- `src/datasift_formatter.py` — Transforms `NoticeData` → DataSift CSV (42 columns)
-- `src/datasift_uploader.py` — Playwright login + upload wizard + enrich + skip trace + preset management + sequence builder + SiftMap sold workflow
-- `test_datasift_upload.py` — Headed browser test (upload + enrich + skip trace)
+- `src/datasift_formatter.py` — Transforms `NoticeData` → DataSift CSV (76 columns) and, via `build_api_payload()`, the REST API's create-property payload shape
+- `src/datasift_api.py` — REST API client (Open API key auth): properties, owners/phones, tags, lists, notes, custom fields, skip trace, phone tags, filter presets, SiftMap
+- `src/datasift_uploader.py` — Both the API-based functions (default) and their original Playwright implementations (kept as `*_playwright()` rollback functions, not dead code) — upload, skip trace, phone read, phone tags, preset discovery, plus the still-Playwright-only enrich/sequence/preset-exclusion/SiftMap-sold workflows
+- `test_datasift_api.py` — Phase A proof harness: create/tag/notes/custom-field/skip-trace/phone-tag round trip against throwaway test records
+- `test_datasift_cutover.py` — Phase B proof: the shared `upload_to_datasift()`/`skip_trace_records()`/`read_record_phone_numbers()`/`upload_phone_tags()` functions end to end
+- `test_datasift_upload.py` — Headed browser test (legacy Playwright upload + enrich + skip trace)
 - `test_manage_presets.py` — Headed browser test (preset discovery + sold exclusion + sequence creation)
 - `test_manage_sold.py` — Headed browser test (SiftMap sold property tagging)
 
-### CSV Column Structure (42 columns)
-- **Core auto-mapped (11):** Property Street/City/State/ZIP, Owner First/Last Name, Mailing Street/City/State/ZIP, Tags
-- **Lists + Notes (2):** Lists (for niche sequential), Notes (contextual per notice type)
-- **Built-in fields (13):** Estimated Value, MSL Status, Last Sale Date/Price, Equity Percentage, Tax Deliquent Value, Tax Delinquent Year, Tax Auction Date, Foreclosure Date, Probate Open Date, Personal Representative, Parcel ID, Structure Type, Year Built, Living SqFt, Bedrooms, Bathrooms, Lot (Acres)
+### CSV Column Structure (76 columns — CLAUDE.md said 42 through 2026-08-19; verify against `DATASIFT_COLUMNS` in `datasift_formatter.py` if this drifts again)
+- **Core auto-mapped (12):** Property Street/City/State/ZIP, Owner First/Last Name, Owner Type, Company Name, Mailing Street/City/State/ZIP
+- **Phone/Email (14):** Phone 1-9, Email 1-5 (Tracerfy skip trace output)
+- **Tags/Lists/Notes (3)**
+- **Built-in fields (18):** Estimated Value, MSL Status, Last Sale Date/Price, Equity Percentage, Tax Deliquent Value, Tax Delinquent Year, Tax Auction Date, Foreclosure Date, Probate Open Date, Personal Representative, Parcel ID, Structure Type, Year Built, Living SqFt, Bedrooms, Bathrooms, Lot (Acres)
 - **Custom fields (16):** Notice Type, County, Date Added, Owner Deceased, Date of Death, Decedent Name, Decision Maker, DM Relationship, DM Confidence, DM 2/3 Name/Relationship, Obituary URL, Source URL, Notice Screenshot
+- **Deep prospecting (10):** DM 1/2/3 Status, DM 1 Source, Heir Count, Heirs Living, Signing Chain Count/Names, DM Confidence Reason, Data Flags
+- **Entity research (3):** Entity Type, Entity Contact, Entity Contact Role
+
+### REST API (build 1.0.34+, live 2026-08-19)
+
+Early access — the user's own key, not the public "coming soon" API. Two surfaces, same `Authorization: Api-Key` header:
+
+| API | Base URL | Covers |
+|---|---|---|
+| Core | `apiv2.reisift.io` | properties, owners/phones, tags, lists, notes, custom fields, skip trace, filter presets, activity |
+| SiftMap | `map.reisift.io` | nationwide property search, map filters with auto-add |
+
+`DATASIFT_API_KEY` in `.env` is this key (format: `prefix.suffix`, 8+32 chars) — no longer dormant.
+
+**Gotchas confirmed live, none of them documented in the official reference:**
+- `owner.address` is **required** on property create — 400s with `{"owner":{"address":["This field is required."]}}` if omitted.
+- Entity (business) owners must **omit** `first_name`/`last_name` entirely, not send `""` — 400s on a blank first_name. `build_api_payload()` in `datasift_formatter.py` is where this gets fixed; the CSV/Playwright path still leaves these blank, which the CSV importer tolerates but the API does not.
+- Custom fields use `label`/`field_type`/`uuid` in real payloads, **not** `title`/`type`/`id` as the generated reference implies. Creating a field also requires `entity_type` and `group_id` — not shown in the reference's create example.
+- Phone tag apply (`POST /api/internal/phone/add-phone-tag/`) takes a **bare list** of `{"number": ..., "tag_uuid": ...}` objects (key is `number`, not `phone`), not a `{"phones": [...], "tag_uuid": ...}` wrapper. The number validator wants a real area code — `865-555-0100` works, `555-555-0100` doesn't.
+- Notes sent inline on property create return 200 and are silently discarded — always a separate `POST .../add-notes/` call.
+- Tags must be an array; a comma-joined string creates one literal tag.
+- **`GET /api/internal/property/` has no `search` parameter at all** — corrected 2026-08-19. The real, spec-declared query parameters are only `limit`/`offset`; the general "list endpoints accept `search=`" claim in the conventions doc does not hold for this endpoint, and it was never verified against this endpoint's actual schema before `find_property_by_address()` was built on it. The endpoint silently ignores an unrecognized `search=` value rather than erroring, so it always returned the same fixed, unfiltered page regardless of query — confirmed by sending a guaranteed-zero-match gibberish term and getting identical results to a real one. This was mistaken for search-index lag at first (the symptom — "not found" regardless of how long you wait — looks identical), but re-running Enrich/phone-read many minutes later never changes because there was never a real search happening. **Fix:** don't rely on server-side address search at all. `upload_to_datasift()` persists each created record's uuid to a local map (`output/.datasift_uuid_map.json`, keyed by `lower(owner_last)|lower(street)` — see `_uuid_map_key()`/`_load_uuid_map()`/`_save_uuid_map_entries()`), and every later, separate call (`skip_trace_records()`, `read_record_phone_numbers()`, `upload_datasift_split()`'s extra-note step) reads that map instead of searching. This also means **cross-run dedupe and `mode="update"` don't currently work** — there's no reliable way to find a record created in an *earlier* process invocation (only `property_exists()` via `reapi_id`/`sift_id` is real, and courthouse-sourced records don't have those). `upload_to_datasift()` always creates fresh now rather than pretending to check; a real fix needs either a working address-lookup endpoint (still undocumented — `autocomplete/` and `exists/` also have no usable declared schema) or accepting some duplicate-address risk on true re-uploads.
+- **SETTLED 2026-08-21 — create ONLY via `bulk_create_properties()`, never `create_property()`.** DataSift keeps a primary DB and a separate Elasticsearch index; the CRM web UI reads ES. Individual `POST` creates write the DB alone: they return 201 with a real, correct, uuid-retrievable record that **never becomes visible in the CRM**. bulk-create runs through the activity/job queue, which indexes into ES, and appears normally. Established by single-variable tests after an earlier A/B confounded endpoint with auth:
+  - **Auth is not the variable.** An individual create using the account owner's own JWT returned 201, reached the API list index, and still could not be found in that same owner's CRM UI.
+  - **The mount is not the variable.** `/api/internal/property/` and `/api/internal/properties/property/` behave identically. (Bare `POST /property/`, which Ty's `datasift_api_upload.py` uses, returns **403 on this account** for GET/OPTIONS/POST under every auth scheme including a super-admin key — not a role ceiling, that mount is simply unavailable here.)
+  - **Address quality is not the variable.** Two *real, geocodable* Tulsa foreclosure leads, both `type: clean`, created minutes apart: the individual-endpoint one invisible, the bulk one visible. This also disposes of the theory that `type: incomplete` (from fake test addresses) explained the earlier results.
+  - **Corollary worth internalizing:** a 201, a uuid, and a clean read-back *by uuid* are together still NOT evidence a record is usable. Only presence in a list/search surface is. Every wrong conclusion in this file's history came from treating one of those as sufficient.
+- **`upload_to_datasift()` is API-only as of 2026-08-21.** bulk-create in chunks → `wait_for_properties()` polls until each address indexes (bulk-create's own job activity is NOT retrievable — the returned activity uuid 404s and bulk jobs never appear in `GET /api/internal/activity/`, whose real enum value is `create_properties`, so records appearing is the only completion signal) → one retry of ONLY the missing addresses, never the whole batch → per-uuid notes + custom fields → skip trace. **No browser unless `enrich=True`.** Verified live 3/3, confirmed visible in the CRM.
+- **The duplicate-400 trick is a real address lookup, with one sharp edge.** Re-POSTing an existing address returns `400 {"non_field_errors": ["Property address already exists!"], "property": ["<uuid>"]}`, which genuinely resolves an address to its uuid across process runs. **But on an address that does NOT exist it CREATES one** — an invisible DB-only orphan that also squats the address so a later bulk-create is rejected as a duplicate. Safe only on addresses known to exist; never as a speculative lookup.
+- **`wait_for_properties()` stale-delete hazard.** The list index keeps returning a record for a while after deletion, so on delete-then-recreate of the same address it can hand back the DEAD uuid (hit live 2026-08-21; the follow-up GET 404'd). Pass `verify_live=True` to GET each candidate first — it also returns full detail records rather than the thinner list objects, which omit `type` and `tags`.
+- **Both auth credentials must resolve to the same user.** They had silently drifted: `DATASIFT_API_KEY` belonged to a different team seat (super-admin) than the JWT minted from `DATASIFT_EMAIL`/`DATASIFT_PASSWORD` (the account owner), so the pipeline wrote as two different people depending on the call. Fixed by re-issuing the key under the owner's login. If either credential is swapped, call `whoami()` on both and compare the returned **uuid**, not the email.
+
+<details><summary>Superseded 2026-08-19/20 investigation, kept only as a record of how the wrong conclusion was reached</summary>
+
+Everything in this block is **wrong** and is retained solely because the shape of the mistake is instructive. It concluded that neither JSON creation endpoint ever indexes, that the Playwright wizard was the only reliable creation path, and that this was a confirmed platform-side bug worth escalating to DataSift support.
+
+The root error: judging indexing before the index had caught up. The diagnostic did create → `sleep(2)` → re-POST → GET → list-check, a sequence completing in ~10 seconds against indexing that takes longer. A negative list-check inside the first minute means nothing, and that single measurement error produced a platform-bug theory, a support escalation, and an architecture rewritten around Playwright. A record declared "permanently invisible" that evening later showed a CRM creation timestamp exactly matching the original API call.
+
+A second error compounded it: the follow-up A/B varied **two** things at once (bulk+JWT vs individual+Api-Key), so "bulk vs individual" and "JWT vs Api-Key" both fit the data, and the first reading was adopted without separating them. It happened to be right, but it was not established until the single-variable tests above.
+
+</details>
+
+- **An enrich endpoint DOES exist — and must not be called blind.** `POST /api/internal/property/enrich/` is real (corrects the earlier "no enrich endpoint exists" claim in this file). But its trigger contract is undocumented, and an empty POST reports a count of *every property in the account*. Guessing at it risks running **owner** enrichment account-wide, which would replace the personal representative on every probate record with the deceased owner of record and undo the entire point of the PR contact mapping. Ty's `run_enrich_lists.py` reached the same conclusion and stays on the browser path deliberately. `enrich_records()` remains Playwright-only — for that reason, not for lack of a route. Do not "migrate" it without first establishing how to scope it to specific records. (Separately confirmed: DataSift does not auto-populate native valuation fields — `estimate_value`, `sqft`, `bedrooms` are `null` on create.)
+- **Select/multiselect custom fields need the OPTION's uuid, not its label** — 43 of this account's 80 custom fields. Sending a label 400s with `"... is not a valid UUID."`, and because the PATCH is a **batch**, one unresolvable value fails the whole request and costs that record *every other custom field with it*. `datasift_api.resolve_custom_field_value()` resolves label → option uuid and **skips + reports** unknown fields/options rather than guessing. Verification compares read-back values: the field uuid is nested at `item["custom_field"]["uuid"]` — **not** `field_uuid`, and not the row's own top-level `uuid`, either of which finds nothing and "verifies" a write that never landed.
+- **Custom fields are never auto-created.** `get_or_create_custom_field()` was removed from the upload path; it used to create ~46 fields defaulted to `field_type="text"` in a "SiftStack" group. The account's custom fields are deliberately curated and off limits. Unmatched labels now skip with a warning — the tradeoff being that columns without a matching field no longer land at all. Note that creating a `select` field requires its options **in the same POST**.
+- **No Sequence API** anywhere in the 323-path official spec or the endpoint index. `create_sold_sequence()` stays Playwright-only, permanently.
+- The 18 "built-in" CSV fields (Estimated Value, Bedrooms, etc.) are routed through the custom-fields mechanism by `build_api_payload()` rather than guessed at as native property keys — a wrong native-key guess would silently drop the value, whereas a custom field write is visible and correctable later.
+
+**Open items, not yet migrated:**
+- `update_all_presets_sold_exclusion()` / `create_sold_sequence()` — the account's real preset structure (64 presets across 14 folders: "01. HOTTEST - CALL", "05. TIER 1 - FTM - CALL", "11. DEEP PROSPECTING (ALL TIERS)", etc., created 2026-07-29) no longer matches the 21-preset/2-folder "00 Niche Sequential Marketing" / "01. Bulk Sequential Marketing" layout these functions target — that structure was apparently rebuilt outside this codebase. Porting the Sold-exclusion logic needs a decision on what the *current* funnel's exclusion policy should be, not a mechanical rewrite. `discover_presets()` itself **is** migrated (API-based, reads whatever folders/presets actually exist — see `datasift_api.list_filter_presets()`/`list_filter_preset_folders()`).
+- `manage_sold_properties()` / `run_manage_sold_workflow()` (SiftMap sold-property tagging) — `POST /properties/search/` on the SiftMap API rejects every address/filter/polygon payload shape tried with the same generic "must provide filter, address, or polygon" error; the official reference doesn't document the working request body. Needs either real SiftMap API docs or a DevTools capture of the app's own SiftMap search call to unblock.
+- Similarly, custom field **groups** in the real account ("Qualifying Questions", "Property Condition - General", "CapEx Assessment", ...) don't match the "SiftStack" group CLAUDE.md previously described — `build_api_payload()`'s custom fields land in a new "SiftStack" group created on first write, alongside whatever pre-existing groups the account has from its own evolution.
 
 ### Niche Sequential Marketing
 DataSift's niche sequential system uses filter presets to guide records through SMS → Call → Mail → Deep Prospecting phases. Two preset folders: "00 Niche Sequential Marketing" (12 presets, courthouse data) and "01. Bulk Sequential Marketing" (9 presets, bulk data). All 21 presets exclude Sold status (build 1.0.23). A "Sold Property Cleanup" sequence in the Transactions folder auto-fires on "Sold" tag to change status, remove from lists, clear tasks, and clear assignee.
@@ -290,12 +348,12 @@ DataSift's niche sequential system uses filter presets to guide records through 
 
 ### Post-Upload: Enrich + Skip Trace
 
-After CSV upload, the pipeline automatically runs two DataSift actions via Playwright:
+After upload, the pipeline runs two DataSift actions, both ON by default when `--upload-datasift` is set:
 
-1. **Enrich Property Information** (Manage → Enrich Data): Adds SiftMap property data (beds, baths, Zestimate, sqft, sale history) to uploaded records. "Enrich Owners" and "Swap Owners" are OFF — protects our PR/DM contact mapping.
-2. **Skip Trace** (Send To → Skip Trace): Pulls phone numbers (up to 5 per owner) + emails via unlimited plan ($97/mo). Adds auto-tag `skip_traced_YYYY-MM`.
+1. **Enrich Property Information** (Manage → Enrich Data, Playwright — an API route exists but is unsafe to call blind; see the REST API section): Adds SiftMap property data (beds, baths, Zestimate, sqft, sale history) to uploaded records. "Enrich Owners" and "Swap Owners" are OFF — protects our PR/DM contact mapping.
+2. **Skip Trace** (build 1.0.34+: `POST /api/internal/property/skip-trace/` via the REST API, not the Send To → Skip Trace click path): Pulls phone numbers + emails via the unlimited plan ($97/mo). Runs asynchronously — verify via `has_phones`/`skiptraced` on a re-read or `datasift_api.get_skip_trace_stats()`, not the submit call's response alone.
 
-Both run in background — tracked in Activity tab. Both are ON by default when `--upload-datasift` is set.
+Both run in background — tracked in Activity tab.
 
 ### CLI Flags
 ```bash
@@ -308,16 +366,18 @@ python src/main.py daily --deep-heirs               # resolve deceased-owner hei
 
 ### Single-Command Pipeline: `skip-and-score-upload` (build 1.0.33+)
 
-Runs the full raw-CSV-to-scored-and-tagged pipeline in one command: Tracerfy skip trace → DataSift upload/enrich/skip-trace → phone read → Trestle scoring → tag push. Built from the manual trial-run pipeline proven live in the 2026-08-13/14 session; every step reuses the same functions (`upload_to_datasift()`, `read_record_phone_numbers()`, `run_phone_validation()`, `upload_phone_tags()`), not a reimplementation.
+Runs the full raw-CSV-to-scored-and-tagged pipeline in one command: Tracerfy skip trace → DataSift upload/enrich/skip-trace → phone read → Trestle scoring → tag push. Built from the manual trial-run pipeline proven live in the 2026-08-13/14 session; every step reuses the same functions (`upload_to_datasift()`, `read_record_phone_numbers()`, `run_phone_validation()`, `upload_phone_tags()`), not a reimplementation. As of build 1.0.34, `upload_to_datasift()`, `skip_trace_records()`, `read_record_phone_numbers()`, and `upload_phone_tags()` are the REST API versions — same functions, same signatures, same per-record safety discipline (no bulk selection, exact-match lookup before any write), now backed by direct API calls instead of Playwright clicks. `enrich_records()` (called on the retry path) is unchanged — still Playwright, deliberately (an endpoint exists but is unsafe to call blind; see the REST API section).
 
 ```bash
 # Estimate only (Tracerfy cost, no spend, no DataSift contact)
 python src/main.py skip-and-score-upload --csv-path "Property Records.xlsx" --estimate
 
-# Full run — prompts to confirm before Tracerfy spend and again before Trestle spend
+# Full run — Tracerfy never prompts (cost is per-record and known upfront); Trestle only
+# pauses for confirmation if some record comes back with >12 phone numbers (likely a
+# common-name mismatch / data-quality issue), otherwise it also proceeds automatically
 python src/main.py skip-and-score-upload --csv-path "Property Records.xlsx" --notice-type foreclosure --county Tulsa
 
-# Unattended (skips both confirmation prompts — only once you trust the batch/cost)
+# Force fully unattended (bypasses even the >12-phones Trestle confirmation)
 python src/main.py skip-and-score-upload --csv-path "Property Records.xlsx" --yes
 
 # Mark a batch as a test run (tagged/noted so it's easy to find and distinguish from real leads)
@@ -326,12 +386,14 @@ python src/main.py skip-and-score-upload --csv-path "Property Records.xlsx" --tr
 
 Input file: a raw property-upload-template `.xlsx` or `.csv` with columns `Property Street, Property City, Property State, Property Zip, First Name, Last Name[, Record Link]` — no phone numbers, no DataSift formatting. Blank template rows (these ship as fixed-size sheets, e.g. 300 rows with only a couple filled in) are skipped automatically.
 
+**Petition detail in Notes / Message Board (expanded 2026-08-21).** When the input came from the `petition-info-extraction` skill, `datasift_formatter._format_petition_notes()` renders its columns into grouped **CASE / PROPERTY / LOAN / MODIFICATIONS / OWNER / LIENS** sections on both the property Notes and the owner Message Board. Beyond the original six loan figures it now carries legal description, plat number, plaintiff, co-defendants, original lender, initial vs current rate, recording document numbers, modification count + history, junior lienholders, and owner status — and appends an automatic **CAUTION** when the unpaid balance exceeds the original loan (arrears capitalized through repeated modification; equity may be thin or negative). `_PETITION_SECTIONS` there and the field table in the skill's `SKILL.md` **must stay in sync** — a field added to one and not the other is extracted and then silently dropped. Signals worth reading: a high modification count means a modification-exhausted borrower, and institutional co-defendants (HUD, IRS, banks, judgment creditors) are junior liens that bear directly on equity. Note also that a petition body may give only a legal description with the street address appearing solely in the Mortgage exhibit — and the two can name different towns.
+
 ### Environment Variables
-- `DATASIFT_EMAIL` — DataSift login email
-- `DATASIFT_PASSWORD` — DataSift login password
+- `DATASIFT_API_KEY` — REST API Open API key (build 1.0.34+, early access) — required for upload/tags/notes/custom-fields/skip-trace/phone-tags/`discover_presets()`
+- `DATASIFT_EMAIL` / `DATASIFT_PASSWORD` — DataSift login, still required for the Playwright-only paths: `enrich_records()`, `create_sold_sequence()`, `update_all_presets_sold_exclusion()`, `manage_sold_properties()` (SiftMap), and as a rollback for any `*_playwright()` function
 - `SLACK_WEBHOOK_URL` — Slack/Discord webhook for run summaries
 
-### Login Selectors (SPA quirks)
+### Login Selectors (SPA quirks, Playwright-only paths)
 - Hidden checkboxes (Remember me, Terms) — click `<label>` elements, not `<input>`
 - Use `wait_until="domcontentloaded"` (not `networkidle` — SPA keeps WebSocket connections open)
 - Cookie validation: check for `/dashboard` or `/records` in URL (5s wait for SPA redirect)
@@ -432,7 +494,7 @@ See `_select_single_verified_record()`, `enrich_records()`, `skip_trace_records(
 
 **DataSift's search index lags behind a just-completed upload.** A record can read as "not found" immediately after upload and then show up correctly, address and all, after nothing more than a page reload. `verify_uploaded_records()` retries with a hard reload before treating a miss as a real mismatch — don't remove that retry to "simplify" the function; it's covering a real, confirmed CRM behavior, not defensive over-engineering.
 
-**Enrich toggles: Property Info + Owners always ON, Swap Owners ON except CSV-indicated absentee owners.** User preference (2026-08-13/14): trusts DataSift's own ownership/contact data over the pipeline's — except Swap Owners was found to silently overwrite a real absentee owner's mailing address with the property address when DataSift's database disagreed, erasing genuine lead-qualification signal. `_read_csv_absentee_flags()` detects absentee status structurally (Mailing Street Address present and different from Property Street Address in the source CSV) and carves out the exception per record.
+**Enrich toggles: Property Information ON, Enrich Owners OFF, Swap Owners OFF** (set 2026-08-21, matching Ty's `run_enrich_lists.py` exactly). Owner enrichment replaces our contact with DataSift's owner of record; on probate that is actively destructive, swapping the personal representative for the *deceased* owner and re-creating the recurring DM-contact bug. **This reverses the earlier ON/ON setting** from 2026-08-13/14, which came from trusting DataSift's ownership data over the pipeline's — sound for a living absentee owner, wrong for a deceased one. The absentee carve-out built for it (`_read_csv_absentee_flags()`) only ever protected the mailing address, never the PR mapping; it is now uncalled but deliberately kept, since it is the only structural absentee detector in the codebase. If owner enrichment is ever wanted again, scope it **per notice type** — ON for foreclosure/tax, never probate — not as a global default.
 
 ## REI Skill Library (13 Skills)
 

@@ -50,7 +50,18 @@ import datasift_api as _api
 logger = logging.getLogger(__name__)
 
 SOURCE_TRACERFY = "Tracerfy"
-SOURCE_DATASIFT = "DataSift"          # a number already on the record, origin unknown
+SOURCE_DATASIFT = "DataSift"          # found by DataSift's own skip trace
+
+#: The DOUBLE SKIP TRACE, verified end to end on a real record 2026-08-21.
+#: Tracerfy and DataSift genuinely return different numbers - on the proving
+#: run Tracerfy found two live Tulsa mobiles (both scored 100) and DataSift
+#: found an OKC number Tracerfy missed. Running only one loses real coverage,
+#: which is why both are in the default sequence. Each number is tagged with
+#: the source that found it, so a caller can always tell where it came from.
+#:
+#: Order matters: Tracerfy FIRST, then DataSift, then score EVERYTHING. Scoring
+#: before the second source means paying Trestle twice or leaving the second
+#: source's numbers untiered.
 
 #: Property tags written after each stage. `TrestleIQ Scored` is applied ONLY
 #: when numbers were actually scored — never on a zero-result record. That is
@@ -221,6 +232,86 @@ def tracerfy_source(subjects: list[dict], *, dry_run: bool = True) -> dict[str, 
             "emails": emails,
         })
     return people_by_subject
+
+
+def datasift_source(subjects: list[dict], *, dry_run: bool = True,
+                     poll_seconds: float = 15.0,
+                     timeout_seconds: float = 300.0) -> dict[str, list[dict]]:
+    """DataSift's own skip trace, SCOPED to these records. Second half of the
+    double skip trace.
+
+    BILLED: prepaid credits, ~$0.12/owner. Runs the free estimate first and
+    REFUSES if it would touch more records than we asked for — the payload has
+    to be nested correctly or the endpoint silently goes account-wide (see
+    datasift_api._skip_trace_body).
+
+    Returns {property_uuid: [Person]} for numbers that are NEW after the trace,
+    so they get the DataSift source tag rather than Tracerfy's.
+
+    Asynchronous and not fast: observed 12s on one record and 150s on another.
+    Poll, don't assume failure.
+    """
+    targets = [s for s in subjects if s.get("property_uuid")]
+    if not targets:
+        return {}
+
+    uuids = [s["property_uuid"] for s in targets]
+    before = {s["property_uuid"]: {ph["number"] for p in s["people"] for ph in p["phones"]}
+              for s in targets}
+
+    est = _api.estimate_skip_trace(uuids, address_prefix=targets[0]["property_address"]
+                                    if len(targets) == 1 else "")
+    logger.warning("BILLED: DataSift skip trace - %s record(s), est. cost %s",
+                    est.get("number_of_records"), est.get("cost"))
+    if dry_run:
+        logger.info("DRY RUN - not submitting DataSift skip trace")
+        return {}
+
+    _api.submit_skip_trace(uuids, max_records=len(uuids),
+                            address_prefix=targets[0]["property_address"]
+                            if len(targets) == 1 else "")
+
+    import time
+    deadline = time.monotonic() + timeout_seconds
+    done: set[str] = set()
+    while time.monotonic() < deadline and len(done) < len(targets):
+        time.sleep(poll_seconds)
+        for s in targets:
+            if s["property_uuid"] in done:
+                continue
+            rec = _api.get_property(s["property_uuid"])
+            if (rec.get("owner") or {}).get("skiptrace_attempts"):
+                done.add(s["property_uuid"])
+    if len(done) < len(targets):
+        logger.warning("datasift_source: %d/%d finished within %.0fs - the rest may "
+                        "still be running; re-read later rather than re-submitting "
+                        "(a re-submit is a second charge)",
+                        len(done), len(targets), timeout_seconds)
+
+    out: dict[str, list[dict]] = {}
+    for s in targets:
+        rec = _api.get_property(s["property_uuid"])
+        owner = rec.get("owner") or {}
+        new_phones = []
+        for ph in (owner.get("phones") or []):
+            n = norm_phone(ph.get("number"))
+            if n and n not in before[s["property_uuid"]]:
+                new_phones.append({"number": n, "sources": [SOURCE_DATASIFT],
+                                   "type_raw": (ph.get("type") or "").title(),
+                                   "tier": None, "score": None})
+        if not new_phones:
+            continue
+        out[s["property_uuid"]] = [{
+            "first": s["first"], "last": s["last"], "name": s["name"],
+            "key": person_key(s["first"], s["last"]),
+            "relationship": None, "age": "", "deceased": False, "is_primary": True,
+            "mailing_street": "", "mailing_city": "", "mailing_state": "",
+            "sources": [SOURCE_DATASIFT], "phones": new_phones,
+            "emails": [e for e in (owner.get("emails") or []) if isinstance(e, str)],
+        }]
+        logger.info("datasift_source: %s -> %d new number(s)",
+                     s["property_address"], len(new_phones))
+    return out
 
 
 # ── Stage 4: merge ────────────────────────────────────────────────────
@@ -509,4 +600,67 @@ def writeback(subjects: list[dict], *, sources: list[str],
             result["records"] += 1
     finally:
         _api.set_dry_run(False)
+    return result
+
+
+# ── The whole pipeline, in the order that was proven ──────────────────
+
+def run_pipeline(rows: list[dict], *, dry_run: bool = True,
+                  use_tracerfy: bool = True, use_datasift: bool = True,
+                  score: bool = True) -> dict:
+    """Resolve -> double skip trace -> score -> tag -> post. One call.
+
+    This is the sequence verified end to end on a real foreclosure lead
+    (7405 S Chestnut Ave, Broken Arrow) on 2026-08-21, at a total cost of
+    $0.185 for one record, with an account-wide diff afterwards confirming
+    ZERO other records were touched.
+
+    `rows`: [{"street", "city", "first", "last"}]
+
+    ORDER IS LOAD-BEARING:
+      1. resolve      - server-side address search, read-only
+      2. Tracerfy     - ~$0.02/record, billed on misses too
+      3. DataSift     - ~$0.12/owner, estimate-gated, async (up to ~2.5 min)
+      4. Trestle      - $0.015 per UNIQUE number, globally deduped
+      5. tags         - source + tier per phone, by TITLE
+      6. notes/board  - handled by the caller (petition text etc.)
+
+    Scoring must come AFTER both sources or the second source's numbers go
+    untiered - or you pay Trestle twice.
+
+    dry_run=True does everything free and bills nothing.
+    """
+    result: dict = {"subjects": [], "unresolved": [], "spend_estimate": 0.0}
+
+    subjects, unresolved = resolve_subjects(rows)
+    result["unresolved"] = unresolved
+    if not subjects:
+        logger.warning("run_pipeline: nothing resolved")
+        return result
+
+    by_source: dict[str, dict[str, list[dict]]] = {}
+    if use_tracerfy:
+        by_source[SOURCE_TRACERFY] = tracerfy_source(subjects, dry_run=dry_run)
+        result["spend_estimate"] += len(subjects) * 0.02
+    subjects = merge_sources(subjects, by_source)
+
+    if use_datasift:
+        ds = datasift_source(subjects, dry_run=dry_run)
+        if ds:
+            subjects = merge_sources(subjects, {SOURCE_DATASIFT: ds})
+        result["spend_estimate"] += len(subjects) * 0.12
+
+    if score:
+        tiers = score_phones(subjects, dry_run=dry_run)
+        result["tiers"] = tiers
+        uniq = {ph["number"] for s in subjects for p in s["people"] for ph in p["phones"]}
+        result["spend_estimate"] += len(uniq) * 0.015
+
+    sources = [s for s in (SOURCE_TRACERFY if use_tracerfy else None,
+                            SOURCE_DATASIFT if use_datasift else None) if s]
+    result["writeback"] = writeback(subjects, sources=sources, dry_run=dry_run)
+    result["subjects"] = subjects
+    logger.info("run_pipeline: %d subject(s), est. spend $%.3f%s",
+                 len(subjects), result["spend_estimate"],
+                 " (DRY RUN - nothing billed)" if dry_run else "")
     return result

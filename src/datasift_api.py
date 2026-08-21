@@ -863,52 +863,100 @@ def update_custom_field_values(property_uuid: str, values: dict[str, str]) -> di
 
 # ── Skip trace ────────────────────────────────────────────────────────
 
-#: Set True only after the scope bug below is proven fixed. See the docstring.
-ALLOW_ACCOUNT_WIDE_SKIP_TRACE = False
+def _skip_trace_body(property_uuids: list[str], *, address_prefix: str = "",
+                      property_type: str = "clean", estimate: bool) -> dict:
+    """Build the skip-trace payload in the shape DataSift's own web app sends.
+
+    Captured 2026-08-21 by intercepting the app's request and ABORTING it, so
+    the contract was learned without spending anything:
+
+        {"query": {"must": {"property_type": "clean",
+                            "search": "address_prefix:7405 S Chestnut Ave",
+                            "properties": ["<uuid>"]},
+                   "ordering": ["-list_count"]},
+         "estimate": 1}
+
+    *** `properties` lives INSIDE query.must, NOT at the top level. ***
+
+    Sending it at the root — which this module did until 2026-08-21 — is not an
+    error the API reports. The key is simply unrecognized and the request falls
+    back to ACCOUNT-WIDE scope: a 2-uuid submission reported
+    `number_of_records: 161` (the whole account) and billed ~29 owners. With a
+    larger balance it would have traced everything.
+
+    Same Elasticsearch filter DSL as search_by_address(). `search` is
+    technically redundant when uuids are given, but the app sends both and so
+    do we — belt and braces on a billed call.
+    """
+    must: dict = {"properties": list(property_uuids)}
+    if property_type:
+        must["property_type"] = property_type
+    if address_prefix:
+        must["search"] = f"address_prefix:{address_prefix}"
+    return {"query": {"must": must, "ordering": ["-list_count"]},
+            "estimate": 1 if estimate else 0}
 
 
-def submit_skip_trace(property_uuids: list[str], *, i_understand_this_is_account_wide: bool = False) -> dict:
-    """*** DISABLED BY DEFAULT — THIS ENDPOINT IGNORES `property_uuids`. ***
+def estimate_skip_trace(property_uuids: list[str], *, address_prefix: str = "",
+                         property_type: str = "clean") -> dict:
+    """Cost preview — **FREE**. Returns what a skip trace would cost and how
+    many records it would touch, without running it.
 
-    **It skip-traces the ENTIRE ACCOUNT, not the uuids you pass**, and it
-    spends prepaid credits doing so. Proven live 2026-08-21: a submission of
-    exactly 2 property uuids returned
-    `{"cost": 19.32, "number_of_records": 161, "cost_per_owner": 0.12}` —
-    161 being the whole account — and the stats deltas confirmed ~29 owners
-    were actually processed (total_owners 210 -> 239, no_result +20, both +8,
-    emails_only +1) for $1.08. It appears to have stopped early only because
-    the credit balance ran out. Had the balance been larger, the whole account
-    would have been traced and billed.
+    Returns `{"cost", "number_of_records", "cost_per_owner", "balance"}`.
 
-    This is the same failure mode as `/api/internal/property/enrich/`, which
-    also reports a count of every property in the account regardless of input.
-    Treat any DataSift endpoint that accepts a record list as account-wide
-    until proven otherwise, and prove it on a cheap/free endpoint first.
+    ALWAYS call this before committing and check `number_of_records` equals
+    what you intended. If it reports the whole account, the scoping is wrong —
+    stop. This is the pre-flight that would have prevented the 2026-08-21
+    account-wide incident, and it existed the whole time.
+    """
+    body = _skip_trace_body(property_uuids, address_prefix=address_prefix,
+                             property_type=property_type, estimate=True)
+    result = _request("POST", f"{CORE_BASE}/api/internal/property/skip-trace/",
+                       json_body=body, mutating=False) or {}
+    logger.info("skip-trace ESTIMATE for %d uuid(s): records=%s cost=%s balance=%s",
+                 len(property_uuids), result.get("number_of_records"),
+                 result.get("cost"), result.get("balance"))
+    return result
 
-    Raises unless BOTH `ALLOW_ACCOUNT_WIDE_SKIP_TRACE` is set and the caller
-    passes `i_understand_this_is_account_wide=True` — deliberately two gates,
-    so this cannot be re-enabled by a single careless edit.
 
-    To scope a skip trace to specific records today: use the DataSift UI, or
-    Tracerfy (`tracerfy_skip_tracer.trace_contacts`), which is genuinely
-    per-record at ~$0.02.
+def submit_skip_trace(property_uuids: list[str], *, address_prefix: str = "",
+                       property_type: str = "clean",
+                       max_records: int | None = None) -> dict:
+    """Skip trace SPECIFIC records. **BILLED** — prepaid credits, ~$0.12/owner.
+
+    Verified live 2026-08-21 end to end: estimate said 1 record / $0.12, the
+    commit charged exactly $0.12, and the account-wide diff afterwards showed
+    zero other records touched.
+
+    `max_records` is a hard ceiling: the free estimate runs first and the
+    submission is REFUSED if it would touch more. Callers should pass
+    `max_records=len(property_uuids)`, which makes an account-wide sweep
+    structurally impossible rather than something a human has to remember.
+
+    Asynchronous: the job can take ~2.5 minutes. Poll the record's
+    `skiptrace_attempts`/`skiptraced` rather than concluding failure early —
+    one record flipped in 12s, another took 150s.
     """
     if not property_uuids:
         logger.info("submit_skip_trace: nothing to submit")
         return {}
 
-    if not (ALLOW_ACCOUNT_WIDE_SKIP_TRACE and i_understand_this_is_account_wide):
+    est = estimate_skip_trace(property_uuids, address_prefix=address_prefix,
+                               property_type=property_type)
+    n = est.get("number_of_records")
+    if max_records is not None and isinstance(n, int) and n > max_records:
         raise DataSiftAPIError(
-            f"submit_skip_trace() is disabled: this endpoint ignores its "
-            f"properties list and skip-traces the ENTIRE ACCOUNT ({len(property_uuids)} "
-            f"uuid(s) requested), spending prepaid credits. See its docstring. "
-            f"Use Tracerfy for per-record tracing, or the DataSift UI."
+            f"REFUSING skip trace: estimate says it would touch {n} record(s), "
+            f"ceiling is {max_records}. The scoping is wrong — do not retry "
+            f"blindly, fix the payload (see _skip_trace_body)."
         )
 
-    logger.warning("BILLED + ACCOUNT-WIDE: submitting DataSift skip trace. The "
-                    "%d uuid(s) passed will NOT limit scope.", len(property_uuids))
+    logger.warning("BILLED: skip tracing %s record(s), est. cost %s (balance %s)",
+                    n, est.get("cost"), est.get("balance"))
+    body = _skip_trace_body(property_uuids, address_prefix=address_prefix,
+                             property_type=property_type, estimate=False)
     return _request("POST", f"{CORE_BASE}/api/internal/property/skip-trace/",
-                     json_body={"properties": property_uuids})
+                     json_body=body)
 
 
 def get_skip_trace_stats() -> dict:
@@ -926,9 +974,24 @@ def upsert_phones(owner_uuid: str, phones: list[dict]) -> dict:
                      json_body={"phones": phones})
 
 
-def upsert_emails(owner_uuid: str, emails: list[dict]) -> dict:
+def upsert_emails(owner_uuid: str, emails: list[str] | list[dict]) -> dict:
+    """Emails take a BARE STRING LIST — `{"emails": ["a@b.com"]}`.
+
+    NOT objects. Sending `[{"email": "a@b.com"}]` returns
+    `400 {"emails": {"0": ["Enter a valid email address."]}}`, which reads like
+    the address is malformed when the address is fine and the shape is wrong.
+    Confirmed live 2026-08-21 on a valid gmail address.
+
+    Note the asymmetry with upsert_phones(), which DOES take objects
+    (`[{"number": ...}]`). Accepts either form here and normalizes.
+    """
+    flat = [e.get("email") or e.get("address") if isinstance(e, dict) else e
+            for e in emails]
+    flat = [e for e in flat if e]
+    if not flat:
+        return {}
     return _request("POST", f"{CORE_BASE}/api/internal/owner/{owner_uuid}/upsert-emails/",
-                     json_body={"emails": emails})
+                     json_body={"emails": flat})
 
 
 # ── Phone tags (dial-priority system) ────────────────────────────────

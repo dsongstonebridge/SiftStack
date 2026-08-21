@@ -272,6 +272,160 @@ DataSift.ai (formerly REISift) is the CRM where scraped records land for niche s
 - **Deep prospecting (10):** DM 1/2/3 Status, DM 1 Source, Heir Count, Heirs Living, Signing Chain Count/Names, DM Confidence Reason, Data Flags
 - **Entity research (3):** Entity Type, Entity Contact, Entity Contact Role
 
+### THE WORKING PIPELINE (verified end-to-end 2026-08-21) — and the traps
+
+Read this before touching anything DataSift. Every claim below was established
+by a live test with a control, not inferred from docs. Where something is broken
+it says so plainly: the expensive mistakes in this project's history all came
+from a capability being assumed rather than proven.
+
+**Proven on a real lead** (7405 S Chestnut Ave, Broken Arrow — Andrew Nordquist),
+total cost **$0.185 for one record**, with an account-wide diff afterwards
+confirming **zero** other records were touched.
+
+```
+petition PDF (scanned)
+  -> pypdfium2 render @300dpi -> image_utils.ocr_page(psm=4)
+  -> bulk_create_properties()        create - the ONLY path visible in the CRM
+  -> wait_for_properties()           poll until indexed; retry ONLY the missing
+  -> add_notes + post_message_board  full petition detail, both surfaces
+  -> add_tags                        Courthouse Data, foreclosure, FTM
+  -> tracerfy_skip_tracer            source 1   ~$0.02/record
+  -> datasift submit_skip_trace      source 2   ~$0.12/owner, estimate-gated
+  -> phone_validator.call_trestle    score ALL numbers  $0.015 each
+  -> upsert_phones + set_phone_tags  source tag + dial tier, per number
+  -> verify_phone_tags               compare TITLES, read off the record
+```
+
+One call runs it: `skip_trace_agent.run_pipeline(rows, dry_run=False)`.
+`dry_run=True` does every free step and bills nothing.
+
+**THE DOUBLE SKIP TRACE IS REAL — run both sources.** They return different
+numbers. On the proving run Tracerfy found two live Tulsa mobiles (both scored
+100 / `Dial First`) and DataSift found an Oklahoma City number Tracerfy missed
+(scored 20 / `Drop`). Running one source loses genuine coverage. Every number
+carries the tag of the source that found it.
+
+**Order is load-bearing:** Tracerfy -> DataSift -> score everything. Scoring
+between the two sources leaves the second source's numbers untiered, or pays
+Trestle twice.
+
+#### Capability status — do not assume beyond this table
+
+| Capability | State | Notes |
+|---|---|---|
+| Upload / create | **WORKS** | `bulk_create_properties()` only |
+| Address search | **WORKS** | POST-as-GET; solves cross-run dedupe |
+| Tracerfy skip trace | **WORKS** | per-record, ~$0.02, billed on misses too |
+| **DataSift skip trace** | **WORKS, SCOPED** | `properties` nested in `query.must` |
+| Skip-trace cost preview | **WORKS, FREE** | `estimate_skip_trace()` |
+| Trestle scoring + tiers | **WORKS** | 81/61/41/21; cached |
+| Phone tags | **WORKS** | TITLES only; append-only, no removal endpoint |
+| Notes / Message Board | **WORKS** | notes must be a separate call from create |
+| Custom field values | **WORKS** | select/multiselect need OPTION uuids |
+| Enrichment | **Playwright only** | endpoint exists but is account-wide |
+| Sequences | **Playwright only** | no API in the 323-path spec |
+| SiftMap sold-tagging | **blocked** | request body shape undocumented |
+
+#### The negative findings — each cost real time or money
+
+1. **Individual `POST` creates are invisible in the CRM, forever.** They return
+   201 with a working uuid, are retrievable by uuid, appear in the API list, and
+   never reach the Elasticsearch index the web UI reads. Only bulk-create does.
+   Established by eliminating auth, mount and record type one variable at a
+   time, including two REAL geocodable addresses both returning `type: clean`.
+   **A 201 + a uuid + a clean read-back are together NOT evidence a record is
+   usable.** Only presence in a list/search surface is.
+
+2. **Skip trace goes account-wide if `properties` is at the top level.** It must
+   be nested inside `query.must`. Sending it at the root is not an error the API
+   reports — the key is unrecognized and scope silently becomes the whole
+   account: a 2-uuid submission reported `number_of_records: 161` and billed ~29
+   owners for $1.08. Nested correctly it reports 1 and bills $0.12.
+   **`submit_skip_trace()` now runs the free estimate first and REFUSES if the
+   count exceeds `max_records`**, so this is structurally impossible rather than
+   something a human must remember.
+
+3. **`cost` and `balance` in that response are a PROJECTION for the whole job**,
+   not the charge and not your balance. Actual spend is the delta in
+   `get_skip_trace_stats()["value_spent"]`, or the balance change between the
+   estimate and the commit. Misreading it caused a false alarm that the account
+   was nearly drained when it was fine.
+
+4. **Phone tags need TITLES, not uuids.** Sending uuids does not error — it
+   CREATES a new tag whose NAME is the uuid string, leaving junk while the real
+   tag goes unapplied. The older `{"number": n, "tag_uuid": u}` payload returns
+   an empty 200 and applies nothing at all. **There is no phone-tag removal
+   endpoint anywhere in the spec** — tags are append-only, so this class of
+   mistake can only be cleaned up manually in the UI.
+
+5. **Emails take a BARE STRING LIST**, `{"emails": ["a@b.com"]}` — not objects.
+   Sending `[{"email": ...}]` returns "Enter a valid email address", which reads
+   like the address is malformed when the shape is wrong. Note the asymmetry:
+   `upsert_phones` DOES take objects.
+
+6. **Verify by the thing you asked for, not by what you sent.** A check that
+   resolved titles to uuids and compared uuids "confirmed" the very junk tags
+   that were wrong. Circular verification is worse than none — it manufactures
+   confidence.
+
+7. **`GET /api/internal/property/`'s `search=` query parameter is silently
+   ignored** — the same unfiltered page for any value, which for days looked
+   like a lagging index. The POST-as-GET body form genuinely filters.
+
+8. **The server rewrites addresses on write.** `4920 South Troost Avenue` is
+   stored `4920 S Troost Ave` (abbreviation); `17642 S Tacoma Ave` became
+   `17642 S Tacoma St` (a geocoding correction). Exact matching misses both.
+   `find_property_by_address()` matches house number, then normalized street,
+   then falls back to ignoring the street-type suffix.
+
+9. **Notes sent inline on create return 200 and are discarded.** Separate call.
+   Tags inline on `upsert-phones` are likewise ignored.
+
+10. **Both auth credentials must resolve to the same user.** They had drifted to
+    different team seats, so the pipeline wrote as two different people
+    depending on the call. Compare the `whoami()` **uuid**, not the email.
+
+11. **Bare `POST /property/` 403s on this account** for every auth scheme
+    including super-admin, on GET/OPTIONS/POST alike. Ty's
+    `datasift_api_upload.py` uses it and therefore cannot run as-is.
+
+12. **Skip trace is asynchronous and slow.** Observed 12s on one record and
+    150s on another. Poll `skiptrace_attempts`/`skiptraced`; never conclude
+    failure early and never re-submit to "make sure" — that is a second charge.
+
+#### Spend discipline
+
+**Ask the user before EVERY metered call, including Trestle** (standing
+instruction 2026-08-21, which explicitly retracted an earlier "stop asking").
+Do not infer authorization from a general "go ahead" earlier in a session.
+
+| Source | Rate | Billed on |
+|---|---|---|
+| Tracerfy | ~$0.02/record | every submission, **hits and misses** |
+| DataSift skip trace | ~$0.12/owner | prepaid credits — **NOT** an unlimited plan |
+| TrestleIQ | ~$0.015/number | per unique number — **dedupe globally first** |
+
+A full record through the whole pipeline costs roughly **$0.15–$0.20**.
+
+#### Verification discipline
+
+- Read the record back and compare the value you intended. Never trust a 2xx.
+- Use a **control**: a query that must return nothing. The `search=` parameter
+  looked functional until a gibberish term returned the same results as a real one.
+- Prefer an authoritative signal (`GET` by uuid, the local Trestle cache) over an
+  inferred one. "Line-typed but untiered" looked like 168 failed tags; the cache
+  showed the real number was 4.
+- **Snapshot before, diff after.** For any run that touches the CRM, capture every
+  record's phones/tags/skiptrace state first, then diff — that is the only way to
+  prove "nothing else was touched", and it is free.
+- `set_dry_run(True)` intercepts every mutating call in `datasift_api` at one
+  point in `_request()`, so new write functions are covered automatically.
+- **When a payload's shape is unknown, capture what the web app sends** —
+  Playwright with `route.abort()` reads the real contract without submitting
+  anything. That is how the scoped skip-trace payload was found, after the spec,
+  the OPTIONS schema and the reference implementation all failed to reveal it.
+
 ### REST API (build 1.0.34+, live 2026-08-19)
 
 Early access — the user's own key, not the public "coming soon" API. Two surfaces, same `Authorization: Api-Key` header:
@@ -351,7 +505,7 @@ DataSift's niche sequential system uses filter presets to guide records through 
 After upload, the pipeline runs two DataSift actions, both ON by default when `--upload-datasift` is set:
 
 1. **Enrich Property Information** (Manage → Enrich Data, Playwright — an API route exists but is unsafe to call blind; see the REST API section): Adds SiftMap property data (beds, baths, Zestimate, sqft, sale history) to uploaded records. "Enrich Owners" and "Swap Owners" are OFF — protects our PR/DM contact mapping.
-2. **Skip Trace** (build 1.0.34+: `POST /api/internal/property/skip-trace/` via the REST API, not the Send To → Skip Trace click path): Pulls phone numbers + emails. Runs asynchronously — verify via `has_phones`/`skiptraced` on a re-read or `datasift_api.get_skip_trace_stats()`, not the submit call's response alone.
+2. **Skip Trace** — see "THE WORKING PIPELINE" above. Scoped over the REST API; `properties` must be nested inside `query.must` or it goes account-wide. Always `estimate_skip_trace()` first. Runs asynchronously — verify via `has_phones`/`skiptraced` on a re-read or `datasift_api.get_skip_trace_stats()`, not the submit call's response alone.
 
    **THIS SPENDS REAL MONEY. Corrected 2026-08-21 — this file previously claimed an "unlimited plan ($97/mo)", which is wrong.** The account runs on **prepaid credits**, so every submitted record draws down a finite balance and an over-large or repeated submission is unrecoverable spend. Treat it as a billed action under the no-unapproved-spend rule: never submit speculatively, never submit test/throwaway records, and never re-submit a batch to "make sure" — check `skiptraced`/`has_phones` first. Note that `skip_trace` defaults to **True** in `upload_to_datasift()` and its variants, so an upload spends credits unless `--no-skip-trace` is passed. `submit_skip_trace()` logs the record count as billable before sending; there is no server-side balance check available, so the count in that log line is the only pre-flight signal.
 

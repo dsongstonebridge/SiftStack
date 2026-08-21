@@ -694,8 +694,31 @@ def update_custom_field_values(property_uuid: str, values: dict[str, str]) -> di
 # ── Skip trace ────────────────────────────────────────────────────────
 
 def submit_skip_trace(property_uuids: list[str]) -> dict:
-    """Submit properties for skip tracing. Runs asynchronously — poll get_skip_trace_stats()
-    or re-read the record's `skiptraced`/`has_phones` fields."""
+    """Submit properties for skip tracing. Runs asynchronously — poll
+    get_skip_trace_stats() or re-read the record's `skiptraced`/`has_phones`.
+
+    *** BILLED ACTION — SPENDS PREPAID CREDITS. ***
+
+    This account is NOT on an unlimited plan (CLAUDE.md claimed one until
+    2026-08-21; it was wrong). Every uuid in this list draws down a finite
+    prepaid balance, and there is no refund and no server-side balance check to
+    pre-flight against. So:
+
+      - Never submit speculatively, and never submit throwaway/test records.
+        Doing exactly that cost $10.20 on fake addresses once already.
+      - Never re-submit a batch to "make sure" it worked. Re-read
+        `skiptraced`/`has_phones` on the records instead — a re-submit is a
+        second charge for data you may already have.
+      - Callers should filter to records that actually need tracing (no phones
+        yet, owner known to be contactable) rather than passing everything.
+
+    The count logged below is the only pre-flight cost signal available.
+    """
+    if not property_uuids:
+        logger.info("submit_skip_trace: nothing to submit")
+        return {}
+    logger.warning("BILLED: submitting %d record(s) for DataSift skip trace "
+                    "(prepaid credits, not unlimited)", len(property_uuids))
     return _request("POST", f"{CORE_BASE}/api/internal/property/skip-trace/",
                      json_body={"properties": property_uuids})
 

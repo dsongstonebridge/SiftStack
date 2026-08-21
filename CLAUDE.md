@@ -351,7 +351,9 @@ DataSift's niche sequential system uses filter presets to guide records through 
 After upload, the pipeline runs two DataSift actions, both ON by default when `--upload-datasift` is set:
 
 1. **Enrich Property Information** (Manage → Enrich Data, Playwright — an API route exists but is unsafe to call blind; see the REST API section): Adds SiftMap property data (beds, baths, Zestimate, sqft, sale history) to uploaded records. "Enrich Owners" and "Swap Owners" are OFF — protects our PR/DM contact mapping.
-2. **Skip Trace** (build 1.0.34+: `POST /api/internal/property/skip-trace/` via the REST API, not the Send To → Skip Trace click path): Pulls phone numbers + emails via the unlimited plan ($97/mo). Runs asynchronously — verify via `has_phones`/`skiptraced` on a re-read or `datasift_api.get_skip_trace_stats()`, not the submit call's response alone.
+2. **Skip Trace** (build 1.0.34+: `POST /api/internal/property/skip-trace/` via the REST API, not the Send To → Skip Trace click path): Pulls phone numbers + emails. Runs asynchronously — verify via `has_phones`/`skiptraced` on a re-read or `datasift_api.get_skip_trace_stats()`, not the submit call's response alone.
+
+   **THIS SPENDS REAL MONEY. Corrected 2026-08-21 — this file previously claimed an "unlimited plan ($97/mo)", which is wrong.** The account runs on **prepaid credits**, so every submitted record draws down a finite balance and an over-large or repeated submission is unrecoverable spend. Treat it as a billed action under the no-unapproved-spend rule: never submit speculatively, never submit test/throwaway records, and never re-submit a batch to "make sure" — check `skiptraced`/`has_phones` first. Note that `skip_trace` defaults to **True** in `upload_to_datasift()` and its variants, so an upload spends credits unless `--no-skip-trace` is passed. `submit_skip_trace()` logs the record count as billable before sending; there is no server-side balance check available, so the count in that log line is the only pre-flight signal.
 
 Both run in background — tracked in Activity tab.
 

@@ -961,7 +961,15 @@ def build_api_payload(row: dict) -> dict:
 
     phones = [{"number": p} for p in
               (row.get(f"Phone {i}") for i in range(1, 10)) if p and p.strip()]
-    emails = [{"email": e} for e in
+    # Emails take a BARE STRING LIST, not objects — `{"emails": ["a@b.com"]}`.
+    # The object form `[{"email": ...}]` is rejected as "Enter a valid email
+    # address", which reads like the address is malformed when the shape is
+    # wrong (datasift_api.upsert_emails, confirmed live 2026-08-21). Sent
+    # through bulk-create the job still returns 202/accepted=1 and then drops
+    # the record during async processing, with no error surfaced anywhere —
+    # caught 2026-08-24 when a record with Tracerfy emails never indexed.
+    # Note the asymmetry: phones DO take objects.
+    emails = [e.strip() for e in
               (row.get(f"Email {i}") for i in range(1, 6)) if e and e.strip()]
 
     owner_address = {

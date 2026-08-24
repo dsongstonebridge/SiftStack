@@ -403,6 +403,32 @@ Trestle twice.
     150s on another. Poll `skiptrace_attempts`/`skiptraced`; never conclude
     failure early and never re-submit to "make sure" — that is a second charge.
 
+13. **Emails as objects make bulk-create SILENTLY DROP the record.** Owner
+    emails take a bare string list. The object form `[{"email": ...}]` returns
+    a loud 400 on `upsert_emails()`, but through bulk-create the job reports a
+    perfectly healthy `202 accepted=1 status=enqueued` and then discards the
+    record during async processing. Nothing surfaces it — the job's activity
+    uuid 404s, bulk jobs never appear in the activity list, and the record is
+    absent from the index under **every** `property_type`. It is
+    indistinguishable from indexing lag, i.e. the exact trap behind the
+    superseded platform-bug theory below. `build_api_payload()` had this wrong
+    while `upsert_emails()` had it right, so it only fired on records carrying
+    skip-traced emails. Fixed 2026-08-24. **When a bulk-created record never
+    indexes, check the payload shape before waiting it out or re-submitting** —
+    and run a positive control (an address known to exist) to prove the search
+    works before blaming the index. Note the asymmetry: phones DO take objects.
+
+14. **A source tag must never be written unless it was established.**
+    `_existing_phones()` stamped `DataSift` on every number already sitting on
+    a record, so numbers Tracerfy found were reported as DataSift wins. The
+    user compares Tracerfy vs DataSift hit rate from these tags to decide which
+    provider to keep paying, so this corrupted the one number the tags exist to
+    produce. Pre-existing numbers now get `Pre-existing` — deliberately not a
+    provider name, since their true origin is unknown. `datasift_source()` was
+    already correct (before/after diff around the trace) and is now the ONLY
+    assigner of `DataSift`. Fixed 2026-08-24. Because phone tags are
+    append-only, mis-attribution is permanent without manual UI cleanup.
+
 #### Spend discipline
 
 **Ask the user before EVERY metered call, including Trestle** (standing

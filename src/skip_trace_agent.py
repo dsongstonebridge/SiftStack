@@ -51,6 +51,11 @@ logger = logging.getLogger(__name__)
 
 SOURCE_TRACERFY = "Tracerfy"
 SOURCE_DATASIFT = "DataSift"          # found by DataSift's own skip trace
+#: Already on the record before this run - origin genuinely unknown. NOT a
+#: provider. Kept distinct from SOURCE_DATASIFT so that provider hit-rate
+#: comparisons stay honest: a number tagged `DataSift` must mean DataSift's
+#: skip trace returned it, never "it happened to be sitting there already".
+SOURCE_PREEXISTING = "Pre-existing"
 
 #: The DOUBLE SKIP TRACE, verified end to end on a real record 2026-08-21.
 #: Tracerfy and DataSift genuinely return different numbers - on the proving
@@ -160,13 +165,28 @@ def resolve_subjects(rows: Iterable[dict]) -> tuple[list[dict], list[dict]]:
 
 
 def _existing_phones(rec: dict) -> list[dict]:
-    """Numbers already on the record. Tagged `DataSift` on writeback so a
-    caller can tell pre-existing bulk data from what we just found."""
+    """Numbers already on the record, tagged `Pre-existing` on writeback.
+
+    These were NOT found by this run, and their true origin is unknown — prior
+    bulk data, an earlier run, a manual entry. They used to be tagged
+    `DataSift`, which was a lie whenever DataSift's skip trace had not in fact
+    returned them, and it corrupted exactly the number the tags exist to
+    support: which provider actually earns its money.
+
+    The leak was worst when a source was skipped (`use_tracerfy=False` on a
+    resumed run), where EVERY number on the record fell through here and came
+    out labelled `DataSift`. But it fires on any record that already carries
+    phones a source does not re-return. Caught 2026-08-24.
+
+    `datasift_source()` is the only thing allowed to assign SOURCE_DATASIFT,
+    and it already does so correctly — via a before/after diff, so only
+    genuinely new numbers get the tag.
+    """
     out = []
     for p in ((rec.get("owner") or {}).get("phones") or []):
         n = norm_phone(p.get("number") if isinstance(p, dict) else p)
         if n:
-            out.append({"number": n, "sources": [SOURCE_DATASIFT],
+            out.append({"number": n, "sources": [SOURCE_PREEXISTING],
                         "type_raw": (p.get("type") or "") if isinstance(p, dict) else "",
                         "tier": None, "score": None})
     return out

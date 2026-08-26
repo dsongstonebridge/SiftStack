@@ -990,7 +990,7 @@ def build_api_payload(row: dict) -> dict:
     # "Courthouse Data, foreclosure, Knox".
     tags = [t.strip() for t in (row.get("Tags") or "").split(",") if t.strip()]
     # Lists, deliberately, is NOT split. Ty's production uploader
-    # sends `lists` as a bare string one line
+    # (datasift_api_upload.py:152) sends `lists` as a bare string one line
     # after splitting tags into an array — the asymmetry is intentional and
     # matches the OpenAPI spec, which types `lists` as a plain string. Our
     # Lists column only ever holds a single list name (see _build_row), so

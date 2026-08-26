@@ -66,9 +66,9 @@ THE CREATION RULE, settled by single-variable tests 2026-08-21:
   key, while /api/internal/property/ returns 200 on the same credentials.
   Not a role ceiling and not fixable by switching seats; that mount is simply
   not available here. Re-verified live 2026-08-26. It is worth knowing because
-  Ty's upstream uploader creates against it, so that script cannot run as-is
-  here — a copy of it used to live at src/datasift_api_upload.py and was
-  removed as dead weight; re-fetch from his repo if it ever needs diffing.
+  Ty's datasift_api_upload.py creates against it, so that script cannot run
+  as-is here. That file is kept as a verbatim upstream reference copy and is
+  NEVER to be deleted or edited in place -- see its own header.
 """
 
 import json as _json

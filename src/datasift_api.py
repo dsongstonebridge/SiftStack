@@ -963,6 +963,102 @@ def get_skip_trace_stats() -> dict:
     return _request("GET", f"{CORE_BASE}/api/internal/activity/skiptrace/stats/")
 
 
+def _enrich_body(property_uuids: list[str], *, search: str = "",
+                 property_type: str = "clean", enrich_property: bool = True,
+                 enrich_owner: bool = False, replace_owner: bool = False) -> dict:
+    """Build the enrich payload in the shape DataSift's own web app sends.
+
+    Captured 2026-08-26 by driving the real Manage -> Enrich records UI with a
+    Playwright route handler that ABORTED the request, so the contract was
+    learned without enriching anything:
+
+        {"query": {"must": {"property_type": "clean",
+                            "search": "Kaplan",
+                            "properties": ["<uuid>"]},
+                   "ordering": ["-list_count"]},
+         "enrich_property": true, "enrich_owner": false, "replace_owner": false}
+
+    *** `properties` lives INSIDE query.must, NOT at the top level -- exactly
+    like _skip_trace_body. *** That nesting is the whole scoping mechanism.
+    An empty or un-nested `properties` is not an error the API reports; the
+    key is simply unrecognized and the job falls back to ACCOUNT-WIDE scope.
+    This is why enrich sat on Playwright until the payload was captured: the
+    route existed all along, its scoping contract did not.
+
+    `enrich_owner` / `replace_owner` default to False and should stay that way
+    for probate-bearing data. Owner enrichment replaces our contact with
+    DataSift's owner of record, which on a probate record swaps the personal
+    representative for the *deceased* owner and re-creates the recurring
+    DM-contact bug. If owner enrichment is ever wanted, scope it per notice
+    type -- ON for foreclosure/tax, never probate -- not as a global default.
+
+    Note `search` is a plain term here (the app sends the text in the Records
+    search box), NOT the `address_prefix:` form _skip_trace_body uses.
+    """
+    must: dict = {"properties": list(property_uuids)}
+    if property_type:
+        must["property_type"] = property_type
+    if search:
+        must["search"] = search
+    return {"query": {"must": must, "ordering": ["-list_count"]},
+            "enrich_property": bool(enrich_property),
+            "enrich_owner": bool(enrich_owner),
+            "replace_owner": bool(replace_owner)}
+
+
+def enrich_properties(property_uuids: list[str], *, search: str = "",
+                      property_type: str = "clean",
+                      enrich_property: bool = True,
+                      enrich_owner: bool = False,
+                      replace_owner: bool = False,
+                      max_records: int | None = None) -> dict:
+    """Enrich SPECIFIC records via the API. Replaces the Playwright path.
+
+    There is no estimate mode on the enrich endpoint, so the pre-flight
+    borrows the skip-trace estimate, which is FREE and accepts the same
+    `query.must.properties` scoping. If that estimate reports more records
+    than we asked for, the `properties` key is not being honoured and this
+    REFUSES rather than sending a mutating account-wide job. That makes the
+    account-wide failure structurally impossible rather than something a
+    human has to remember -- the same guard submit_skip_trace() carries.
+
+    Asynchronous, like skip trace: verify by re-reading the record, not by
+    this call's response.
+    """
+    if not property_uuids:
+        # An empty list is precisely the account-wide trap -- never send it.
+        raise DataSiftAPIError(
+            "REFUSING enrich: empty property list. An enrich with no "
+            "`properties` scopes to the ENTIRE ACCOUNT."
+        )
+
+    ceiling = max_records if max_records is not None else len(property_uuids)
+    est = estimate_skip_trace(property_uuids, property_type=property_type)
+    n = est.get("number_of_records")
+    if isinstance(n, int) and n > ceiling:
+        raise DataSiftAPIError(
+            f"REFUSING enrich: the same scoped query matches {n} record(s), "
+            f"ceiling is {ceiling}. `properties` is not being honoured -- do "
+            f"not retry blindly, fix the payload (see _enrich_body)."
+        )
+    logger.info("enrich pre-flight OK: scoped query matches %s record(s), "
+                "ceiling %s", n, ceiling)
+
+    if enrich_owner or replace_owner:
+        logger.warning("enrich: owner enrichment is ON (enrich_owner=%s "
+                       "replace_owner=%s) -- this OVERWRITES the contact with "
+                       "DataSift's owner of record. Never do this on probate.",
+                       enrich_owner, replace_owner)
+
+    body = _enrich_body(property_uuids, search=search, property_type=property_type,
+                        enrich_property=enrich_property,
+                        enrich_owner=enrich_owner, replace_owner=replace_owner)
+    logger.info("enrich: submitting %d record(s) (property=%s owner=%s replace=%s)",
+                len(property_uuids), enrich_property, enrich_owner, replace_owner)
+    return _request("POST", f"{CORE_BASE}/api/internal/property/enrich/",
+                    json_body=body)
+
+
 # ── Owners / phones / emails ─────────────────────────────────────────
 
 def get_owner(owner_uuid: str) -> dict:
@@ -975,7 +1071,7 @@ def upsert_phones(owner_uuid: str, phones: list[dict]) -> dict:
 
 
 def upsert_emails(owner_uuid: str, emails: list[str] | list[dict]) -> dict:
-    """Emails take a BARE STRING LIST — `{"emails": ["a@b.com"]}`.
+    """Emails take a BARE STRING LIST -- `{"emails": ["a@b.com"]}`.
 
     NOT objects. Sending `[{"email": "a@b.com"}]` returns
     `400 {"emails": {"0": ["Enter a valid email address."]}}`, which reads like
@@ -1023,7 +1119,7 @@ def phone_tag_properties_count(tag_uuid: str) -> int:
 
 
 def set_phone_tags(number_to_tags: dict[str, list[str]]) -> dict:
-    """Apply tags to numbers — `{number: [tag_title, ...]}` — in one call.
+    """Apply tags to numbers -- `{number: [tag_title, ...]}` -- in one call.
 
     CORRECTED 2026-08-21. The previous payload (`{"number": n, "tag_uuid": u}`)
     was accepted with an empty 200 and applied NOTHING; it had been recorded as
@@ -1035,7 +1131,7 @@ def set_phone_tags(number_to_tags: dict[str, list[str]]) -> dict:
 
     Verified semantics, each tested live:
       - `type` is OPTIONAL, and omitting it PRESERVES the phone's existing type.
-        Do not send a guessed type — this endpoint upserts the phone object, so
+        Do not send a guessed type -- this endpoint upserts the phone object, so
         a wrong `type` would overwrite the real one.
       - Tags APPEND. Existing tags on the number survive, so this is safe to
         call repeatedly and safe on numbers that already carry source tags.
@@ -1047,7 +1143,7 @@ def set_phone_tags(number_to_tags: dict[str, list[str]]) -> dict:
         titles = [t for t in titles if t]
         if not titles:
             continue
-        # TITLES, not uuids. Sending uuids does not fail — it CREATES a new
+        # TITLES, not uuids. Sending uuids does not fail -- it CREATES a new
         # phone tag whose NAME is the uuid string, leaving four pieces of
         # garbage in the namespace and the real tag unapplied. Confirmed the
         # hard way on 2026-08-21. A correctly-tagged phone reads back as
@@ -1076,7 +1172,7 @@ def verify_phone_tags(owner_uuid: str, number_to_tags: dict[str, list[str]]) -> 
     """Read the owner back and confirm each number carries the tags requested.
 
     Necessary because the tag endpoint returns an empty body whether it worked
-    or silently did nothing — the record is the only trustworthy signal.
+    or silently did nothing -- the record is the only trustworthy signal.
 
     Compares TITLES against what the record reports, deliberately. An earlier
     version resolved each title to its uuid and compared uuids, which made the
@@ -1100,7 +1196,7 @@ def verify_phone_tags(owner_uuid: str, number_to_tags: dict[str, list[str]]) -> 
 
 # ── Filter presets ────────────────────────────────────────────────────
 # Schema note: list/detail responses use "title" (not "name") and "filters"
-# (not "filter_data") — confirmed live 2026-08-19 against 64 real presets.
+# (not "filter_data") -- confirmed live 2026-08-19 against 64 real presets.
 
 def list_filter_presets() -> list[dict]:
     return get_all(f"{CORE_BASE}/api/internal/filter-preset/")
@@ -1132,7 +1228,7 @@ def update_filter_preset(preset_uuid: str, **fields) -> dict:
                      json_body=fields)
 
 
-# ── SiftMap (Phase C — untested against a live account so far) ────────
+# ── SiftMap (Phase C -- untested against a live account so far) ────────
 
 def siftmap_search(*, polygon: list[list[float]] | None = None,
                     address: str | None = None) -> dict:

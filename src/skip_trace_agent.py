@@ -437,6 +437,21 @@ def score_phones(subjects: list[dict], *, dry_run: bool = True) -> dict[str, dic
             for ph in p["phones"]:
                 unique.add(ph["number"])
 
+    # An unusually large phone count on one record is a real signal worth
+    # surfacing -- usually a common-name mismatch, occasionally a data quality
+    # problem. The retired skip-and-score-upload mode stopped and prompted
+    # here; this pipeline is DRY RUN by default and prints total spend before
+    # --commit, so the anomaly is logged rather than turned into an
+    # interactive prompt that would break unattended runs.
+    OUTLIER_PHONES_PER_RECORD = 12
+    for s in subjects:
+        n = sum(len(p["phones"]) for p in s["people"])
+        if n > OUTLIER_PHONES_PER_RECORD:
+            logger.warning("OUTLIER: %s / %s has %d phone number(s) (threshold %d) "
+                            "- check for a common-name mismatch before committing",
+                            s.get("name") or "?", s.get("property_address") or "?",
+                            n, OUTLIER_PHONES_PER_RECORD)
+
     logger.warning("BILLED: TrestleIQ scoring %d unique number(s) (~$%.2f at $0.015 each)",
                     len(unique), len(unique) * 0.015)
     if dry_run:

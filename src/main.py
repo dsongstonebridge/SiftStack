@@ -1140,15 +1140,97 @@ async def _retry_skipped_step(page, step_fn, csv_path: Path, skipped: list[dict]
     return retry_result
 
 
-def _run_skip_trace(args) -> None:
-    """`skip-trace` mode — the proven DataSift pipeline for records already in
-    the CRM: resolve -> Tracerfy -> DataSift -> Trestle -> tags -> board.
+def _create_records_for_batch(args, csv_path: Path) -> list[dict] | None:
+    """`--create` front end: raw property template -> CRM records, ready for
+    run_pipeline() to trace and score.
 
-    DRY RUN BY DEFAULT. Every step is free until --commit is passed, and the
-    run prints its estimated spend first. See skip_trace_agent.run_pipeline().
+    Absorbed from the retired skip-and-score-upload mode 2026-08-26. That mode
+    carried its own second implementation of Tracerfy -> phone read -> Trestle
+    -> tag push, which produced NO phone source tags and no Message Board
+    post. Only the create/format/enrich half was worth keeping; everything
+    after it is now run_pipeline()'s job, so there is exactly one
+    implementation of the traced-and-scored path.
+
+    Records are deliberately created WITHOUT phones. Tracerfy runs later
+    inside run_pipeline, so every number reaches the CRM through the same
+    upsert_phones + set_phone_tags path and therefore carries an honest
+    source tag. See [[feedback-phone-source-tags-must-be-true]].
+
+    Returns the rows to hand to run_pipeline, or None if the batch failed.
+    """
+    import asyncio as _asyncio
+    from datasift_formatter import build_datasift_csv_from_template
+    from datasift_uploader import upload_to_datasift
+
+    template_rows = _read_property_template(csv_path)
+    if not template_rows:
+        logging.error("No valid rows in %s (need Property Street + Last Name at minimum)",
+                      csv_path)
+        return None
+    logging.info("Read %d record(s) from %s", len(template_rows), csv_path.name)
+
+    notice_type = getattr(args, "notice_type", "foreclosure") or "foreclosure"
+    county = getattr(args, "county", "") or ""
+    trial_tag = getattr(args, "trial_tag", None)
+    list_name = (getattr(args, "list_name", None)
+                 or f"SiftStack {datetime.now().strftime('%Y-%m-%d')}")
+
+    # "Owner Alive" == "No" means the source document names no living
+    # heir/spouse/co-borrower/representative at all. Those records are still
+    # created and enriched, but must never be traced at either source.
+    # See [[feedback-petition-deceased-owner-no-skip-trace]].
+    deceased = [r for r in template_rows
+                if str(r.get("Owner Alive") or "").strip().lower() == "no"]
+    alive = [r for r in template_rows if r not in deceased]
+    if deceased:
+        logging.info("%d record(s) flagged Owner Alive=No - created and enriched "
+                     "but never traced: %s", len(deceased),
+                     ", ".join(f"{r.get('First Name','')} {r.get('Last Name','')}".strip()
+                               for r in deceased))
+
+    # No trace results yet, by design -- see the docstring.
+    datasift_csv = build_datasift_csv_from_template(
+        template_rows, [], notice_type=notice_type, county=county,
+        trial_tag=trial_tag,
+    )
+
+    # skip_trace=False: run_pipeline owns the DataSift trace, scoped and
+    # estimate-gated. Enrich is API-scoped as of 2026-08-26, so no browser.
+    upload_result = _asyncio.run(upload_to_datasift(
+        csv_path=datasift_csv, enrich=True, skip_trace=False,
+        mode="add", list_name=list_name, batch_tag="FTM",
+    ))
+    logging.info("DataSift upload: %s", upload_result.get("message", ""))
+    if not upload_result.get("success"):
+        logging.error("Upload did not succeed - stopping before any billed step.")
+        return None
+
+    return [{"street": (r.get("Property Street") or "").strip(),
+             "city": (r.get("Property City") or "").strip(),
+             "first": (r.get("First Name") or "").strip(),
+             "last": (r.get("Last Name") or "").strip()}
+            for r in alive]
+
+
+def _run_skip_trace(args) -> None:
+    """`skip-trace` mode — the one DataSift pipeline.
+
+    Without --create: resolve existing CRM records -> Tracerfy -> DataSift ->
+    Trestle -> phone tags (source + tier) -> Message Board.
+
+    With --create: reads a raw property-template .xlsx/.csv, creates the
+    records (bulk-create + petition notes + custom fields + lists), enriches
+    them over the API, then runs the same pipeline. This replaces the retired
+    skip-and-score-upload mode, which duplicated the second half in a weaker
+    form (no source tags, no board post).
+
+    DRY RUN BY DEFAULT for everything billed. --create does its own creating
+    and enriching (neither is metered); every billed step waits for --commit,
+    and the run prints estimated spend first.
 
         python src/main.py skip-trace --csv-path leads.csv
         python src/main.py skip-trace --csv-path leads.csv --commit
+        python src/main.py skip-trace --csv-path batch.xlsx --create --commit
         python src/main.py skip-trace --street "7405 S Chestnut Ave" --city "Broken Arrow"
     """
     import csv as _csv
@@ -1157,7 +1239,26 @@ def _run_skip_trace(args) -> None:
     from skip_trace_agent import run_pipeline
 
     rows: list[dict] = []
-    if getattr(args, "csv_path", None):
+    if getattr(args, "create", False):
+        csv_path = getattr(args, "csv_path", None)
+        if not csv_path:
+            logger.error("skip-trace --create requires --csv-path (raw property template)")
+            return
+        csv_path = Path(csv_path)
+        if not csv_path.exists():
+            logger.error("File not found: %s", csv_path)
+            return
+        if getattr(args, "estimate", False):
+            n = len(_read_property_template(csv_path) or [])
+            logger.info("Estimate: %d record(s) x $0.02 Tracerfy = $%.2f, plus "
+                        "~$0.12/owner DataSift and $0.015 per unique number "
+                        "(Trestle count is unknown until numbers come back).",
+                        n, n * 0.02)
+            return
+        rows = _create_records_for_batch(args, csv_path) or []
+        if not rows:
+            return
+    elif getattr(args, "csv_path", None):
         with open(args.csv_path, encoding="utf-8-sig", newline="") as fh:
             for r in _csv.DictReader(fh):
                 street = (r.get("Property Street Address") or r.get("Property Street")
@@ -1192,252 +1293,6 @@ def _run_skip_trace(args) -> None:
         logger.warning("  unresolved: %s", _json.dumps(u)[:160])
     if dry:
         logger.info("Nothing was billed. Re-run with --commit to execute.")
-
-
-def _run_skip_and_score_upload(args) -> None:
-    """Full pipeline, single command: raw property-template CSV/xlsx ->
-    Tracerfy skip trace -> DataSift upload/enrich/skip-trace -> phone read ->
-    Trestle scoring -> tag push back.
-
-    This is the saved, repeatable version of the manual trial-run pipeline
-    from the 2026-08-13/14 session — every step below reuses the same
-    functions proven live that session (upload_to_datasift(),
-    read_record_phone_numbers(), run_phone_validation(), upload_phone_tags()),
-    not a reimplementation.
-
-    Runs fully unattended by default — no confirmation prompts. Tracerfy
-    cost is per-record and known upfront, so it never gates. Trestle only
-    pauses for confirmation if some record comes back with more than
-    MAX_PHONES_PER_RECORD_BEFORE_CONFIRM (12) phone numbers — an unusually
-    high count that's more likely a common-name mismatch or data-quality
-    issue than routine skip-trace results. --yes bypasses that check too,
-    for guaranteed no-prompt runs (e.g. scheduled jobs).
-    """
-    import asyncio as _asyncio
-
-    csv_path = getattr(args, "csv_path", None)
-    if not csv_path:
-        logging.error("skip-and-score-upload requires --csv-path (raw property template .xlsx or .csv)")
-        sys.exit(1)
-    csv_path = Path(csv_path)
-    if not csv_path.exists():
-        logging.error("File not found: %s", csv_path)
-        sys.exit(1)
-
-    notice_type = getattr(args, "notice_type", "foreclosure") or "foreclosure"
-    county = getattr(args, "county", "") or ""
-    trial_tag = getattr(args, "trial_tag", None)
-    list_name = getattr(args, "list_name", None) or f"SiftStack {datetime.now().strftime('%Y-%m-%d')}"
-    auto_yes = getattr(args, "yes", False)
-    estimate_only = getattr(args, "estimate", False)
-
-    template_rows = _read_property_template(csv_path)
-    if not template_rows:
-        logging.error("No valid rows found in %s (need Property Street + Last Name at minimum)", csv_path)
-        sys.exit(1)
-    logging.info("Read %d record(s) from %s", len(template_rows), csv_path.name)
-
-    # "Owner Alive" (from petition-info-extraction) == "No" means the source
-    # document names no living heir/spouse/co-borrower/representative at all
-    # for that owner — never trace those, at either Tracerfy (below) or
-    # DataSift's own skip trace (after upload). They still get uploaded and
-    # enriched, just flagged instead of traced — see
-    # [[feedback-petition-deceased-owner-no-skip-trace]].
-    deceased_no_contact = [
-        r for r in template_rows
-        if str(r.get("Owner Alive") or "").strip().lower() == "no"
-    ]
-    alive_rows = [r for r in template_rows if r not in deceased_no_contact]
-    if deceased_no_contact:
-        logging.info(
-            "%d record(s) flagged Owner Alive=No — will upload/enrich but skip "
-            "Tracerfy and DataSift skip trace for: %s",
-            len(deceased_no_contact),
-            ", ".join(f"{r.get('First Name', '')} {r.get('Last Name', '')}".strip() for r in deceased_no_contact),
-        )
-
-    tracerfy_cost = len(alive_rows) * 0.02
-    if estimate_only:
-        logging.info(
-            "Estimate: %d record(s) x $0.02 Tracerfy = $%.2f (%d deceased-no-contact "
-            "record(s) excluded from tracing). "
-            "(Trestle cost isn't known until after DataSift skip trace returns real phone "
-            "numbers — that estimate is shown mid-run.)",
-            len(alive_rows), tracerfy_cost, len(deceased_no_contact),
-        )
-        return
-
-    # Tracerfy cost is per-record, small, and known upfront — no confirmation
-    # gate here. Per-record phone-count risk (the thing actually worth a
-    # human check) can only be evaluated later, once real phone numbers
-    # exist — see the MAX_PHONES_PER_RECORD_BEFORE_CONFIRM check below.
-    logging.info("Tracerfy: tracing %d record(s), ~$%.2f — proceeding automatically",
-                  len(alive_rows), tracerfy_cost)
-
-    from tracerfy_skip_tracer import trace_contacts
-    contacts = [
-        {
-            "first_name": r.get("First Name", ""), "last_name": r.get("Last Name", ""),
-            "address": r.get("Property Street", ""), "city": r.get("Property City", ""),
-            "state": r.get("Property State", ""), "zip": str(r.get("Property Zip", "")),
-        }
-        for r in alive_rows
-    ]
-    trace_results = trace_contacts(contacts) if contacts else []
-    logging.info("Tracerfy: %d/%d record(s) matched", len(trace_results), len(contacts))
-
-    from datasift_formatter import build_datasift_csv_from_template
-    datasift_csv = build_datasift_csv_from_template(
-        template_rows, trace_results,
-        notice_type=notice_type, county=county, trial_tag=trial_tag,
-    )
-
-    # Everything in template_rows (including deceased-no-contact records)
-    # gets uploaded and enriched, but the DataSift-side skip trace must only
-    # touch the alive ones — scope it to a filtered copy of the CSV rather
-    # than the full upload CSV.
-    skip_trace_csv = datasift_csv
-    if deceased_no_contact:
-        alive_last_names = {(r.get("Last Name") or "").strip() for r in alive_rows}
-        skip_trace_csv = _filter_csv_by_owners(
-            datasift_csv, alive_last_names,
-            OUTPUT_DIR / f"skip_trace_scope_{notice_type}_{datetime.now().strftime('%Y-%m-%d')}.csv",
-        )
-
-    from datasift_uploader import upload_to_datasift
-    upload_result = _asyncio.run(upload_to_datasift(
-        csv_path=datasift_csv, headless=False, enrich=True, skip_trace=True,
-        mode="add", list_name=list_name, batch_tag="FTM",
-        skip_trace_csv_path=skip_trace_csv,
-    ))
-    logging.info("DataSift upload: %s", upload_result.get("message", ""))
-    if not upload_result.get("success"):
-        logging.error("Upload did not succeed — stopping before phone scoring. "
-                       "Check DataSift and re-run once the underlying issue is fixed.")
-        sys.exit(1)
-
-    async def _finish_pipeline() -> None:
-        from playwright.async_api import async_playwright
-        from datasift_core import login
-        from datasift_uploader import (
-            read_record_phone_numbers, write_phone_enrichment_csv, upload_phone_tags,
-            enrich_records, skip_trace_records,
-        )
-
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=False)
-            context = await browser.new_context(viewport={"width": 1280, "height": 900})
-            page = await context.new_page()
-            try:
-                logged_in = await login(page)
-                if not logged_in:
-                    logging.error("DataSift login failed — cannot read phone data")
-                    return
-
-                # One automatic retry pass each for enrich and skip trace —
-                # same per-record verified-selection safety, just re-run once
-                # on whatever fell through the first pass (e.g. a search that
-                # briefly returned 0 or 2+ rows). Skip trace must retry before
-                # phone read: a record only has phone data to read once its
-                # own skip trace has actually succeeded.
-                still_unresolved: dict[str, list[str]] = {}
-                enrich_skipped = upload_result.get("enrich_result", {}).get("skipped", [])
-                if enrich_skipped:
-                    retry = await _retry_skipped_step(
-                        page, enrich_records, datasift_csv, enrich_skipped,
-                        OUTPUT_DIR / f"retry_enrich_{notice_type}.csv", "Enrich",
-                    )
-                    if retry.get("skipped"):
-                        still_unresolved["enrich"] = [s["owner"] for s in retry["skipped"] if s.get("owner")]
-
-                skip_trace_skipped = upload_result.get("skip_trace_result", {}).get("skipped", [])
-                if skip_trace_skipped:
-                    retry = await _retry_skipped_step(
-                        page, skip_trace_records, datasift_csv, skip_trace_skipped,
-                        OUTPUT_DIR / f"retry_skip_trace_{notice_type}.csv", "Skip trace",
-                    )
-                    if retry.get("skipped"):
-                        still_unresolved["skip_trace"] = [s["owner"] for s in retry["skipped"] if s.get("owner")]
-
-                phone_result = await read_record_phone_numbers(page, datasift_csv)
-                if phone_result["skipped"]:
-                    retry = await _retry_skipped_step(
-                        page, read_record_phone_numbers, datasift_csv, phone_result["skipped"],
-                        OUTPUT_DIR / f"retry_phone_read_{notice_type}.csv", "Phone read",
-                    )
-                    phone_result["records"].update(retry.get("records", {}))
-                    if retry.get("skipped"):
-                        still_unresolved["phone_read"] = [s["owner"] for s in retry["skipped"] if s.get("owner")]
-                    phone_result["success"] = bool(phone_result["records"])
-
-                if still_unresolved:
-                    logging.warning(
-                        "skip-and-score-upload: record(s) still needing manual attention after "
-                        "automatic retry — %s. Everything else completed end to end.",
-                        still_unresolved,
-                    )
-
-                if not phone_result["success"]:
-                    logging.warning("No phone data read from any record: %s", phone_result.get("skipped"))
-                    return
-
-                phone_csv = write_phone_enrichment_csv(
-                    phone_result["records"],
-                    OUTPUT_DIR / f"phone_enrichment_{notice_type}_{datetime.now().strftime('%Y-%m-%d')}.csv",
-                )
-
-                from phone_validator import estimate_cost, run_phone_validation
-                est = estimate_cost(phone_csv)
-                logging.info("Trestle estimate: %d unique phone(s) x $0.015 = $%.2f",
-                             est["unique_phones"], est["estimated_cost"])
-
-                # Confirmation gate is conditional, not blanket: proceed
-                # automatically unless some record came back with an
-                # unusually large phone count (>12), which is a real signal
-                # worth a human look — e.g. a common-name mismatch or a data
-                # quality issue — rather than routine skip-trace results.
-                # --yes always bypasses this too, for genuinely unattended runs.
-                MAX_PHONES_PER_RECORD_BEFORE_CONFIRM = 12
-                max_phones = max((len(v) for v in phone_result["records"].values()), default=0)
-                if max_phones > MAX_PHONES_PER_RECORD_BEFORE_CONFIRM and not auto_yes:
-                    over_limit = {
-                        owner: len(phones) for owner, phones in phone_result["records"].items()
-                        if len(phones) > MAX_PHONES_PER_RECORD_BEFORE_CONFIRM
-                    }
-                    resp = input(
-                        f"Record(s) with unusually many phone numbers found: {over_limit} "
-                        f"(threshold: {MAX_PHONES_PER_RECORD_BEFORE_CONFIRM}/record). "
-                        f"Proceed with Trestle scoring (~${est['estimated_cost']:.2f})? [y/N]: "
-                    ).strip().lower()
-                    if resp != "y":
-                        logging.info(
-                            "Skipped Trestle scoring. Phone data saved to %s — "
-                            "re-run skip-and-score-upload later to resume from here.", phone_csv,
-                        )
-                        return
-                else:
-                    logging.info("Trestle: proceeding automatically (max %d phone(s)/record, "
-                                 "threshold %d)", max_phones, MAX_PHONES_PER_RECORD_BEFORE_CONFIRM)
-
-                validation_result = run_phone_validation(str(phone_csv))
-                if not validation_result.get("success"):
-                    logging.error("Trestle scoring failed: %s", validation_result.get("message"))
-                    return
-                logging.info("Trestle: %d scored, %d error(s)",
-                             validation_result.get("results_count", 0),
-                             validation_result.get("errors_count", 0))
-                for tier, count in validation_result.get("tier_counts", {}).items():
-                    logging.info("  %s: %d", tier, count)
-
-                tag_csv = validation_result.get("tag_csv_path")
-                if tag_csv:
-                    tag_result = await upload_phone_tags(page, tag_csv)
-                    logging.info("Tag push: %s", tag_result.get("message", ""))
-            finally:
-                await browser.close()
-
-    _asyncio.run(_finish_pipeline())
-    logging.info("skip-and-score-upload complete.")
 
 
 def _run_daily_obits(args) -> None:
@@ -2121,7 +1976,7 @@ def cli_main() -> None:
         choices=[
             "daily", "historical", "pdf-import", "photo-import", "dropbox-watch",
             "csv-import", "phone-validate", "manage-sold", "manage-presets", "manage-list",
-            "daily-obits", "skip-and-score-upload", "skip-trace",
+            "daily-obits", "skip-trace",
             # New analysis & workflow modes
             "comp", "rehab", "analyze-deal", "market-analysis", "buyer-prospect",
             "deep-prospect", "lead-manage", "setup-sequences", "niche-sequential",
@@ -2132,8 +1987,9 @@ def cli_main() -> None:
             "pdf-import/photo-import = import from files; "
             "dropbox-watch = poll Dropbox; csv-import = re-enrich CSV; "
             "phone-validate = Trestle scoring; manage-sold/manage-presets = DataSift ops; "
-            "skip-and-score-upload = full pipeline: raw property template -> Tracerfy -> "
-            "DataSift upload/enrich/skip-trace -> Trestle scoring -> tag push; "
+            "skip-trace = THE DataSift pipeline (dry run unless --commit): "
+            "resolve -> Tracerfy -> DataSift -> Trestle -> phone tags -> board; "
+            "add --create to build the records from a raw property template first; "
             "comp = comparable sales ARV; rehab = rehab cost estimate; "
             "analyze-deal = full deal analysis; market-analysis = zip code scoring; "
             "buyer-prospect = cash buyer lists; deep-prospect = 4-level research; "
@@ -2289,6 +2145,15 @@ def cli_main() -> None:
         help=("skip-trace: actually run it. WITHOUT this the run is a DRY RUN and "
               "bills nothing. Spends real money: Tracerfy ~$0.02/record, DataSift "
               "~$0.12/owner, Trestle ~$0.015/number."),
+    )
+    parser.add_argument(
+        "--create", action="store_true",
+        help=("skip-trace: build the CRM records from --csv-path first (raw "
+              "property template .xlsx/.csv), then trace and score them. "
+              "Creation, petition notes, custom fields, lists and API "
+              "enrichment are all unmetered and run even without --commit; "
+              "every billed step still waits for --commit. Replaces the "
+              "retired skip-and-score-upload mode."),
     )
     parser.add_argument(
         "--csv-county",
@@ -2469,33 +2334,33 @@ def cli_main() -> None:
         help="Export all DataSift records for phone validation (phone-validate mode)",
     )
 
-    # skip-and-score-upload arguments
+    # skip-trace --create arguments
     parser.add_argument(
         "--notice-type",
         type=str,
         default="foreclosure",
-        help="Notice type for the batch, e.g. foreclosure, probate (skip-and-score-upload mode, default: foreclosure)",
+        help="Notice type for the batch, e.g. foreclosure, probate (skip-trace --create, default: foreclosure)",
     )
     parser.add_argument(
         "--county",
         type=str,
         default="",
-        help="County to tag/set on the batch (skip-and-score-upload mode)",
+        help="County to tag/set on the batch (skip-trace --create)",
     )
     parser.add_argument(
         "--trial-tag",
         type=str,
         default=None,
         help='Tag/note marking this as a test batch, e.g. "Pipeline_Trial_2026-08-14" '
-             "(skip-and-score-upload mode). Omit for real production runs.",
+             "(skip-trace --create). Omit for real production runs.",
     )
     parser.add_argument(
         "--yes",
         action="store_true",
-        help="Guarantee zero confirmation prompts (skip-and-score-upload mode). "
-             "The pipeline already runs unattended by default; this only matters if "
-             "some record comes back with more than 12 phone numbers, which would "
-             "otherwise pause once for confirmation before Trestle spend.",
+        help="Accepted for backwards compatibility; no longer gates anything. "
+             "The >12-phones-per-record confirmation it used to bypass is now a "
+             "logged OUTLIER warning, because skip-trace is dry-run by default "
+             "and --commit is the real spend gate.",
     )
     parser.add_argument(
         "--estimate",
@@ -2896,10 +2761,6 @@ def cli_main() -> None:
     # Phone validation mode — separate pipeline
     if args.mode == "phone-validate":
         _run_phone_validate(args)
-        return
-
-    if args.mode == "skip-and-score-upload":
-        _run_skip_and_score_upload(args)
         return
 
     if args.mode == "skip-trace":

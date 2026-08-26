@@ -249,7 +249,7 @@ The default obituary path extracts survivors/heirs from obituary text with an LL
 
 DataSift.ai (formerly REISift) is the CRM where scraped records land for niche sequential marketing campaigns.
 
-**As of build 1.0.34 (2026-08-19), a real REST API is live** (early access — see "REST API" section below) and handles upload, tags, lists, notes, custom fields, skip trace, and phone tags. **As of 2026-08-21 the upload path is API-only — no browser in record creation.** Playwright remains for two things: the **Sequence builder** (no API anywhere in the 323-path spec) and **Enrich Property Information** (an endpoint exists, but calling it wrong risks enriching the whole account — a deliberate choice, not a missing route).
+**As of build 1.0.34 (2026-08-19), a real REST API is live** (early access — see "REST API" section below) and handles upload, tags, lists, notes, custom fields, skip trace, and phone tags. **As of 2026-08-21 the upload path is API-only — no browser in record creation.** **As of 2026-08-26 enrichment is API-scoped too** — Playwright now remains for exactly one thing: the **Sequence builder** (no API anywhere in the 323-path spec).
 
 **Domain:** `app.reisift.io` (NOT `app.datasift.ai`). Core API at `apiv2.reisift.io`, SiftMap API at `map.reisift.io`.
 
@@ -305,6 +305,12 @@ One call runs it: `skip_trace_agent.run_pipeline(rows, dry_run=False)`.
 python src/main.py skip-trace --street "7405 S Chestnut Ave" --city "Broken Arrow"
 python src/main.py skip-trace --csv-path leads.csv
 
+# Raw property template -> create records + petition notes + API enrich,
+# THEN trace/score/tag them. Creation and enrich are unmetered and happen
+# even without --commit; every billed step still waits for it.
+python src/main.py skip-trace --csv-path batch.xlsx --create --estimate
+python src/main.py skip-trace --csv-path batch.xlsx --create --commit     --notice-type foreclosure --county Tulsa
+
 # Actually run it. SPENDS MONEY - ask the user first.
 python src/main.py skip-trace --csv-path leads.csv --commit
 ```
@@ -332,7 +338,7 @@ Trestle twice.
 | Phone tags | **WORKS** | TITLES only; append-only, no removal endpoint |
 | Notes / Message Board | **WORKS** | notes must be a separate call from create |
 | Custom field values | **WORKS** | select/multiselect need OPTION uuids |
-| Enrichment | **Playwright only** | endpoint exists but is account-wide |
+| Enrichment | **WORKS, SCOPED** | `properties` nested in `query.must`, same as skip trace |
 | Sequences | **Playwright only** | no API in the 323-path spec |
 | SiftMap sold-tagging | **blocked** | request body shape undocumented |
 
@@ -500,7 +506,7 @@ A second error compounded it: the follow-up A/B varied **two** things at once (b
 
 </details>
 
-- **An enrich endpoint DOES exist — and must not be called blind.** `POST /api/internal/property/enrich/` is real (corrects the earlier "no enrich endpoint exists" claim in this file). But its trigger contract is undocumented, and an empty POST reports a count of *every property in the account*. Guessing at it risks running **owner** enrichment account-wide, which would replace the personal representative on every probate record with the deceased owner of record and undo the entire point of the PR contact mapping. Ty's `run_enrich_lists.py` reached the same conclusion and stays on the browser path deliberately. `enrich_records()` remains Playwright-only — for that reason, not for lack of a route. Do not "migrate" it without first establishing how to scope it to specific records. (Separately confirmed: DataSift does not auto-populate native valuation fields — `estimate_value`, `sqft`, `bedrooms` are `null` on create.)
+- **An enrich endpoint DOES exist — and must not be called blind.** `POST /api/internal/property/enrich/` is real (corrects the earlier "no enrich endpoint exists" claim in this file). But its trigger contract is undocumented, and an empty POST reports a count of *every property in the account*. Guessing at it risks running **owner** enrichment account-wide, which would replace the personal representative on every probate record with the deceased owner of record and undo the entire point of the PR contact mapping. **SOLVED 2026-08-26 — enrichment is now API-scoped.** The contract was captured off DataSift's own web app with a Playwright route handler that ABORTED the request, the same technique that cracked the skip-trace payload. It is the identical shape: `{"query": {"must": {"property_type": "clean", "search": "<term>", "properties": ["<uuid>"]}, "ordering": ["-list_count"]}, "enrich_property": true, "enrich_owner": false, "replace_owner": false}` — ***`properties` nests inside `query.must`***, and an un-nested or empty list is what silently went account-wide. `datasift_api.enrich_properties()` refuses an empty list outright and pre-flights the same scoped query through the FREE skip-trace estimate, refusing if it matches more records than asked for. The endpoint echoes `{"count": N}`; `enrich_records()` treats a count that disagrees with the request as a failure. Verified live on 9 records: pre-flight said 9 (not the account's 962) and the response said `count: 9`. The three toggles are explicit booleans — `enrich_owner`/`replace_owner` default False and must stay False for probate. (Separately confirmed: DataSift does not auto-populate native valuation fields — `estimate_value`, `sqft`, `bedrooms` are `null` on create.)
 - **Select/multiselect custom fields need the OPTION's uuid, not its label** — 43 of this account's 80 custom fields. Sending a label 400s with `"... is not a valid UUID."`, and because the PATCH is a **batch**, one unresolvable value fails the whole request and costs that record *every other custom field with it*. `datasift_api.resolve_custom_field_value()` resolves label → option uuid and **skips + reports** unknown fields/options rather than guessing. Verification compares read-back values: the field uuid is nested at `item["custom_field"]["uuid"]` — **not** `field_uuid`, and not the row's own top-level `uuid`, either of which finds nothing and "verifies" a write that never landed.
 - **Custom fields are never auto-created.** `get_or_create_custom_field()` was removed from the upload path; it used to create ~46 fields defaulted to `field_type="text"` in a "SiftStack" group. The account's custom fields are deliberately curated, so nothing is created implicitly as a side effect of an upload. (The CRM itself is in scope as of 2026-08-21 — deliberate, explicit schema changes are fine; silent ones are not.) Unmatched labels now skip with a warning — the tradeoff being that columns without a matching field no longer land at all. Note that creating a `select` field requires its options **in the same POST**.
 - **No Sequence API** anywhere in the 323-path official spec or the endpoint index. `create_sold_sequence()` stays Playwright-only, permanently.
@@ -539,7 +545,7 @@ DataSift's niche sequential system uses filter presets to guide records through 
 
 After upload, the pipeline runs two DataSift actions, both ON by default when `--upload-datasift` is set:
 
-1. **Enrich Property Information** (Manage → Enrich Data, Playwright — an API route exists but is unsafe to call blind; see the REST API section): Adds SiftMap property data (beds, baths, Zestimate, sqft, sale history) to uploaded records. "Enrich Owners" and "Swap Owners" are OFF — protects our PR/DM contact mapping.
+1. **Enrich Property Information** (REST API as of 2026-08-26, scoped — see the REST API section; `enrich_records_playwright()` kept as rollback): Adds SiftMap property data (beds, baths, Zestimate, sqft, sale history) to uploaded records. "Enrich Owners" and "Swap Owners" are OFF — protects our PR/DM contact mapping.
 2. **Skip Trace** — see "THE WORKING PIPELINE" above. Scoped over the REST API; `properties` must be nested inside `query.must` or it goes account-wide. Always `estimate_skip_trace()` first. Runs asynchronously — verify via `has_phones`/`skiptraced` on a re-read or `datasift_api.get_skip_trace_stats()`, not the submit call's response alone.
 
    **THIS SPENDS REAL MONEY. Corrected 2026-08-21 — this file previously claimed an "unlimited plan ($97/mo)", which is wrong.** The account runs on **prepaid credits**, so every submitted record draws down a finite balance and an over-large or repeated submission is unrecoverable spend. Treat it as a billed action under the no-unapproved-spend rule: never submit speculatively, never submit test/throwaway records, and never re-submit a batch to "make sure" — check `skiptraced`/`has_phones` first. Note that `skip_trace` defaults to **True** in `upload_to_datasift()` and its variants, so an upload spends credits unless `--no-skip-trace` is passed. `submit_skip_trace()` logs the record count as billable before sending; there is no server-side balance check available, so the count in that log line is the only pre-flight signal.
@@ -555,9 +561,9 @@ python src/main.py daily --notify-slack            # send run summary to Slack/D
 python src/main.py daily --deep-heirs               # resolve deceased-owner heirs via Enformion (~$0.35/match)
 ```
 
-### Single-Command Pipeline: `skip-and-score-upload` (build 1.0.33+)
+### Single-Command Pipeline: `skip-trace --create` (build 1.0.35+)
 
-Runs the full raw-CSV-to-scored-and-tagged pipeline in one command: Tracerfy skip trace → DataSift upload/enrich/skip-trace → phone read → Trestle scoring → tag push. Built from the manual trial-run pipeline proven live in the 2026-08-13/14 session; every step reuses the same functions (`upload_to_datasift()`, `read_record_phone_numbers()`, `run_phone_validation()`, `upload_phone_tags()`), not a reimplementation. As of build 1.0.34, `upload_to_datasift()`, `skip_trace_records()`, `read_record_phone_numbers()`, and `upload_phone_tags()` are the REST API versions — same functions, same signatures, same per-record safety discipline (no bulk selection, exact-match lookup before any write), now backed by direct API calls instead of Playwright clicks. `enrich_records()` (called on the retry path) is unchanged — still Playwright, deliberately (an endpoint exists but is unsafe to call blind; see the REST API section).
+Runs the full raw-CSV-to-scored-and-tagged pipeline in one command: Tracerfy skip trace → DataSift upload/enrich/skip-trace → phone read → Trestle scoring → tag push. Built from the manual trial-run pipeline proven live in the 2026-08-13/14 session; every step reuses the same functions (`upload_to_datasift()`, `read_record_phone_numbers()`, `run_phone_validation()`, `upload_phone_tags()`), not a reimplementation. As of build 1.0.34, `upload_to_datasift()`, `skip_trace_records()`, `read_record_phone_numbers()`, and `upload_phone_tags()` are the REST API versions — same functions, same signatures, same per-record safety discipline (no bulk selection, exact-match lookup before any write), now backed by direct API calls instead of Playwright clicks. `enrich_records()` is also the REST API version as of 2026-08-26, so this pipeline no longer launches a browser at all.
 
 ```bash
 # Estimate only (Tracerfy cost, no spend, no DataSift contact)
@@ -578,6 +584,26 @@ python src/main.py skip-and-score-upload --csv-path "Property Records.xlsx" --tr
 Input file: a raw property-upload-template `.xlsx` or `.csv` with columns `Property Street, Property City, Property State, Property Zip, First Name, Last Name[, Record Link]` — no phone numbers, no DataSift formatting. Blank template rows (these ship as fixed-size sheets, e.g. 300 rows with only a couple filled in) are skipped automatically.
 
 **Petition detail in Notes / Message Board (expanded 2026-08-21).** When the input came from the `petition-info-extraction` skill, `datasift_formatter._format_petition_notes()` renders its columns into grouped **CASE / PROPERTY / LOAN / MODIFICATIONS / OWNER / LIENS** sections on both the property Notes and the owner Message Board. Beyond the original six loan figures it now carries legal description, plat number, plaintiff, co-defendants, original lender, initial vs current rate, recording document numbers, modification count + history, junior lienholders, and owner status — and appends an automatic **CAUTION** when the unpaid balance exceeds the original loan (arrears capitalized through repeated modification; equity may be thin or negative). `_PETITION_SECTIONS` there and the field table in the skill's `SKILL.md` **must stay in sync** — a field added to one and not the other is extracted and then silently dropped. Signals worth reading: a high modification count means a modification-exhausted borrower, and institutional co-defendants (HUD, IRS, banks, judgment creditors) are junior liens that bear directly on equity. Note also that a petition body may give only a legal description with the street address appearing solely in the Mortgage exhibit — and the two can name different towns.
+
+**Consolidated 2026-08-26.** `skip-and-score-upload` is GONE — it carried a
+second, weaker implementation of the trace/score/tag half that applied **no
+phone source tags** and posted **no Message Board** entry. Only its
+create/format/enrich half was worth keeping; that is now
+`_create_records_for_batch()` behind `skip-trace --create`, and everything
+after creation is `skip_trace_agent.run_pipeline()` — one implementation.
+Records are created **without phones on purpose**: Tracerfy runs later inside
+run_pipeline, so every number reaches the CRM through the same
+`upsert_phones` + `set_phone_tags` path and therefore carries an honest source
+tag. The old >12-phones-per-record confirmation prompt is now a logged
+`OUTLIER` warning in `score_phones()`, since dry-run-by-default plus `--commit`
+is the stronger gate and a prompt breaks unattended runs.
+
+**Do not re-run a batch whose source tags are already correct.** `_existing_phones()`
+stamps every number already on a record as `Pre-existing` (correct — their true
+origin is unknown), so a second pass over an already-traced record appends
+`Pre-existing` beside the real `Tracerfy`/`DataSift` tag. Phone tags are
+append-only, so that permanently muddies the provider comparison the tags exist
+to produce.
 
 ### Environment Variables
 - `DATASIFT_API_KEY` — REST API Open API key (build 1.0.34+, early access) — required for upload/tags/notes/custom-fields/skip-trace/phone-tags/`discover_presets()`

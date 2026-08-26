@@ -130,7 +130,7 @@ async def upload_to_datasift(
     """Upload a DataSift-formatted CSV entirely over the REST API — no browser
     for creation. Same signature/return shape as the Playwright-only original
     (upload_to_datasift_playwright) so daily --upload-datasift, dropbox-watch,
-    and skip-and-score-upload need no call-site changes.
+    and `skip-trace --create` need no call-site changes.
 
     Flow:
       1. bulk_create_properties() in chunks  — the ONLY creation path that
@@ -283,24 +283,13 @@ async def upload_to_datasift(
     )
     logger.info(result["message"])
 
-    # ── 6. Enrich is the one step with no usable API route. ──
+    # ── 6. Enrich — scoped over the REST API as of 2026-08-26, no browser. ──
+    # This step used to launch Playwright because the enrich endpoint's
+    # scoping contract was unknown. It is now captured and enforced; see
+    # enrich_records() and datasift_api._enrich_body.
     if result["success"] and enrich:
-        eff_email = email or os.environ.get("DATASIFT_EMAIL", "")
-        eff_password = password or os.environ.get("DATASIFT_PASSWORD", "")
-        if not eff_email or not eff_password:
-            logger.warning("Skipping enrichment - DATASIFT_EMAIL/PASSWORD not set")
-        else:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=headless)
-                context = await browser.new_context(viewport={"width": 1280, "height": 900})
-                page = await context.new_page()
-                try:
-                    if await login(page, eff_email, eff_password):
-                        result["enrich_result"] = await enrich_records(page, csv_path)
-                    else:
-                        logger.warning("Skipping enrichment - DataSift login failed")
-                finally:
-                    await browser.close()
+        result["enrich_result"] = await enrich_records(None, csv_path)
+        logger.info("Enrich: %s", result["enrich_result"].get("message"))
 
     # Scoped over the REST API — no browser. `skip_trace` still defaults to
     # False because it is BILLED (prepaid credits, ~$0.12/owner) and the user's
@@ -1325,7 +1314,7 @@ async def _hard_reload_records(page: Page) -> None:
     "/records" (true for the whole duration of a long enrich/skip-trace run,
     since none of those actions change the URL), so it can never recover a
     degraded SPA client state. Confirmed live 2026-08-18: after ~58
-    consecutive select/act cycles in one skip-and-score-upload run (56
+    consecutive select/act cycles in one batch run (56
     enrich + a couple of skip trace attempts), the Records search input
     silently stopped existing in the DOM at all ("Could not find Records
     search box") for every remaining record — a single successful skip
@@ -1707,7 +1696,84 @@ def _read_csv_absentee_flags(csv_paths: list[Path]) -> dict[str, bool]:
     return flags
 
 
-async def enrich_records(page: Page, csv_path: str | Path | list[str | Path]) -> dict:
+async def enrich_records(page, csv_path: str | Path | list[str | Path], *,
+                         enrich_owner: bool = False,
+                         replace_owner: bool = False) -> dict:
+    """API-based enrichment -- same (page, csv_path) signature as
+    enrich_records_playwright(); `page` accepted but unused.
+
+    Migrated 2026-08-26. This module previously said an enrich endpoint
+    existed but could not be called safely because its trigger contract was
+    undocumented and an unscoped call enriched the whole account. That was
+    true, and it is now fixed rather than worked around: the real payload was
+    captured off DataSift's own web app with a Playwright route handler that
+    ABORTED the request, revealing that `properties` nests inside
+    `query.must` exactly like the skip-trace payload. See
+    datasift_api._enrich_body.
+
+    Scoping is enforced in datasift_api.enrich_properties(), which refuses an
+    empty property list outright and pre-flights the same scoped query through
+    the FREE skip-trace estimate -- if that reports more records than we asked
+    for, `properties` is not being honoured and nothing is sent.
+
+    Owner enrichment stays OFF by default. It replaces our contact with
+    DataSift's owner of record, which on a probate record swaps the personal
+    representative for the *deceased* owner. If it is ever wanted, scope it
+    per notice type -- ON for foreclosure/tax, never probate.
+    """
+    result: dict = {"success": False, "message": "", "enriched": [], "skipped": []}
+    rows = _read_csv_rows(csv_path)
+    if not rows:
+        result["message"] = f"No valid records found in {csv_path} - nothing to enrich"
+        return result
+
+    uuid_map = _load_uuid_map()
+    uuids, targets = [], []
+    for row in rows:
+        owner_last, street = _row_owner_street(row)
+        prop_uuid = uuid_map.get(_uuid_map_key(owner_last, street))
+        if not prop_uuid:
+            result["skipped"].append({"owner": owner_last, "street": street,
+                                      "reason": "no uuid in local map"})
+            continue
+        uuids.append(prop_uuid)
+        targets.append({"owner": owner_last, "street": street})
+
+    if not uuids:
+        result["message"] = "No resolvable records - nothing to enrich"
+        return result
+
+    try:
+        resp = _api.enrich_properties(
+            uuids, enrich_property=True,
+            enrich_owner=enrich_owner, replace_owner=replace_owner,
+            max_records=len(uuids),
+        ) or {}
+    except _api.DataSiftAPIError as e:
+        result["message"] = f"Enrich refused/failed: {e}"
+        logger.error("Enrich failed: %s", e)
+        result["skipped"].extend(targets)
+        return result
+
+    # The endpoint echoes how many records it scoped to. Treat a count that
+    # disagrees with what we asked for as a failure, not a detail -- that
+    # number is the only scope signal the call gives back.
+    count = resp.get("count")
+    if isinstance(count, int) and count != len(uuids):
+        result["message"] = (f"Enrich scope mismatch: asked for {len(uuids)}, "
+                             f"endpoint reported {count}")
+        logger.error(result["message"])
+        result["skipped"].extend(targets)
+        return result
+
+    result["enriched"] = targets
+    result["success"] = True
+    result["message"] = f"Enriched {len(targets)} record(s) via API (count={count})"
+    logger.info(result["message"])
+    return result
+
+
+async def enrich_records_playwright(page: Page, csv_path: str | Path | list[str | Path]) -> dict:
     """Enrich uploaded records with DataSift's SiftMap property data.
 
     Processes one record at a time: search for it by owner + address, verify

@@ -1156,7 +1156,7 @@ def build_datasift_csv_from_template(
 
     This is the reusable version of the CSV-building step that was
     previously hand-written inline for every trial run in the 2026-08-13/14
-    session — see the skip-and-score-upload CLI mode in main.py.
+    session -- see the `skip-trace --create` CLI mode in main.py.
 
     Args:
         template_rows: rows from the raw template, each with at least
@@ -1172,7 +1172,7 @@ def build_datasift_csv_from_template(
             representative for this owner — the record is still built and
             uploaded (tagged "deceased", Owner Deceased=yes, and flagged in
             Notes/Message Board) but is never given phone/email data here,
-            and the caller (see skip-and-score-upload in main.py) must also
+            and the caller (see `skip-trace --create` in main.py) must also
             exclude it from Tracerfy and DataSift's own skip trace.
         notice_type: e.g. "foreclosure" — drives the Lists column via
             NOTICE_TYPE_TO_LIST and gets tagged directly.

@@ -61,10 +61,14 @@ THE CREATION RULE, settled by single-variable tests 2026-08-21:
   list/search surface is. This module's history is a chain of confident
   conclusions drawn from exactly that insufficient evidence.
 
-  Third mount warning: bare `POST /property/` — what Ty's datasift_api_upload.py
-  uses — returns 403 on this account for GET, OPTIONS and POST alike, under
-  both auth schemes including a super-admin key. Not a role ceiling and not
-  fixable by switching seats; that mount is simply not available here.
+  Third mount warning: bare `POST /property/` returns 403 on this account for
+  GET, OPTIONS and POST alike, under both auth schemes including a super-admin
+  key, while /api/internal/property/ returns 200 on the same credentials.
+  Not a role ceiling and not fixable by switching seats; that mount is simply
+  not available here. Re-verified live 2026-08-26. It is worth knowing because
+  Ty's upstream uploader creates against it, so that script cannot run as-is
+  here — a copy of it used to live at src/datasift_api_upload.py and was
+  removed as dead weight; re-fetch from his repo if it ever needs diffing.
 """
 
 import json as _json

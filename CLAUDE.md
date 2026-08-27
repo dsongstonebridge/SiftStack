@@ -253,6 +253,37 @@ DataSift.ai (formerly REISift) is the CRM where scraped records land for niche s
 
 **Domain:** `app.reisift.io` (NOT `app.datasift.ai`). Core API at `apiv2.reisift.io`, SiftMap API at `map.reisift.io`.
 
+### THE RULE (settled 2026-08-26 — do not re-litigate)
+
+**One pipeline. API only. `python src/main.py skip-trace`** (add `--create`
+when the records don't exist yet). Dry run by default; `--commit` is the spend
+gate.
+
+- **Never use `skip-and-score-upload`.** It no longer exists — mode, handler,
+  dispatch and args were all removed. It was the user's own earlier code,
+  written before they received Tyler Austin's, and it applied **no phone
+  source tags**. Do not resurrect it or hand-assemble its steps.
+- **Never reach for Playwright for upload, create, enrich, skip trace, phone
+  read, scoring, or tagging.** All of it is API. `enrich_records()` is API as
+  of 2026-08-26 (`enrich_records_playwright()` is a rollback, not a fallback
+  to prefer). If a browser opens during a batch run, something is wrong —
+  investigate rather than accept it.
+- **The only remaining Playwright surfaces** are the **Sequence builder** (no
+  API exists anywhere in the 323-path spec) and **SiftMap sold-tagging**
+  (request body undocumented). Neither is part of the record pipeline. Saying
+  "API only" refers to the pipeline; these two are genuinely unavailable over
+  the API, not a shortcut being taken.
+- **"Inherited" means Tyler Austin AND Ty**, and both are in active use:
+  the trace/score/tag pipeline (`skip_trace_agent`) is adapted from Tyler
+  Austin's FCRE skip-trace-agent; `find_property_by_address()` and
+  dry-run-by-default come from his `crm_api.py`; the enrich toggle policy is
+  Ty's `run_enrich_lists.py`; `lists`-as-a-bare-string is Ty's uploader.
+- **Never delete anything sourced from Ty** — not when unimported, not when
+  its endpoint 403s here, not when a cleanup pass flags it as dead weight.
+  `src/datasift_api_upload.py` was deleted once on 2026-08-26 and had to be
+  restored. Reference copies stay byte-identical; adaptations live elsewhere.
+
+
 ### Key Files
 - `src/datasift_formatter.py` — Transforms `NoticeData` → DataSift CSV (76 columns) and, via `build_api_payload()`, the REST API's create-property payload shape
 - `src/datasift_api.py` — REST API client (Open API key auth): properties, owners/phones, tags, lists, notes, custom fields, skip trace, phone tags, filter presets, SiftMap
@@ -568,22 +599,21 @@ python src/main.py daily --deep-heirs               # resolve deceased-owner hei
 
 ### Single-Command Pipeline: `skip-trace --create` (build 1.0.35+)
 
-Runs the full raw-CSV-to-scored-and-tagged pipeline in one command: Tracerfy skip trace → DataSift upload/enrich/skip-trace → phone read → Trestle scoring → tag push. Built from the manual trial-run pipeline proven live in the 2026-08-13/14 session; every step reuses the same functions (`upload_to_datasift()`, `read_record_phone_numbers()`, `run_phone_validation()`, `upload_phone_tags()`), not a reimplementation. As of build 1.0.34, `upload_to_datasift()`, `skip_trace_records()`, `read_record_phone_numbers()`, and `upload_phone_tags()` are the REST API versions — same functions, same signatures, same per-record safety discipline (no bulk selection, exact-match lookup before any write), now backed by direct API calls instead of Playwright clicks. `enrich_records()` is also the REST API version as of 2026-08-26, so this pipeline no longer launches a browser at all.
+**THIS IS THE ONLY DataSift pipeline. There is no other one to reach for.** Runs raw-CSV-to-scored-and-tagged in one command: create (bulk-create + petition notes + custom fields + lists) → API enrich → Tracerfy → DataSift skip trace → Trestle scoring → phone tags (source + tier) → Message Board. **Dry run by default; `--commit` is the spend gate.** Drop `--create` when the records already exist in the CRM. Built from the manual trial-run pipeline proven live in the 2026-08-13/14 session; every step reuses the same functions (`upload_to_datasift()`, `read_record_phone_numbers()`, `run_phone_validation()`, `upload_phone_tags()`), not a reimplementation. As of build 1.0.34, `upload_to_datasift()`, `skip_trace_records()`, `read_record_phone_numbers()`, and `upload_phone_tags()` are the REST API versions — same functions, same signatures, same per-record safety discipline (no bulk selection, exact-match lookup before any write), now backed by direct API calls instead of Playwright clicks. `enrich_records()` is also the REST API version as of 2026-08-26, so this pipeline no longer launches a browser at all.
 
 ```bash
-# Estimate only (Tracerfy cost, no spend, no DataSift contact)
-python src/main.py skip-and-score-upload --csv-path "Property Records.xlsx" --estimate
+# Estimate only — free, no CRM contact
+python src/main.py skip-trace --csv-path "Property Records.xlsx" --create --estimate
 
-# Full run — Tracerfy never prompts (cost is per-record and known upfront); Trestle only
-# pauses for confirmation if some record comes back with >12 phone numbers (likely a
-# common-name mismatch / data-quality issue), otherwise it also proceeds automatically
-python src/main.py skip-and-score-upload --csv-path "Property Records.xlsx" --notice-type foreclosure --county Tulsa
+# DRY RUN (the default) — creates + enriches (both unmetered), then prints exactly
+# what it WOULD trace/score/tag and the total spend. Bills nothing.
+python src/main.py skip-trace --csv-path "Property Records.xlsx" --create     --notice-type foreclosure --county Tulsa
 
-# Force fully unattended (bypasses even the >12-phones Trestle confirmation)
-python src/main.py skip-and-score-upload --csv-path "Property Records.xlsx" --yes
+# The real run. SPENDS MONEY — ask the user first.
+python src/main.py skip-trace --csv-path "Property Records.xlsx" --create --commit     --notice-type foreclosure --county Tulsa
 
-# Mark a batch as a test run (tagged/noted so it's easy to find and distinguish from real leads)
-python src/main.py skip-and-score-upload --csv-path "Property Records.xlsx" --trial-tag "Pipeline_Trial_2026-08-14"
+# Mark a batch as a test run (tagged/noted so it's easy to distinguish from real leads)
+python src/main.py skip-trace --csv-path "Property Records.xlsx" --create --commit     --trial-tag "Pipeline_Trial_2026-08-14"
 ```
 
 Input file: a raw property-upload-template `.xlsx` or `.csv` with columns `Property Street, Property City, Property State, Property Zip, First Name, Last Name[, Record Link]` — no phone numbers, no DataSift formatting. Blank template rows (these ship as fixed-size sheets, e.g. 300 rows with only a couple filled in) are skipped automatically.
@@ -592,7 +622,9 @@ Input file: a raw property-upload-template `.xlsx` or `.csv` with columns `Prope
 
 **Consolidated 2026-08-26.** `skip-and-score-upload` is GONE — it carried a
 second, weaker implementation of the trace/score/tag half that applied **no
-phone source tags** and posted **no Message Board** entry. Only its
+phone source tags** (it DID post the petition Message Board entry — an earlier
+claim that it did not was wrong; it skipped only `writeback()`'s one-line phone
+summary). Only its
 create/format/enrich half was worth keeping; that is now
 `_create_records_for_batch()` behind `skip-trace --create`, and everything
 after creation is `skip_trace_agent.run_pipeline()` — one implementation.

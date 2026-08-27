@@ -525,6 +525,29 @@ A full record through the whole pipeline costs roughly **$0.15–$0.20**.
   Playwright with `route.abort()` reads the real contract without submitting
   anything. That is how the scoped skip-trace payload was found, after the spec,
   the OPTIONS schema and the reference implementation all failed to reveal it.
+- **A check over zero items is not a pass.** Assert a non-zero denominator
+  before reporting success. On 2026-08-26 a verifier read `owners` (a list)
+  when the real shape is `owner` (a dict), found 0 phones, and printed "no tier
+  mismatches" and "every number carries a source tag" — both vacuously true and
+  both read as green. Dump one real object and confirm the keys before trusting
+  any reader you just wrote.
+- **Never assert an absence you did not look for.** "No Message Board posts"
+  and "no source tags" were inferred from a code path, not read off a record.
+  The Message Board posts existed and were rich. Read the object, or say you
+  have not checked.
+- **A settled-sounding note here may be an unfinished investigation.** "Enrich
+  must not be called blind" read like a wall for five days; it was an open
+  question, and one `route.abort()` capture answered it. Check the evidence
+  class before inheriting a conclusion: "captured live", "verified 3/3", "with
+  a control" is a finding. "risks", "unknown", "do not" is a to-do.
+- **Fix the class, then re-grep.** After renaming or deleting a command,
+  search the CLI, dispatch, argparse, docstrings, CLAUDE.md, memory **and
+  `.claude/skills/*/SKILL.md`** — skills chain into commands and fail silently.
+  Deleting `skip-and-score-upload` left four live invocations in CLAUDE.md and
+  a skill that would have died on argparse after doing all its OCR work.
+- **Before saying "done" or "confirmed", run the search that would prove you
+  wrong.** Each time the user asked "are you sure?" on 2026-08-26, there was
+  more. Go look first.
 
 ### REST API (build 1.0.34+, live 2026-08-19)
 

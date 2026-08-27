@@ -253,6 +253,29 @@ DataSift.ai (formerly REISift) is the CRM where scraped records land for niche s
 
 **Domain:** `app.reisift.io` (NOT `app.datasift.ai`). Core API at `apiv2.reisift.io`, SiftMap API at `map.reisift.io`.
 
+### The daily foreclosure run
+
+"Do the daily foreclosure run" / "process the new petitions" is a standing,
+self-contained request — don't ask which folder or which command:
+
+1. New scanned petition PDFs land in `Desktop\Foreclosure pdfs`. **No text
+   layer** — OCR at 300dpi (`image_utils.ocr_page`, psm 4) for the body, and a
+   higher-res page-1 crop (400-600dpi, psm 6/11) for the stamped case number
+   and file date. The body is the first ~5 pages; the property address, monthly
+   payment and mortgage doc number often appear only in the Note/Mortgage
+   exhibits after it.
+2. `petition-info-extraction` skill → `output/petition_batch.xlsx`
+   (28 columns, fresh per batch, never appended).
+3. `python src/main.py skip-trace --csv-path "output/petition_batch.xlsx"
+   --create --notice-type foreclosure --county Tulsa` — **a dry run**. Report
+   the estimate, ask before `--commit`.
+4. Verify by reading records back: tags by TITLE, tiers against Trestle's own
+   `assigned_tag`.
+
+Each record ends up in the CRM, API-enriched, with grouped petition detail in
+Notes *and* Message Board, double skip traced, every number scored with a dial
+tier and an honest source tag. ~$0.21/record.
+
 ### THE RULE (settled 2026-08-26 — do not re-litigate)
 
 **One pipeline. API only. `python src/main.py skip-trace`** (add `--create`

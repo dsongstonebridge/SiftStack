@@ -262,7 +262,7 @@ uploaded to the CRM and nothing has been skip traced.** Only the orchestration
 | Probate Notes / Message Board | `_PROBATE_SECTIONS`, `_NOTES_SECTION_SETS`, `_signing_chain_block()` | signing chain + mailing address |
 | Trace at the person's address | `resolve_subjects()` -> `trace_*` | probate never falls back to the property |
 | Repeat-PR dedupe | `tracerfy_source()` | billed once, credited to every record |
-| **The chain** | — | **NOT BUILT** |
+| **The chain** | `_create_records_for_batch()` | enrich -> buy box -> review, all before creation |
 
 **The skill's column list and `_PROBATE_SECTIONS` must stay in sync.** A field
 in one and not the other is extracted and then silently dropped — same trap as
@@ -407,8 +407,9 @@ grandchild-heir lives in the estate property. Artifacts in
 
 ### Known gaps
 
-1. **The chain is not built** — no code path wires PDFs -> extract -> gates ->
-   assessor -> review -> CSV -> create. Each link works; nothing orchestrates them.
+1. **Never run live.** The chain is built and tested against the real Tulsa
+   batch with the upload stubbed, but no probate record has ever been created
+   or traced.
 2. Multi-parcel estates: parcels with no situs address ride on the addressed
    record as `additional_parcels`; `output/probate_template_SAMPLE.csv` still
    wrongly assumes one row per case.

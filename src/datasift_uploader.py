@@ -181,8 +181,12 @@ async def upload_to_datasift(
 
     # ── 1. Create, in bulk. The only path that reaches the CRM's index. ──
     def _addr_key(payload: dict) -> str:
+        # Must be _api.address_key — the SAME function wait_for_properties
+        # keys its results with. This was a second, bare-lower() copy, and the
+        # two drifted: a server-side address rewrite made a real, indexed
+        # record look like it had never been created (2026-08-31).
         a = payload["address"]
-        return f"{(a.get('street') or '').strip().lower()}|{(a.get('city') or '').strip().lower()}"
+        return _api.address_key(a.get("street"), a.get("city"))
 
     create_records = [
         {k: v for k, v in payload.items()

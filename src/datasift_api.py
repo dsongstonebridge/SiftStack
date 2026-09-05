@@ -351,10 +351,29 @@ _STREET_ABBR = {
 _STREET_SUFFIXES = {"ST", "AVE", "DR", "RD", "PL", "LN", "CT", "BLVD", "CIR",
                     "TER", "PKWY", "TRL", "HWY", "WAY", "LOOP", "PT", "RUN"}
 
+#: Trailing directionals the server sometimes drops on write. Only ever used
+#: for a LAST-RESORT unique match — in Tulsa "E 56th St S" and "E 56th St N"
+#: are different streets, so these must never be collapsed silently.
+_DIRECTIONALS = {"N", "S", "E", "W", "NE", "NW", "SE", "SW"}
+
 
 def _norm_street(street: str) -> str:
     toks = re.sub(r"[^\w\s]", " ", (street or "").upper()).split()
     return " ".join(_STREET_ABBR.get(t, t) for t in toks)
+
+
+def address_key(street: str, city: str) -> str:
+    """The canonical "street|city" key for matching an address we SENT against
+    one the server STORED.
+
+    Must be the single definition. wait_for_properties() builds its result
+    keys with this, and callers index into that result with it; when the two
+    were separate copies they drifted into a bare lower() on one side, and a
+    server-side rewrite ("11300 N 118th E Ave" stored as "11300 N 118Th East
+    Ave") then read as "the record was never created" — through a full
+    timeout and a pointless retry. Verified live 2026-08-31.
+    """
+    return f"{_norm_street(street)}|{(city or '').strip().lower()}"
 
 
 def _strip_suffix(normalized: str) -> str:
@@ -417,6 +436,48 @@ def find_property_by_address(street: str, city: str = "", state: str = "") -> di
                          "by ignoring the street suffix (server corrected it)",
                          street, stored)
             return _pick_best(loose)
+
+        # Tier 3 — the server also DROPS a trailing directional: sent
+        # "1752 E 56th St S", stored "1752 E 56Th St" (verified live
+        # 2026-09-04). _strip_suffix does not help, because the trailing token
+        # is a direction, not a street type.
+        #
+        # This is deliberately the most conservative tier. In Tulsa
+        # "E 56th St S" and "E 56th St N" are DIFFERENT streets, so collapsing
+        # the directional can genuinely point at the wrong property. It is
+        # therefore only accepted when it resolves to exactly ONE candidate —
+        # with two, there is no way to tell which was meant, and guessing
+        # would put notes, tags and skip-trace spend on someone else's record.
+        def _strip_dir(normalized: str) -> str:
+            toks = normalized.split()
+            if len(toks) > 2 and toks[-1] in _DIRECTIONALS:
+                toks = toks[:-1]
+            return " ".join(toks)
+
+        # Order matters: directional FIRST, then street type. Reversed, the
+        # sent "1752 E 56TH ST S" keeps its "ST" (the trailing token is "S",
+        # not a street type, so _strip_suffix is a no-op) while the stored
+        # "1752 E 56TH ST" loses it — and the two never line up.
+        def _bare(n: str) -> str:
+            return _strip_suffix(_strip_dir(n))
+
+        want_nd = _bare(want)
+        cands = [r for r in results
+                 if _bare(_norm_street((r.get("address") or {}).get("street"))) == want_nd
+                 and city_ok(r.get("address") or {})]
+        if len(cands) == 1:
+            stored = (cands[0].get("address") or {}).get("street")
+            logger.info("find_property_by_address: matched %r to stored %r by "
+                         "ignoring a trailing directional (server dropped it); "
+                         "accepted because it was the only candidate",
+                         street, stored)
+            return cands[0]
+        if len(cands) > 1:
+            logger.warning(
+                "find_property_by_address: %r matches %d records once a "
+                "trailing directional is ignored (%s) — refusing to guess",
+                street, len(cands),
+                [(r.get("address") or {}).get("street") for r in cands[:4]])
     return None
 
 
@@ -592,10 +653,18 @@ def wait_for_properties(addresses: list[tuple[str, str]], *,
     result feeds subsequent per-uuid writes on an address that may have
     existed before.
     """
-    def norm(s: str, c: str) -> str:
-        return f"{(s or '').strip().lower()}|{(c or '').strip().lower()}"
+    # address_key(), not a bare lower(): the server rewrites abbreviations on
+    # write in BOTH directions. "11300 N 118th E Ave" came back "11300 N
+    # 118Th East Ave" (expansion), which a raw case-fold compare misses — it
+    # read as "never indexed" for the full timeout, twice, on a record that
+    # was in fact created and visible. The docstring above always claimed this
+    # normalization; the code did not do it. Confirmed live 2026-08-31.
+    norm = address_key
 
-    remaining = {norm(s, c) for s, c in addresses}
+    # Keep the caller's original wording for each key — the fallback lookup
+    # below needs a real street/city, not the normalized form.
+    original: dict[str, tuple[str, str]] = {norm(s, c): (s, c) for s, c in addresses}
+    remaining = set(original)
     found: dict[str, dict] = {}
     if not remaining:
         return found
@@ -622,6 +691,31 @@ def wait_for_properties(addresses: list[tuple[str, str]], *,
             remaining.discard(key)
         if not remaining:
             logger.info("wait_for_properties: all %d record(s) indexed", len(found))
+            return found
+        if time.monotonic() >= deadline:
+            # Before reporting a miss: the scan above reads the newest N by
+            # -created, so it structurally CANNOT see a record that already
+            # existed from an earlier run — bulk-create leaves such an address
+            # alone, and it never surfaces near the top of a -created listing.
+            # find_property_by_address searches by house number instead, so it
+            # finds those. Read-only: unlike the duplicate-400 trick it never
+            # creates anything on a miss, so it is safe on an address that may
+            # genuinely not exist. Hit live 2026-08-31 on a record carried over
+            # from a 2026-08-18 upload.
+            for key in sorted(remaining):
+                street, city = original[key]
+                try:
+                    hit = find_property_by_address(street, city)
+                except DataSiftAPIError:
+                    continue
+                if hit:
+                    logger.info("wait_for_properties: %r resolved by address "
+                                 "lookup (pre-existing record, not in the "
+                                 "newest-%d page)", street, page)
+                    found[key] = hit
+                    remaining.discard(key)
+        if not remaining:
+            logger.info("wait_for_properties: all %d record(s) resolved", len(found))
             return found
         if time.monotonic() >= deadline:
             logger.warning("wait_for_properties: %d of %d not indexed after %.0fs: %s",

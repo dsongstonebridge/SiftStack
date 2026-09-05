@@ -12,10 +12,13 @@ extended with additional fallbacks for the Tulsa Assessor's name format.
 """
 
 import asyncio
+import json
 import logging
 import re
+import urllib.parse
 from typing import Optional
 
+import requests
 from playwright.async_api import Page, async_playwright
 
 from notice_parser import NoticeData
@@ -23,6 +26,177 @@ from notice_parser import NoticeData
 logger = logging.getLogger(__name__)
 
 ASSESSOR_SEARCH_URL = "https://assessor.tulsacounty.org/Property/Search?terms={terms}&filterTag=null"
+
+_HTTP_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"),
+}
+#: The embedded grid data is JavaScript, not JSON — `new Date(1, 0, 1)` literals
+#: appear inside it and make json.loads fail at a confusing char offset.
+_JS_DATE_RE = re.compile(r"new Date\([^)]*\)")
+
+
+def _extract_grid_records(html: str) -> list[dict]:
+    """Pull the DevExpress dxDataGrid `dataSource` array out of a search page.
+
+    The Assessor renders results into a JS grid, NOT an HTML table — a
+    BeautifulSoup `<table>` parse finds ZERO rows on a page holding thousands
+    of records, which reads exactly like "no results". Verified live
+    2026-09-02.
+
+    Several `"data":[` arrays exist on the page; only one holds property
+    records, so pick by looking for AccountNo nearby. The others are arrays of
+    plain strings and will parse into a list of `str`.
+    """
+    start = -1
+    for m in re.finditer(r'"data":\[', html):
+        cand = m.end() - 1
+        if "AccountNo" in html[cand:cand + 3000]:
+            start = cand
+            break
+    if start < 0:
+        return []
+
+    depth, in_str, esc = 0, False, False
+    for j in range(start, len(html)):
+        ch = html[j]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(_JS_DATE_RE.sub("null", html[start:j + 1]))
+                except (ValueError, TypeError) as e:
+                    logger.warning("assessor: grid JSON parse failed: %s", e)
+                    return []
+    return []
+
+
+def search_assessor(terms: str, *, timeout: int = 60) -> list[dict]:
+    """Search the Tulsa County Assessor over plain HTTP. No browser needed.
+
+    `terms` accepts an owner name ("FULTON, JOHNNIE SR"), a street address, a
+    parcel/account number, or a subdivision name ("SUBURBAN ACRES") — all are
+    really searched server-side. Confirmed with a gibberish control returning
+    zero, so a zero here is a REAL zero, unlike the treasurer's list API whose
+    `search[value]` is silently ignored.
+
+    Name format matters: "FULTON, JOHNNIE SR" (comma + suffix) returns the one
+    exact parcel, while "FULTON JOHNNIE" returns a broader set. Try several.
+
+    Returns the raw grid records. Useful keys: AccountNo, FullPropertyStreet,
+    PropertyCity, PropertyZipCode, FullPrimaryOwnerName, OwnerName1/2,
+    SubdivisionName, Section, Township, Range.
+
+    NOTE the chain-of-deaths trap: a decedent who held only an undivided
+    interest in an unprobated parent estate has NO record in their own name and
+    this returns a true zero. That is not evidence of "no real property" —
+    search the root owner (the earlier decedent), the surviving spouse, and the
+    PR before concluding anything.
+    """
+    url = ASSESSOR_SEARCH_URL.format(terms=urllib.parse.quote(terms))
+    try:
+        resp = requests.get(url, headers=_HTTP_HEADERS, timeout=timeout)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        logger.warning("assessor: search failed for %r: %s", terms, e)
+        return []
+    recs = [r for r in _extract_grid_records(resp.text)
+            if isinstance(r, dict) and r.get("AccountNo")]
+    logger.info("assessor: %r -> %d parcel(s)", terms, len(recs))
+    return recs
+
+
+ASSESSOR_INFO_URL_HTTP = "https://assessor.tulsacounty.org/Property/Info?accountNo={}"
+
+#: The Assessor's parcel page states this verbatim when a parcel carries no
+#: structure. Verified 2026-09-04 against a control parcel that DOES have a
+#: house (which instead renders an Improvements table with a "Yr Blt" column).
+_NO_IMPROVEMENTS = "This property has no improvements"
+
+
+def get_parcel_improvements(account_no: str, *, timeout: int = 60) -> Optional[dict]:
+    """Is there actually a building on this parcel?
+
+    Returns {"has_improvements", "is_vacant_lot", "land_value", "year_built"}
+    or None if the page could not be read.
+
+    Bare land is excluded from the CRM by policy — the user buys houses, not
+    lots — but every excluded lot must still be REPORTED, because it is a real
+    asset of the estate and affects what the whole estate is worth. Never drop
+    one silently.
+
+    Note that a parcel can have a perfectly good street address and still be
+    vacant, so address presence is NOT a proxy for this. Check it directly.
+    """
+    url = ASSESSOR_INFO_URL_HTTP.format(account_no.strip())
+    try:
+        resp = requests.get(url, headers=_HTTP_HEADERS, timeout=timeout)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        logger.warning("assessor: improvements lookup failed for %s: %s", account_no, e)
+        return None
+
+    text = re.sub(r"<[^>]+>", " ", resp.text)
+    text = re.sub(r"\s+", " ", text)
+    has_impr = _NO_IMPROVEMENTS.lower() not in text.lower()
+
+    land_value = None
+    m = re.search(r"Land Value\s*\$?([\d,]+)", text)
+    if m:
+        try:
+            land_value = int(m.group(1).replace(",", ""))
+        except ValueError:
+            pass
+    year_built = None
+    m = re.search(r"Yr Blt\s*(\d{4})", text)
+    if m:
+        year_built = int(m.group(1))
+
+    return {
+        "has_improvements": has_impr,
+        "is_vacant_lot": not has_impr,
+        "land_value": land_value,
+        "year_built": year_built,
+    }
+
+
+def get_parcel_situs(account_no: str, *, timeout: int = 60) -> Optional[dict]:
+    """Street address for one parcel, by account number.
+
+    Returns {"street", "city", "zip", "owner", "subdivision"} or None.
+
+    Many estate parcels legitimately have NO situs address — vacant or
+    unplatted lots the county never assigned one to. Verified 2026-09-04
+    against a control parcel that does have one, so a blank here is a real
+    absence, not a parse failure. There is no lookup that will invent a street
+    address the county has not issued: attach such parcels to the estate's
+    addressed record instead of creating a record keyed on a parcel number.
+    """
+    recs = search_assessor(account_no.strip(), timeout=timeout)
+    for r in recs:
+        if (r.get("AccountNo") or "").strip().upper() == account_no.strip().upper():
+            street = (r.get("FullPropertyStreet") or "").strip()
+            return {
+                "street": street,
+                "city": (r.get("PropertyCity") or "").strip(),
+                "zip": (r.get("PropertyZipCode") or "").strip()[:5],
+                "owner": (r.get("FullPrimaryOwnerName") or "").strip(),
+                "subdivision": (r.get("SubdivisionName") or "").strip(),
+                "has_street_address": bool(street),
+            }
+    return None
 
 _STREET_SUFFIXES = frozenset({
     "AV", "AVE", "BLVD", "CIR", "CT", "DR", "HWY", "LN", "PKWY",

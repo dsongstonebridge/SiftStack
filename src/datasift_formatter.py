@@ -109,6 +109,11 @@ DATASIFT_COLUMNS = [
     "Entity Contact Role",
 ]
 
+#: Membership test for the template->CSV pass-through in
+#: build_datasift_csv_from_template(). A template column whose name matches a
+#: real DataSift column lands in that column instead of being discarded.
+_DATASIFT_COLUMN_SET = frozenset(DATASIFT_COLUMNS)
+
 
 def _format_date(iso_date: str) -> str:
     """Convert YYYY-MM-DD to M/D/YYYY."""
@@ -1054,16 +1059,59 @@ _PETITION_SECTIONS: list[tuple[str, list[str]]] = [
     ]),
 ]
 
+#: Probate filing sections (OSCN Tulsa PB cases). Mirrors _PETITION_SECTIONS
+#: but for the probate document set: petition / order appointing PR / general
+#: inventory. Kept separate rather than merged so a probate record never
+#: renders a foreclosure heading and vice versa.
+#:
+#: Field names here MUST match the column names the probate extraction step
+#: emits, exactly as _PETITION_SECTIONS must match petition-info-extraction's.
+#: A field added on one side and not the other is extracted then silently
+#: dropped.
+_PROBATE_SECTIONS: list[tuple[str, list[str]]] = [
+    ("CASE", [
+        "Case Number", "Court County", "Date Filed", "Judge", "Attorney",
+    ]),
+    ("DECEDENT", [
+        "Decedent Name", "Date of Death", "Decedent Age", "Decedent Residence",
+        "Testate", "Marital Status",
+    ]),
+    ("ESTATE", [
+        "Real Property Stated", "Estate Value", "Inventory Waived",
+        "Legal Description", "Additional Parcels",
+    ]),
+    ("REPRESENTATIVE", [
+        "Personal Representative", "PR Relationship", "PR Address",
+        "Co-Administrators",
+    ]),
+    ("HEIRS", [
+        "Heir Count", "Heirs", "Heirs Deceased", "Heirs Address Unknown",
+    ]),
+]
+
+#: notice_type -> (heading, sections). Anything not listed falls back to the
+#: foreclosure petition shape, which is what plain property templates used
+#: before probate existed.
+_NOTES_SECTION_SETS: dict[str, tuple[str, list[tuple[str, list[str]]]]] = {
+    "foreclosure": ("FORECLOSURE PETITION", _PETITION_SECTIONS),
+    "probate":     ("PROBATE FILING",       _PROBATE_SECTIONS),
+}
+
 #: Flat list, kept for callers that just want to know which columns are
 #: petition-derived (e.g. deciding whether a row has petition data at all).
 _PETITION_INFO_FIELDS = [f for _, fields in _PETITION_SECTIONS for f in fields]
 
 
-def _format_petition_notes(rec: dict) -> str:
-    """Format the petition-info-extraction skill's extra columns (if present
-    in this row) into a single Notes-appendable string. Returns "" if none
-    of those columns are present/populated — plain property-template rows
-    (no petition data) are unaffected."""
+def _format_petition_notes(rec: dict, notice_type: str = "foreclosure") -> str:
+    """Format a source document's extra columns (if present in this row) into a
+    single Notes-appendable string. Returns "" if none of those columns are
+    present/populated — plain property-template rows (no document data) are
+    unaffected.
+
+    `notice_type` selects the heading and section list. A probate record must
+    never be labelled "FORECLOSURE PETITION"; that happened on every probate
+    row in the 2026-09-02 batch preview because this function had one
+    hardcoded heading."""
 
     def _fmt_date(v) -> str:
         if v is None or v == "":
@@ -1106,8 +1154,11 @@ def _format_petition_notes(rec: dict) -> str:
         "Initial Interest Rate": _fmt_rate,
     }
 
+    doc_heading, doc_sections = _NOTES_SECTION_SETS.get(
+        (notice_type or "").strip().lower(), _NOTES_SECTION_SETS["foreclosure"])
+
     sections: list[str] = []
-    for heading, fields in _PETITION_SECTIONS:
+    for heading, fields in doc_sections:
         lines = []
         for field in fields:
             if field not in rec:
@@ -1121,7 +1172,7 @@ def _format_petition_notes(rec: dict) -> str:
     if not sections:
         return ""
 
-    note = "FORECLOSURE PETITION\n" + "\n\n".join(sections)
+    note = doc_heading + "\n" + "\n\n".join(sections)
 
     # Underwriting flag worth surfacing, not buried in the figures: when the
     # balance owed exceeds the original loan, arrears have been capitalized
@@ -1197,6 +1248,9 @@ def build_datasift_csv_from_template(
     list_name = NOTICE_TYPE_TO_LIST.get(notice_type, notice_type.title())
 
     rows = []
+    skipped_rows: list[dict] = []      # rows that cannot become a CRM record
+    missing_mailing: list[str] = []    # built, but with no mailing address
+    passed_through: set[str] = set()   # template columns landed in real fields
     for rec in template_rows:
         street = (rec.get("Property Street") or "").strip()
         city = (rec.get("Property City") or "").strip()
@@ -1206,6 +1260,18 @@ def build_datasift_csv_from_template(
         last = (rec.get("Last Name") or "").strip()
         source_url = (rec.get("Record Link") or "").strip()
         if not (street and last):
+            # Never drop a row silently. Three real estate parcels vanished
+            # without a log line in the 2026-09-02 probate preview (an
+            # unplatted Fulton tract and two adjacent Berry lots) purely
+            # because probate gives a legal description and no street address.
+            # Losing an asset quietly is the worst failure mode here.
+            skipped_rows.append({
+                "reason": "no Property Street" if not street else "no Last Name",
+                "case": str(rec.get("Case Number") or "").strip(),
+                "parcel": str(rec.get("Parcel ID") or "").strip(),
+                "legal": str(rec.get("Legal Description") or "").strip()[:80],
+                "owner": f"{first} {last}".strip(),
+            })
             continue
 
         # "Owner Alive" is an optional column from the petition-info-extraction
@@ -1229,10 +1295,33 @@ def build_datasift_csv_from_template(
         emails = [(t.get(k) or "").strip() for k in EMAIL_FIELDS]
         emails = [e for e in emails if e][:5]
 
-        mail_street = (t.get("mail_address") or "").strip() or street
-        mail_city = (t.get("mail_city") or "").strip() or city
-        mail_state = (t.get("mail_state") or "").strip() or state
-        mail_zip = (t.get("mail_zip") or "").strip() or zip_code
+        # Mailing address. Trust order, highest first:
+        #   1. an explicit mailing address carried on the template row (for
+        #      probate this is the PR's address off the court filing — the
+        #      address the COURT itself mails to, i.e. the best one there is)
+        #   2. skip-trace vendor data
+        #   3. the property address
+        #
+        # Step 3 is right for foreclosure (the owner usually lives there) and
+        # WRONG for probate: the PR rarely lives in the decedent's house. In
+        # the 2026-09-02 preview all five probate rows inherited the property
+        # address, which would have mailed Tyler Castellanos in Tulsa when he
+        # lives in San Antonio, and mailed Jennifer Faulk at a house occupied
+        # by her nephew. So probate never falls back to the property.
+        tmpl_mail_street = (rec.get("Mailing Street") or rec.get("Owner Mailing Street") or "").strip()
+        tmpl_mail_city = (rec.get("Mailing City") or rec.get("Owner Mailing City") or "").strip()
+        tmpl_mail_state = (rec.get("Mailing State") or rec.get("Owner Mailing State") or "").strip()
+        tmpl_mail_zip = str(rec.get("Mailing Zip") or rec.get("Owner Mailing Zip") or "").strip()
+
+        mail_falls_back_to_property = notice_type.strip().lower() != "probate"
+        _prop_fallback = (street, city, state, zip_code) if mail_falls_back_to_property else ("", "", "", "")
+
+        mail_street = tmpl_mail_street or (t.get("mail_address") or "").strip() or _prop_fallback[0]
+        mail_city = tmpl_mail_city or (t.get("mail_city") or "").strip() or _prop_fallback[1]
+        mail_state = tmpl_mail_state or (t.get("mail_state") or "").strip() or _prop_fallback[2]
+        mail_zip = tmpl_mail_zip or (t.get("mail_zip") or "").strip() or _prop_fallback[3]
+        if not mail_street:
+            missing_mailing.append(f"{first} {last}".strip() or street)
         is_absentee = bool(mail_street) and mail_street.lower() != street.lower()
 
         tags = ["Courthouse Data", notice_type]
@@ -1259,7 +1348,13 @@ def build_datasift_csv_from_template(
                 "as a live contact). Needs deep prospecting / heir research "
                 "before any outreach."
             )
-        else:
+        elif t:
+            # Only claim a trace when one actually produced data for THIS row.
+            # This was unconditional, so every row in the 2026-09-02 probate
+            # preview asserted "Skip traced via Tracerfy." on a batch where
+            # nothing had been traced at all — a false statement written onto
+            # the record, and exactly the class of unearned claim that
+            # [[feedback-phone-source-tags-must-be-true]] exists to prevent.
             notes_parts.append("Skip traced via Tracerfy.")
 
         # Extra petition-info columns (from petition-info-extraction skill
@@ -1272,12 +1367,12 @@ def build_datasift_csv_from_template(
         # doesn't sync typed text the way a plain textarea would). Only adds
         # this block when the source file actually has these columns, so
         # plain property templates are unaffected.
-        petition_note = _format_petition_notes(rec)
+        petition_note = _format_petition_notes(rec, notice_type)
         if petition_note:
             notes_parts.append(petition_note)
 
         row = {c: "" for c in DATASIFT_COLUMNS}
-        row.update({
+        row_core = {
             "Property Street Address": street,
             "Property City": city,
             "Property State": state,
@@ -1297,7 +1392,25 @@ def build_datasift_csv_from_template(
             "Date Added": today,
             "Owner Deceased": "yes" if is_deceased_no_contact else "no",
             "Source URL": source_url,
-        })
+        }
+        row.update(row_core)
+        row_core_keys = row_core.keys()
+        # Pass through any template column whose name IS a DataSift column, so
+        # source data the caller already has lands in its real field instead of
+        # being dropped. Probate is the case that needed this: Personal
+        # Representative, Decedent Name, Parcel ID, Heir Count, Signing Chain
+        # *, Probate Open Date, Decision Maker and DM Relationship all exist as
+        # columns and all came out EMPTY on every row of the 2026-09-02
+        # preview, because only the scraper path (_build_row) ever populated
+        # them. Explicitly-set fields above always win — this never overwrites.
+        _explicit = set(row_core_keys)
+        for k, v in rec.items():
+            if k in _explicit or k not in _DATASIFT_COLUMN_SET:
+                continue
+            if str(v or "").strip() and not str(row.get(k) or "").strip():
+                row[k] = v
+                passed_through.add(k)
+
         for i, p in enumerate(phones, start=1):
             row[f"Phone {i}"] = p
         for i, e in enumerate(emails, start=1):
@@ -1315,6 +1428,28 @@ def build_datasift_csv_from_template(
         w.writerows(rows)
 
     logger.info("Wrote %d record(s) to %s", len(rows), output_path)
+
+    # Report what did NOT make it, loudly. A row silently vanishing is how
+    # three real parcels disappeared from the 2026-09-02 probate preview.
+    if skipped_rows:
+        logger.warning("DROPPED %d of %d template row(s) - NOT in the CSV:",
+                       len(skipped_rows), len(template_rows))
+        for s in skipped_rows:
+            detail = " ".join(
+                f"{k}={v}" for k, v in (
+                    ("case", s["case"]), ("parcel", s["parcel"]),
+                    ("owner", s["owner"]), ("legal", s["legal"]))
+                if v)
+            logger.warning("  - %s (%s)", s["reason"], detail or "no identifying data")
+        logger.warning("  A parcel with a legal description but no street address cannot "
+                       "become a CRM record; resolve the address first or handle manually.")
+    if missing_mailing:
+        logger.warning("%d record(s) have NO mailing address (probate does not fall back "
+                       "to the property address, by design): %s",
+                       len(missing_mailing), ", ".join(missing_mailing[:10]))
+    if passed_through:
+        logger.info("Template columns mapped straight into DataSift fields: %s",
+                    ", ".join(sorted(passed_through)))
     return output_path
 
 

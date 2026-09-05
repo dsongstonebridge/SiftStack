@@ -1072,6 +1072,30 @@ def _read_property_template(path: Path) -> list[dict]:
     templates are typically shipped as a fixed-size sheet with only the
     first few rows actually filled in)."""
     rows: list[dict] = []
+    dropped: list[dict] = []
+
+    def _keep(row_dict: dict) -> None:
+        """Keep a row, or record WHY it was dropped. Never drop silently — a
+        probate parcel often has a legal description and no street address, and
+        losing it without a log line is how three real parcels disappeared from
+        the 2026-09-02 batch preview."""
+        if row_dict.get("Property Street") and row_dict.get("Last Name"):
+            rows.append(row_dict)
+            return
+        # A wholly empty row is expected padding — these templates ship as
+        # fixed-size sheets (300+ rows, a couple filled in). Warning on those
+        # would bury the real losses under hundreds of lines.
+        if not any(str(v or "").strip() for v in row_dict.values()):
+            return
+        dropped.append({
+            "reason": "no Property Street" if not row_dict.get("Property Street")
+                      else "no Last Name",
+            "case": str(row_dict.get("Case Number") or "").strip(),
+            "parcel": str(row_dict.get("Parcel ID") or "").strip(),
+            "owner": f"{row_dict.get('First Name', '')} "
+                     f"{row_dict.get('Last Name', '')}".strip(),
+        })
+
     if path.suffix.lower() in (".xlsx", ".xls"):
         import openpyxl
         wb = openpyxl.load_workbook(path, data_only=True)
@@ -1083,15 +1107,21 @@ def _read_property_template(path: Path) -> list[dict]:
                 continue
             if not any(row):
                 continue
-            row_dict = {k: ("" if v is None else v) for k, v in zip(headers, row)}
-            if row_dict.get("Property Street") and row_dict.get("Last Name"):
-                rows.append(row_dict)
+            _keep({k: ("" if v is None else v) for k, v in zip(headers, row)})
     else:
         import csv as _csv
         with open(path, newline="", encoding="utf-8") as f:
             for row_dict in _csv.DictReader(f):
-                if row_dict.get("Property Street") and row_dict.get("Last Name"):
-                    rows.append(row_dict)
+                _keep(row_dict)
+
+    if dropped:
+        logger.warning("%s: SKIPPED %d row(s) that cannot become a record:",
+                       path.name, len(dropped))
+        for d in dropped:
+            detail = " ".join(f"{k}={v}" for k, v in
+                              (("case", d["case"]), ("parcel", d["parcel"]),
+                               ("owner", d["owner"])) if v)
+            logger.warning("  - %s (%s)", d["reason"], detail or "blank row")
     return rows
 
 

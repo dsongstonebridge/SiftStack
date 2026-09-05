@@ -71,7 +71,11 @@ def trace_contacts(contacts: list[dict], timeout_sec: int = 300) -> list[dict]:
         writer.writerow([
             c.get("first_name", ""), c.get("last_name", ""),
             c.get("address", ""), c.get("city", ""), c.get("state", ""),
-            c.get("zip", ""), "", "", "",
+            c.get("zip", ""),
+            # These three were hardcoded blank, so a caller could not supply a
+            # mailing address even though Tracerfy's own format accepts one.
+            # Optional: omit them and the row is identical to before.
+            c.get("mail_address", ""), c.get("mail_city", ""), c.get("mail_state", ""),
         ])
     csv_content = buf.getvalue()
     buf.close()

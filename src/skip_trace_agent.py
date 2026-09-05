@@ -147,21 +147,119 @@ def resolve_subjects(rows: Iterable[dict]) -> tuple[list[dict], list[dict]]:
         first = (row.get("first") or owner.get("first_name") or "").strip()
         last = (row.get("last") or owner.get("last_name") or "").strip()
 
+        prop_street = addr.get("street") or street
+        prop_city = addr.get("city") or city
+        prop_state = addr.get("state") or ""
+        prop_zip = addr.get("postal_code") or ""
+
+        # THE ADDRESS WE SKIP TRACE ON is the address of the PERSON, which is
+        # not always the address of the PROPERTY.
+        #
+        # On probate they are usually different: the owner/contact is the
+        # personal representative or an heir, who almost never lives in the
+        # decedent's house. Tracing "Jennifer Faulk" at 4503 N Iroquois (a
+        # house her nephew lives in) asks the vendor to match a person against
+        # an address they have no connection to — and Tracerfy bills $0.02
+        # whether it hits or misses. Her real address, off the court filing,
+        # is 2240 W Newton.
+        #
+        # `owner.address` on the CRM record is the mailing address, which
+        # build_api_payload() sources from the CSV's Mailing Street Address —
+        # for probate, the PR's address from the Order. Prefer it; fall back
+        # to a row-supplied mailing; fall back to the property last (correct
+        # for foreclosure, where the owner does live there).
+        owner_addr = owner.get("address") or {}
+        trace_street = ((owner_addr.get("street") or "").strip()
+                        or (row.get("mail_street") or "").strip())
+        if trace_street:
+            trace_city = ((owner_addr.get("city") or "").strip()
+                          or (row.get("mail_city") or "").strip())
+            trace_state = ((owner_addr.get("state") or "").strip()
+                           or (row.get("mail_state") or "").strip())
+            trace_zip = ((owner_addr.get("postal_code") or "").strip()
+                         or (row.get("mail_zip") or "").strip())
+            trace_source = "owner mailing"
+        else:
+            trace_street, trace_city = prop_street, prop_city
+            trace_state, trace_zip = prop_state, prop_zip
+            trace_source = "property (no owner mailing on record)"
+
+        if trace_street.strip().lower() != (prop_street or "").strip().lower():
+            logger.info("resolve: %s %s will be traced at their OWN address %r, "
+                        "not the property %r", first, last, trace_street, prop_street)
+
         subjects.append({
             "property_uuid": rec.get("uuid"),
             "owner_uuid": owner.get("uuid"),
             "first": first, "last": last,
             "name": f"{first} {last}".strip(),
-            "property_address": addr.get("street") or street,
-            "property_city": addr.get("city") or city,
-            "property_state": addr.get("state") or "",
-            "property_zip": addr.get("postal_code") or "",
+            "property_address": prop_street,
+            "property_city": prop_city,
+            "property_state": prop_state,
+            "property_zip": prop_zip,
+            # what the skip trace actually uses
+            "trace_street": trace_street,
+            "trace_city": trace_city,
+            "trace_state": trace_state,
+            "trace_zip": trace_zip,
+            "trace_address_source": trace_source,
             "existing_phones": _existing_phones(rec),
             "people": [],
             "has_results": False,
+            # Probate context for the Message Board's SIGNING CHAIN block.
+            # Empty dict for foreclosure, which just omits the block.
+            **_probate_context(rec, row),
         })
     logger.info("resolve: %d subject(s), %d unresolved", len(subjects), len(unresolved))
     return subjects, unresolved
+
+
+#: CRM custom-field label -> the subject key the Message Board's SIGNING CHAIN
+#: block reads. Only probate records carry these; a foreclosure record has none
+#: of them and the block is simply omitted.
+_PROBATE_SUBJECT_FIELDS = {
+    "Personal Representative": "personal_representative",
+    "Decedent Name":           "decedent_name",
+    "Date of Death":           "date_of_death",
+    "Heir Count":              "heir_count",
+    "Decision Maker":          "decision_maker",
+    "DM Relationship":         "dm_relationship",
+}
+
+
+def _probate_context(rec: dict, row: dict) -> dict:
+    """Probate detail for the SIGNING CHAIN block, from the row we were handed
+    or, failing that, off the CRM record's custom fields.
+
+    The row wins because `skip-trace --create` has the freshly-extracted court
+    data in hand; reading the record back covers the plain `skip-trace` case
+    where the record already existed from an earlier run.
+    """
+    out: dict = {}
+    for label, key in _PROBATE_SUBJECT_FIELDS.items():
+        v = row.get(label) or row.get(key)
+        if str(v or "").strip():
+            out[key] = v
+    for extra in ("heirs", "heirs_deceased", "heirs_address_unknown",
+                  "additional_parcels"):
+        v = row.get(extra) or row.get(extra.replace("_", " ").title())
+        if str(v or "").strip():
+            out[extra] = v
+    if out:
+        return out
+
+    # Fall back to the record's own custom fields. The value row nests the
+    # field at item["custom_field"], NOT a flat field_uuid — reading the wrong
+    # key finds nothing and silently yields an empty block.
+    for item in (rec.get("custom_field_values") or rec.get("custom_fields") or []):
+        if not isinstance(item, dict):
+            continue
+        label = ((item.get("custom_field") or {}).get("label")
+                 or item.get("label") or "")
+        key = _PROBATE_SUBJECT_FIELDS.get(label)
+        if key and str(item.get("value") or "").strip():
+            out[key] = item["value"]
+    return out
 
 
 def _existing_phones(rec: dict) -> list[dict]:
@@ -207,23 +305,60 @@ def tracerfy_source(subjects: list[dict], *, dry_run: bool = True) -> dict[str, 
     """
     from tracerfy_skip_tracer import trace_contacts
 
-    contacts, index = [], {}
+    # ONE contact per unique person, not per record.
+    #
+    # A probate PR routinely appears on several cases at once (Jennifer Faulk
+    # was PR on three Fulton estates filed the same day). Submitting her once
+    # per record bills $0.02 each time for identical data. Worse, `index` used
+    # to be keyed person -> ONE subject and overwrote on collision, so the
+    # results came back and were applied to only the LAST record sharing that
+    # person; the others silently got nothing despite being paid for.
+    contacts: list[dict] = []
+    index: dict[str, list[dict]] = {}
     for s in subjects:
         if not (s["first"] and s["last"]):
             logger.warning("tracerfy: skipping %s - no owner name", s["property_address"])
             continue
+        key = person_key(s["first"], s["last"])
+        if key in index:
+            index[key].append(s)
+            logger.info("tracerfy: %s %s already queued (also on %s) - not billing twice",
+                        s["first"], s["last"], s["property_address"])
+            continue
+        index[key] = [s]
+        # The PERSON's address, not the property's — see resolve(). Older
+        # subjects (or a caller building them by hand) may lack the trace_*
+        # keys, so fall back rather than KeyError.
         contacts.append({
             "first_name": s["first"], "last_name": s["last"],
-            "address": s["property_address"], "city": s["property_city"],
-            "state": s["property_state"], "zip": s["property_zip"],
+            "address": s.get("trace_street") or s["property_address"],
+            "city": s.get("trace_city") or s["property_city"],
+            "state": s.get("trace_state") or s["property_state"],
+            "zip": s.get("trace_zip") or s["property_zip"],
+            "_subject": s,
         })
-        index[person_key(s["first"], s["last"])] = s
 
     if not contacts:
         return {}
 
+    dupes = sum(len(v) - 1 for v in index.values())
+    if dupes:
+        logger.warning("tracerfy: %d record(s) share a person with another - "
+                        "billing %d trace(s) instead of %d, saving $%.2f",
+                        dupes, len(contacts), len(contacts) + dupes, dupes * 0.02)
+
+    # Print exactly who is being traced at which address, before spending.
+    # The user asked to be certain the PR/heir is traced at their real mailing
+    # address; this is the line that proves it, and it prints on a dry run too.
     logger.warning("BILLED: submitting %d record(s) to Tracerfy (~$%.2f at $0.02/record)",
                     len(contacts), len(contacts) * 0.02)
+    for c in contacts:
+        s = c["_subject"]
+        logger.warning("  trace: %s %s @ %s, %s %s %s  [%s]",
+                        c["first_name"], c["last_name"], c["address"], c["city"],
+                        c["state"], c["zip"], s.get("trace_address_source", "property"))
+    for c in contacts:
+        c.pop("_subject", None)
     if dry_run:
         logger.info("DRY RUN - not calling Tracerfy")
         return {}
@@ -235,8 +370,8 @@ def tracerfy_source(subjects: list[dict], *, dry_run: bool = True) -> dict[str, 
     for rec in records:
         first = (rec.get("first_name") or "").strip()
         last = (rec.get("last_name") or "").strip()
-        subj = index.get(person_key(first, last))
-        if not subj:
+        matched = index.get(person_key(first, last)) or []
+        if not matched:
             logger.warning("tracerfy: result for %s %s matched no subject", first, last)
             continue
 
@@ -249,20 +384,30 @@ def tracerfy_source(subjects: list[dict], *, dry_run: bool = True) -> dict[str, 
                                "tier": None, "score": None})
         emails = [e for e in (rec.get(f) for f in _EMAIL_FIELDS) if e]
 
-        people_by_subject.setdefault(subj["property_uuid"], []).append({
-            "first": first, "last": last, "name": f"{first} {last}".strip(),
-            "key": person_key(first, last),
-            "relationship": None,        # owner: source + tier only
-            "age": rec.get("age") or "",
-            "deceased": False,
-            "is_primary": True,
-            "mailing_street": rec.get("address") or "",
-            "mailing_city": rec.get("city") or "",
-            "mailing_state": rec.get("state") or "",
-            "sources": [SOURCE_TRACERFY],
-            "phones": phones,
-            "emails": emails,
-        })
+        # One paid lookup, credited to EVERY record that shares this person.
+        # A repeat PR is billed once (see the dedupe above) but must still
+        # populate all of their records — the old code kept only the last
+        # subject per person, so the others got nothing despite being paid for.
+        # Each subject gets its own copy: downstream stages mutate these dicts
+        # (tier/score on phones), so a shared object would cross-contaminate.
+        if len(matched) > 1:
+            logger.info("tracerfy: applying %s %s's result to %d records",
+                        first, last, len(matched))
+        for subj in matched:
+            people_by_subject.setdefault(subj["property_uuid"], []).append({
+                "first": first, "last": last, "name": f"{first} {last}".strip(),
+                "key": person_key(first, last),
+                "relationship": None,        # owner: source + tier only
+                "age": rec.get("age") or "",
+                "deceased": False,
+                "is_primary": True,
+                "mailing_street": rec.get("address") or "",
+                "mailing_city": rec.get("city") or "",
+                "mailing_state": rec.get("state") or "",
+                "sources": [SOURCE_TRACERFY],
+                "phones": [dict(p, sources=list(p["sources"])) for p in phones],
+                "emails": list(emails),
+            })
     return people_by_subject
 
 
@@ -520,6 +665,89 @@ def _last4s(phones: list[dict]) -> str:
     return ", ".join(out)
 
 
+def _signing_chain_block(subject: dict) -> str:
+    """SIGNING CHAIN section for the Message Board post.
+
+    Probate's central risk is contacting someone who is a good lead but cannot
+    convey alone. The Fulton estate has ten heirs; Castellanos has three, one
+    with no known address; Berry has a sole heir who can sign by himself.
+    Those are three completely different conversations and the caller has to
+    know which one they are in before they discuss price.
+
+    Everything here comes off the court filing for free — no skip trace, no
+    enrichment. Returns "" for records that carry no probate context (i.e.
+    every foreclosure record), so this is additive and safe for both types.
+    """
+    pr = (subject.get("personal_representative") or "").strip()
+    decedent = (subject.get("decedent_name") or "").strip()
+    if not (pr or decedent):
+        return ""
+
+    try:
+        heir_count = int(subject.get("heir_count") or 0)
+    except (TypeError, ValueError):
+        heir_count = 0
+    heirs = (subject.get("heirs") or "").strip()
+    unknown = (subject.get("heirs_address_unknown") or "").strip()
+    deceased_heirs = (subject.get("heirs_deceased") or "").strip()
+    dm = (subject.get("decision_maker") or subject.get("name") or "").strip()
+    dm_rel = (subject.get("dm_relationship") or "").strip()
+
+    lines = ["SIGNING CHAIN"]
+    if decedent:
+        dod = (subject.get("date_of_death") or "").strip()
+        lines.append(f"  Decedent: {decedent}" + (f" (d. {dod})" if dod else ""))
+    if pr:
+        lines.append(f"  Personal Rep: {pr}")
+    if dm:
+        lines.append(f"  Talking to: {dm}" + (f" ({dm_rel})" if dm_rel else ""))
+
+    # The contact's OWN mailing address, stated plainly and labelled as theirs.
+    # This is where we mail them and what the skip trace matched on — it is NOT
+    # the property. The property is the decedent's house, which is the thing we
+    # are trying to buy, and the two must never read as interchangeable.
+    mail = (subject.get("trace_street") or "").strip()
+    if mail:
+        loc = ", ".join(x for x in (subject.get("trace_city"),
+                                     subject.get("trace_state")) if x)
+        zc = (subject.get("trace_zip") or "").strip()
+        line = f"  Their mailing address: {mail}" + (f", {loc}" if loc else "")
+        lines.append(line + (f" {zc}" if zc else ""))
+        prop = (subject.get("property_address") or "").strip()
+        if prop and mail.lower() != prop.lower():
+            lines.append(f"  (Estate property is {prop} - do NOT mail there; "
+                         f"the contact does not live at it)")
+
+    if heir_count == 1:
+        lines.append("  Heirs: 1 - SOLE HEIR, can convey alone once appointed.")
+    elif heir_count > 1:
+        lines.append(f"  Heirs: {heir_count} - MULTIPLE HEIRS. The PR conveys on "
+                     f"behalf of the estate; individual heirs cannot sell alone.")
+    if heirs:
+        lines.append(f"  Named: {heirs}")
+    if deceased_heirs:
+        lines.append(f"  Deceased heirs (their share passes to THEIR heirs): {deceased_heirs}")
+    if unknown:
+        lines.append(f"  NO ADDRESS ON FILE: {unknown} - must be located before closing.")
+
+    # Extra parcels the estate owns that have NO county-assigned street
+    # address (vacant/unplatted lots). Verified 2026-09-04: the assessor's
+    # Situs Address really is blank for these, and the treasurer's list API
+    # cannot be queried, so no lookup will produce a street address that does
+    # not exist. They must not become their own CRM records — a parcel number
+    # is not an address — so they ride on the estate's addressed record here,
+    # which keeps the asset visible without creating junk.
+    extra = (subject.get("additional_parcels") or "").strip()
+    if extra:
+        lines.append("")
+        lines.append("ALSO OWNED BY THIS ESTATE (no street address assigned):")
+        for part in [p.strip() for p in extra.split(";") if p.strip()]:
+            lines.append(f"  {part}")
+        lines.append("  Not separate CRM records by design - verify acreage/value "
+                     "at the assessor before making an offer on the whole estate.")
+    return "\n".join(lines)
+
+
 def build_message_board(subject: dict, *, sources: list[str]) -> str:
     """One combined post per record, in his house format.
 
@@ -529,10 +757,17 @@ def build_message_board(subject: dict, *, sources: list[str]) -> str:
     """
     src = " + ".join(sources) if sources else "Skip trace"
     stamp = datetime.now().strftime("%m/%d/%Y")
+    signing = _signing_chain_block(subject)
     if not subject["has_results"]:
-        return f"{src} attempted {stamp} - no numbers returned."
+        base = f"{src} attempted {stamp} - no numbers returned."
+        return f"{base}\n\n{signing}" if signing else base
 
     lines = [f"{src} - {stamp}", ""]
+    # Who can actually sign, before the phone list. A caller needs to know
+    # "this person signs alone" vs "one of ten heirs" BEFORE they talk price;
+    # "best available contact" is not the same as "can convey clean title".
+    if signing:
+        lines += [signing, ""]
     primary = next((p for p in subject["people"] if p["is_primary"]), None)
     if primary:
         lines.append(f"{primary['name'].upper()}: {_last4s(primary['phones'])}"

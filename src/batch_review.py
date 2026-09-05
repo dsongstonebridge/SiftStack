@@ -29,6 +29,8 @@ import re
 from datetime import datetime
 from pathlib import Path
 
+from buy_box import check_buy_box, describe as describe_buy_box
+
 logger = logging.getLogger(__name__)
 
 #: Severity levels. BLOCK means do not create the record; WARN means a human
@@ -87,16 +89,18 @@ def review_batch(rows: list[dict], *, notice_type: str = "probate") -> list[dict
         decedent = str(r.get("Decedent Name") or "").strip()
         pr = str(r.get("Personal Representative") or "").strip()
 
-        # ── bare land: excluded by policy, reported every time ───────
-        # A parcel can have a perfectly good street address and still be an
-        # empty lot, so this is checked on its own and never inferred from
-        # whether an address exists. `tulsa_assessor.get_parcel_improvements()`
-        # supplies the flag.
-        vacant = str(r.get("Vacant Lot") or r.get("is_vacant_lot") or "").strip().lower()
-        if vacant in ("yes", "true", "1"):
-            _flag(findings, i, EXCLUDE, "Vacant Lot",
-                  "Empty lot, no structure - NOT uploaded to the CRM, but it IS "
-                  "an estate asset worth knowing about",
+        # ── buy box: excluded by policy, reported every time ─────────
+        # Single-family homes at minimum: must have a structure and be
+        # residential. A parcel can have a perfectly good street address and
+        # still be an empty lot, so vacancy is checked directly rather than
+        # inferred from whether an address exists —
+        # `tulsa_assessor.get_parcel_improvements()` supplies that flag.
+        # Rejections are reported, never silently dropped.
+        ok, why = check_buy_box(r)
+        if not ok:
+            _flag(findings, i, EXCLUDE, "Buy Box",
+                  "; ".join(why) + " - NOT uploaded to the CRM, but it IS an "
+                  "estate asset worth knowing about",
                   " ".join(x for x in (str(r.get("Parcel ID") or ""),
                                        street or "(no street address)",
                                        f"land ${r.get('Land Value')}" if r.get("Land Value") else "")
@@ -273,12 +277,14 @@ def print_review(findings: list[dict], total_rows: int = 0) -> bool:
     # warnings is the same as not being told.
     if excluded:
         logger.warning("")
-        logger.warning("=== EMPTY LOTS - NOT UPLOADED, BUT YOU SHOULD KNOW (%d) ===",
+        logger.warning("=== OUTSIDE THE BUY BOX - NOT UPLOADED, BUT YOU SHOULD KNOW (%d) ===",
                        len(excluded))
         for f in excluded:
             logger.warning("  row %d: %s", f["row"], f["value"] or f["message"])
-        logger.warning("  These are estate assets with no house on them. They do not "
-                       "become CRM records; note them if you are valuing the whole estate.")
+            logger.warning("      reason: %s", f["message"].split(" - NOT uploaded")[0])
+        logger.warning("  %s", describe_buy_box())
+        logger.warning("  These are still real estate assets - note them if you are "
+                       "valuing a whole estate.")
         logger.warning("")
 
     for f in blocks + warns:

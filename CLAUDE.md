@@ -245,11 +245,71 @@ The default obituary path extracts survivors/heirs from obituary text with an LL
 - `numpy>=1.26.0` — required by OpenCV
 - `dropbox>=12.0.2` — Dropbox SDK (minimum for post-Jan-2026 API compatibility)
 
-## Tulsa Probate Pipeline (OSCN) — DISCOVERY COMPLETE, NOT YET BUILT
+## Tulsa Probate Pipeline (OSCN) — BUILT, NOT YET RUN
 
-**Status as of 2026-09-02: no code written, nothing uploaded to the CRM, nothing
-skip traced.** Discovery is finished and the hard questions are answered. Do not
-start building, and do not create records, without saying so first.
+**Status as of 2026-09-04: the steps are built and verified. Nothing has been
+uploaded to the CRM and nothing has been skip traced.** Only the orchestration
+("the chain") is missing — every link works and is tested individually.
+
+### What exists
+
+| Piece | Where | State |
+|---|---|---|
+| `probate-info-extraction` skill | `~/.claude/skills/probate-info-extraction/` | 41 columns, one row per PROPERTY |
+| Buy box | `src/buy_box.py` | single-family at minimum; gates BEFORE creation |
+| Human check step | `src/batch_review.py` | BLOCK / WARN / EXCLUDE |
+| Assessor over plain HTTP | `tulsa_assessor.search_assessor()`, `get_parcel_situs()`, `get_parcel_improvements()` | no Playwright |
+| Probate Notes / Message Board | `_PROBATE_SECTIONS`, `_NOTES_SECTION_SETS`, `_signing_chain_block()` | signing chain + mailing address |
+| Trace at the person's address | `resolve_subjects()` -> `trace_*` | probate never falls back to the property |
+| Repeat-PR dedupe | `tracerfy_source()` | billed once, credited to every record |
+| **The chain** | — | **NOT BUILT** |
+
+**The skill's column list and `_PROBATE_SECTIONS` must stay in sync.** A field
+in one and not the other is extracted and then silently dropped — same trap as
+the petition version.
+
+### Two addresses, never confused
+
+- **Property address** on the CRM record = the **decedent's house**. That is the
+  thing being bought, and it is the whole point of the pipeline.
+- **Mailing address** = the **PR's or heir's own address**. Used for skip
+  tracing and mail only.
+
+For probate the mailing address must **never** fall back to the property — the
+PR rarely lives in the decedent's house (on one real case a grandchild did).
+Foreclosure keeps the property fallback, since the owner usually lives there.
+Both appear in the Message Board, labelled, with a "do NOT mail there" line when
+they differ.
+
+### Buy box (2026-09-04)
+
+**Single-family homes at minimum**: must have a structure, must be residential.
+Runs on the extracted sheet BEFORE creation, because
+**`skip-trace --create` writes to the CRM whether or not `--commit` is passed** —
+the dry-run gate protects spend, not the CRM. Fails OPEN on missing data.
+Rejections are reported, never silently dropped.
+
+**Not enforced, and do not imply otherwise: single-family vs duplex.**
+`AcctType` reads "Residential" for both and the assessor's structure detail is
+client-side from an unexposed endpoint. A duplex passes.
+
+### Empty lots
+
+Bare land never reaches the CRM but is **reported every run** under its own
+banner. Detection is the assessor's verbatim `"This property has no
+improvements"` — verified 8/8. A parcel can have a street address and still be
+vacant, so check improvements directly rather than inferring from the address.
+Parcels with no county-assigned address ride on the estate's addressed record
+via `additional_parcels`; a parcel number is not an address.
+
+### Cost — do not quote the dry run's total
+
+Tracerfy (~$0.02/record) and DataSift (~$0.12/owner) are per-RECORD and
+predictable. **Trestle is per unique NUMBER** and numbers-per-record swings
+(4.8 then 6.4 on consecutive real batches). The dry run's Trestle line reads
+~$0.00 because no trace has run. Budget **$0.21-0.26/record**, quote Trestle as
+a range, and speak up when the `BILLED: TrestleIQ scoring N unique number(s)`
+line implies more than was approved.
 
 Everything below was established live against real Tulsa cases, with controls —
 not inferred from docs.
@@ -345,34 +405,24 @@ metes-and-bounds parcel (`R90328032815610`) with no street address. A
 grandchild-heir lives in the estate property. Artifacts in
 `output/probate_discovery/`.
 
-### Known gaps before anything gets built
+### Known gaps
 
-1. **Address resolution is proven but unbuilt** — no code path wires OSCN ->
-   assessor -> template row yet.
-2. `_read_property_template()` **silently drops any row without `Property Street`**,
-   so probate rows die before reaching the pipeline until the address step exists.
-3. `_format_petition_notes()` is hardcoded to `_PETITION_SECTIONS` and a literal
-   `"FORECLOSURE PETITION"` header — needs to be per-notice-type.
-4. **`build_datasift_csv_from_template()` never populates the probate CRM columns**
-   (`Personal Representative`, `Decedent Name`, `Heir Count`, `Signing Chain *`).
-   Only `_build_row()` (the scraper path) does. Probate records created through
-   `--create` would land with those fields empty.
-5. No probate extraction skill yet (mirror of `petition-info-extraction`).
-6. Multi-parcel estates need **one row per parcel joined on case number**;
-   `output/probate_template_SAMPLE.csv` wrongly assumes one row per case.
-7. **Buy box still not supplied** — and see the warning below.
-8. OCR mangles names and ordinals in these documents (`Faulk`->`Haulk`,
-   `49th St.`->`49" St.`, same class as the Tulsa avenue-format bug). Names and
-   street numbers feed skip trace and **phone tags are append-only**, so a human
-   check on the extracted sheet must sit BEFORE record creation.
+1. **The chain is not built** — no code path wires PDFs -> extract -> gates ->
+   assessor -> review -> CSV -> create. Each link works; nothing orchestrates them.
+2. Multi-parcel estates: parcels with no situs address ride on the addressed
+   record as `additional_parcels`; `output/probate_template_SAMPLE.csv` still
+   wrongly assumes one row per case.
+3. Single-family vs duplex is not detectable from free data (see above).
+4. `Signing Chain Count` / `Heirs Living` are still not computed — the Message
+   Board's SIGNING CHAIN block carries the heir count and who can sign instead.
 
 ### `--create` WRITES TO THE CRM WITHOUT `--commit`
 
 `_create_records_for_batch()` runs at `main.py:1258`, **before** `dry` is computed
 at `main.py:1285`, and calls `upload_to_datasift()` unconditionally. **The dry-run
 gate protects spend, not the CRM.** Any trial of `skip-trace --create` puts real
-records in DataSift, so the buy-box gate has to exist *before* the first probate
-trial, not after.
+records in DataSift — which is exactly why the buy box and `batch_review.py` run
+on the extracted sheet, before creation, rather than as a post-upload cleanup.
 
 ## DataSift.ai (REISift) Integration
 

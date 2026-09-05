@@ -1170,6 +1170,170 @@ async def _retry_skipped_step(page, step_fn, csv_path: Path, skipped: list[dict]
     return retry_result
 
 
+def _enrich_probate_rows(rows: list[dict]) -> list[dict]:
+    """Fill each probate row's property facts from the county assessor.
+
+    Probate filings name a decedent and heirs but almost never a street
+    address, so this is the step that turns a court record into something the
+    CRM can hold. Free, read-only, no browser.
+
+    Fills, only where the row does not already have it:
+      Property Street/City/Zip, Parcel ID, AcctType, Vacant Lot, Land Value
+
+    THE ROOT-OWNER TRAP: on a chain-of-deaths estate the decedent owns nothing
+    in their own name and the assessor returns a true zero — searching Alfred
+    Fulton finds nothing while his father Johnnie Sr. holds the property. So a
+    miss on the decedent falls through to the PR and then the named heirs
+    rather than concluding "no real property".
+    """
+    import time
+    from tulsa_assessor import (search_assessor, get_parcel_improvements,
+                                _score_name_match)
+
+    for row in rows:
+        if str(row.get("Property Street") or "").strip() and row.get("Vacant Lot"):
+            continue
+
+        # Search order: decedent, then root-owner candidates from the filing.
+        candidates = [
+            ("decedent", row.get("Decedent Name")),
+            ("PR", row.get("Personal Representative")),
+        ]
+        for label, heir_blob in (("heir", row.get("Heirs")),
+                                 ("deceased heir", row.get("Heirs Deceased"))):
+            for part in str(heir_blob or "").split(";"):
+                nm = part.split("(")[0].strip()
+                if nm:
+                    candidates.append((label, nm))
+
+        hits, matched_on = [], ""
+        for label, name in candidates:
+            name = str(name or "").strip()
+            if not name:
+                continue
+            # Try several name forms, widest last. "LAST, FIRST MIDDLE" gives
+            # the tightest match when it hits, but a middle initial can sink it
+            # outright: "Berry, Jacquilla D." returns ZERO while
+            # "Berry, Jacquilla" returns three parcels. Dropping the middle is
+            # not an optimisation, it is required for correctness.
+            parts = [p.strip(".,") for p in name.replace(",", " ").split() if p.strip(".,")]
+            # STRIP THE SUFFIX FIRST. "Johnnie Fulton, Sr." tokenizes to
+            # [Johnnie, Fulton, Sr] and a naive parts[-1] makes "Sr" the
+            # surname — which searched 'Sr Johnnie', returned five unrelated
+            # parcels, and confidently attached the wrong house to the estate.
+            # Same for "Buckley, Jr." -> 21 parcels. Caught 2026-09-04.
+            _SUFFIXES = {"JR", "SR", "II", "III", "IV", "V", "ESQ"}
+            while len(parts) > 1 and parts[-1].upper() in _SUFFIXES:
+                parts.pop()
+            forms: list[str] = []
+            if len(parts) >= 2:
+                last, rest = parts[-1], parts[:-1]
+                forms.append(f"{last}, {' '.join(rest)}")          # LAST, FIRST MIDDLE
+                if len(rest) > 1:
+                    forms.append(f"{last}, {rest[0]}")             # LAST, FIRST
+                forms.append(f"{last} {rest[0]}")                  # LAST FIRST
+            else:
+                forms.append(name)
+
+            for query in forms:
+                candidates_found = search_assessor(query)
+                time.sleep(2)
+                if not candidates_found:
+                    continue
+                # SCORE, never take the first hit. "Lovelace, Robert" returns
+                # both ROBERT C (the decedent) and ROBERT L (a different man);
+                # taking hits[0] attached the wrong house. _score_name_match
+                # hard-gates on surname and penalises a leading first name that
+                # is not in the query.
+                # Score against the SUFFIX-STRIPPED "First Middle Last" form.
+                # _score_name_match treats the query's LAST token as the
+                # surname, so handing it "Johnnie Fulton, Sr." makes the
+                # surname "Sr" and every real match scores 0.00.
+                score_name = " ".join(parts)
+                # Tie-break with the PR/spouse. "Lovelace, Robert" returns
+                # ROBERT C (the decedent, co-owned with JULIENNE the PR) and
+                # ROBERT L (an unrelated man); both score 0.67 on name alone,
+                # so the deciding signal is which owner string also names the
+                # person the filing says is the spouse/PR.
+                pr_first = ""
+                for src in (row.get("Personal Representative"), row.get("Decision Maker")):
+                    tok = str(src or "").replace(",", " ").split()
+                    if tok:
+                        pr_first = tok[0].strip(".,")
+                        break
+                def _rank(h):
+                    owner = h.get("FullPrimaryOwnerName") or ""
+                    s = _score_name_match(score_name, owner, dm_first=pr_first.upper())
+                    corroborated = bool(pr_first) and pr_first.upper() in owner.upper()
+                    return (s, corroborated)
+                scored = sorted(((_rank(h), h) for h in candidates_found),
+                                key=lambda t: (t[0][0], t[0][1]), reverse=True)
+                if len(scored) > 1 and scored[0][0][0] == scored[1][0][0]:
+                    if scored[0][0][1] and not scored[1][0][1]:
+                        logging.info("  assessor: tie at %.2f broken by %s appearing "
+                                     "on the deed", scored[0][0][0], pr_first)
+                    else:
+                        logging.warning("  assessor: AMBIGUOUS - %d candidates tie at "
+                                        "%.2f and nothing breaks it; verify by hand: %s",
+                                        len(scored), scored[0][0][0],
+                                        " | ".join((h.get("FullPrimaryOwnerName") or "")[:40]
+                                                   for _, h in scored[:3]))
+                scored = [(sc[0], h) for sc, h in scored]
+                best_score, _ = scored[0]
+                if best_score < 0.4:
+                    logging.info("  assessor: %d hit(s) for %r but best name score "
+                                 "%.2f < 0.40 - rejecting rather than guessing",
+                                 len(candidates_found), query, best_score)
+                    continue
+                hits = [h for s, h in scored if s >= 0.4]
+                matched_on = f"{label}: {name} (as {query!r}, score {best_score:.2f})"
+                break
+            if hits:
+                if label != "decedent":
+                    logging.info("  assessor: decedent found nothing; matched on the "
+                                 "%s instead (chain-of-deaths estate)", label)
+                break
+
+        if not hits:
+            logging.warning("  assessor: no parcel for %s (%s) - searched %d name(s). "
+                            "This is NOT proof of no real property; check the filing.",
+                            row.get("Decedent Name"), row.get("Case Number"),
+                            len([c for _, c in candidates if c]))
+            continue
+
+        addressed = [h for h in hits if (h.get("FullPropertyStreet") or "").strip()]
+        primary = addressed[0] if addressed else hits[0]
+        acct = primary.get("AccountNo") or ""
+
+        if not str(row.get("Property Street") or "").strip():
+            row["Property Street"] = (primary.get("FullPropertyStreet") or "").strip()
+            row["Property City"] = (primary.get("PropertyCity") or "").strip().title()
+            row["Property State"] = "OK"
+            row["Property Zip"] = (primary.get("PropertyZipCode") or "").strip()[:5]
+        row.setdefault("Parcel ID", acct)
+        row["AcctType"] = primary.get("AcctType") or ""
+        row["Assessor Owner"] = primary.get("FullPrimaryOwnerName") or ""
+        row["Assessor Matched On"] = matched_on
+
+        impr = get_parcel_improvements(acct) if acct else None
+        time.sleep(2)
+        if impr:
+            row["Vacant Lot"] = "Yes" if impr["is_vacant_lot"] else "No"
+            if impr.get("land_value") is not None:
+                row["Land Value"] = impr["land_value"]
+
+        # Extra parcels ride on this record rather than becoming their own —
+        # a parcel number is not an address.
+        extras = [h for h in hits if h.get("AccountNo") != acct]
+        if extras and not row.get("Additional Parcels"):
+            row["Additional Parcels"] = "; ".join(
+                f"{h.get('AccountNo')} ({(h.get('FullPropertyStreet') or 'no street address').strip()})"
+                for h in extras)
+        logging.info("  %s -> %s [%s]", row.get("Decedent Name"),
+                     row.get("Property Street") or "(no address)", matched_on)
+    return rows
+
+
 def _create_records_for_batch(args, csv_path: Path) -> list[dict] | None:
     """`--create` front end: raw property template -> CRM records, ready for
     run_pipeline() to trace and score.
@@ -1202,6 +1366,40 @@ def _create_records_for_batch(args, csv_path: Path) -> list[dict] | None:
     notice_type = getattr(args, "notice_type", "foreclosure") or "foreclosure"
     county = getattr(args, "county", "") or ""
     trial_tag = getattr(args, "trial_tag", None)
+
+    # ── THE CHAIN: enrich -> buy box -> review, all BEFORE creation ──────
+    # This ordering is the whole point. `--create` writes to the CRM whether
+    # or not --commit is passed, so these gates cannot sit after it: by then
+    # the record exists and the user has the junk they asked us to prevent.
+    if notice_type == "probate":
+        logging.info("Probate: resolving property from the county assessor...")
+        template_rows = _enrich_probate_rows(template_rows)
+
+    from buy_box import apply_buy_box, describe as describe_buy_box
+    from batch_review import review_batch, print_review, write_review_sheet
+
+    template_rows, rejected = apply_buy_box(template_rows)
+    if rejected:
+        logging.warning("")
+        logging.warning("=== OUTSIDE THE BUY BOX - NOT UPLOADED (%d) ===", len(rejected))
+        for r in rejected:
+            logging.warning("  %s %s | %s",
+                            r.get("Case Number") or "", r.get("Parcel ID") or "",
+                            "; ".join(r["_buy_box_reasons"]))
+            logging.warning("      %s %s",
+                            r.get("Property Street") or "(no street address)",
+                            f"land ${r.get('Land Value')}" if r.get("Land Value") else "")
+        logging.warning("  %s", describe_buy_box())
+        logging.warning("")
+    if not template_rows:
+        logging.error("Every row was rejected by the buy box - nothing to create.")
+        return None
+
+    findings = review_batch(template_rows, notice_type=notice_type)
+    sheet = write_review_sheet(template_rows, findings)
+    if not print_review(findings, total_rows=len(template_rows)):
+        logging.error("Stopping BEFORE any record is created. Fix %s and re-run.", sheet)
+        return None
     list_name = (getattr(args, "list_name", None)
                  or f"SiftStack {datetime.now().strftime('%Y-%m-%d')}")
 

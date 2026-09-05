@@ -130,10 +130,28 @@ def review_batch(rows: list[dict], *, notice_type: str = "probate") -> list[dict
             owner_tok = _tokens(f"{first} {last}")
             dec_tok = _tokens(decedent)
             if owner_tok and owner_tok <= dec_tok:
-                _flag(findings, i, BLOCK, "Owner",
-                      "OWNER IS THE DECEDENT. The contact must be the PR or an "
-                      "heir - never the deceased owner of record",
-                      f"{first} {last} / {decedent}")
+                # A generational suffix is a REAL distinction between two
+                # living-and-dead people: Gerald William Buckley Jr. is the
+                # decedent, Gerald William Buckley III is his son and the PR.
+                # _tokens() strips suffixes, so without this every Jr/Sr/III
+                # probate blocks spuriously. Downgrade to a warning and name
+                # the thing to check, rather than either blocking a valid row
+                # or silently letting the real bug through.
+                sfx = re.compile(r"\b(JR|SR|II|III|IV|V)\b", re.I)
+                owner_sfx = set(m.upper() for m in sfx.findall(f"{first} {last}"))
+                dec_sfx = set(m.upper() for m in sfx.findall(decedent))
+                pr_sfx = set(m.upper() for m in sfx.findall(pr))
+                if dec_sfx and (owner_sfx or pr_sfx) and (owner_sfx or pr_sfx) != dec_sfx:
+                    _flag(findings, i, WARN, "Owner",
+                          "Owner and decedent share a name but differ by generational "
+                          "suffix - confirm the contact is the LIVING one",
+                          f"{first} {last} ({'/'.join(sorted(owner_sfx or pr_sfx))}) "
+                          f"vs decedent ({'/'.join(sorted(dec_sfx))})")
+                else:
+                    _flag(findings, i, BLOCK, "Owner",
+                          "OWNER IS THE DECEDENT. The contact must be the PR or an "
+                          "heir - never the deceased owner of record",
+                          f"{first} {last} / {decedent}")
             # Deliberately NOT flagged: an owner who merely shares the
             # decedent's surname. A surviving spouse or child with the same
             # last name is the ordinary probate case (Julienne Lovelace is the

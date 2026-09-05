@@ -51,10 +51,23 @@ Deliberately NOT rejected:
   record out of the CRM, but in good time to deprioritise it or skip tracing
   it. That would be a preference sort, not a rejection.
 
-`fail_open` is deliberate: a MISSING signal never rejects a record. A gate that
+`fail_open` is deliberate: a missing signal never rejects a record. A gate that
 silently drops leads on absent data is worse than one that lets a few through,
 because the loss is invisible. Same reasoning as `filter_buy_box()` in
 `enrichment_pipeline.py`.
+
+**One deliberate exception to fail-open: a missing PROPERTY ADDRESS (criterion
+5).** That is not a buy-box judgement about a property — it is the row being
+unusable, since a record cannot be created without one. It is still *reported*
+rather than discarded, so the loss is not invisible, which is what the
+principle above actually protects. Note that `_read_property_template()`
+already drops rows lacking a street, so on the foreclosure path this criterion
+is redundant; it earns its place on probate, where an address only appears
+after the assessor step and its absence means that step found nothing.
+
+Every other criterion fails open, and any new one must. If you are adding a
+check and find yourself rejecting on absent data, that is the moment to
+re-read this paragraph.
 """
 
 from __future__ import annotations
@@ -137,6 +150,24 @@ def check_buy_box(row: dict) -> tuple[bool, list[str]]:
     if street and _UNIT_ADDRESS_RE.search(street):
         reasons.append(f"address carries a unit designator ({street!r}) - "
                        "not a whole single-family house")
+
+    # 4. The filing itself says there is no real property.
+    #    Probate petitions state this explicitly and the wording is the
+    #    discriminator: "an interest in real property" / "real and personal
+    #    property" versus "leaving personal property". On a real batch the
+    #    Hokanson estate used the last phrasing and an independent assessor
+    #    search returned zero parcels — two free sources agreeing there is no
+    #    house to buy. Policy exclusion, not a data defect, so it belongs here
+    #    rather than blocking the whole batch in review.
+    rp = str(row.get("Real Property Stated") or "").strip().lower()
+    if rp.startswith("no") or ("personal property" in rp and "real" not in rp):
+        reasons.append("the filing states NO real property - no house to buy")
+
+    # 5. No property address could be resolved.
+    #    After the assessor step this means nothing was found, so the row
+    #    cannot become a CRM record. Report it; do not stop the batch.
+    if not str(row.get("Property Street") or row.get("Property Street Address") or "").strip():
+        reasons.append("no property address could be resolved")
 
     # --- future parameters go here -----------------------------------
     # Equity percentage and ZIP exclusions were named as likely additions.

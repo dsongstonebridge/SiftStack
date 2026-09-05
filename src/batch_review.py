@@ -108,11 +108,10 @@ def review_batch(rows: list[dict], *, notice_type: str = "probate") -> list[dict
             continue   # nothing else about this row matters; it is not becoming a record
 
         # ── structural: can this become a record at all ──────────────
-        if not street:
-            _flag(findings, i, BLOCK, "Property Street",
-                  "No property address - row will be DROPPED, asset lost unless "
-                  "attached to another record as an additional parcel",
-                  r.get("Parcel ID") or r.get("Case Number") or "")
+        # NOTE: a missing property address and a filing that states no real
+        # property are BUY-BOX exclusions (reported, batch continues), not
+        # review defects. Blocking the whole batch on one policy-excluded row
+        # stopped five good records on the 2026-09-04 test run.
         if not last:
             _flag(findings, i, BLOCK, "Last Name", "No owner surname - cannot create or trace")
 
@@ -203,11 +202,6 @@ def review_batch(rows: list[dict], *, notice_type: str = "probate") -> list[dict
             if not pr:
                 _flag(findings, i, WARN, "Personal Representative",
                       "No PR recorded - cannot show a signing chain to the caller")
-            rp = str(r.get("Real Property Stated") or "").strip().lower()
-            if rp.startswith("no") or "personal property" in rp:
-                _flag(findings, i, BLOCK, "Real Property Stated",
-                      "Filing states NO real property - this estate has no house "
-                      "to buy and should not reach the CRM", rp)
             unknown = str(r.get("heirs_address_unknown") or "").strip()
             if unknown:
                 _flag(findings, i, WARN, "Heirs",

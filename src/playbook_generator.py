@@ -296,12 +296,14 @@ def generate_playbook(blueprint: str = "wholesale", market: str = "knoxville",
     bp = BLUEPRINTS.get(blueprint, BLUEPRINTS["wholesale"])
     team = TEAM_CONFIGS.get(team_size, TEAM_CONFIGS[1])
     market_name = market.title()
+    _MARKET_STATE = {"knoxville": "Tennessee", "maryville": "Tennessee", "tulsa": "Oklahoma"}
+    market_state = _MARKET_STATE.get(market.lower(), "")
 
     lines = []
     lines.append(f"# {bp['name']} Acquisition Playbook — {market_name}")
     lines.append(f"")
     lines.append(f"**Blueprint:** {bp['name']} — {bp['description']}")
-    lines.append(f"**Market:** {market_name}, Tennessee")
+    lines.append(f"**Market:** {market_name}" + (f", {market_state}" if market_state else ""))
     lines.append(f"**Team:** {team['name']} ({team_size} {'person' if team_size == 1 else 'people'})")
     lines.append(f"**Generated:** {datetime.now().strftime('%Y-%m-%d')}")
     lines.append(f"")

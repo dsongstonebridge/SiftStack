@@ -245,6 +245,135 @@ The default obituary path extracts survivors/heirs from obituary text with an LL
 - `numpy>=1.26.0` — required by OpenCV
 - `dropbox>=12.0.2` — Dropbox SDK (minimum for post-Jan-2026 API compatibility)
 
+## Tulsa Probate Pipeline (OSCN) — DISCOVERY COMPLETE, NOT YET BUILT
+
+**Status as of 2026-09-02: no code written, nothing uploaded to the CRM, nothing
+skip traced.** Discovery is finished and the hard questions are answered. Do not
+start building, and do not create records, without saying so first.
+
+Everything below was established live against real Tulsa cases, with controls —
+not inferred from docs.
+
+### The data source: OSCN carries the whole thing
+
+The old "OSCN probate is too thin" note was true only of the **results page**.
+Docket **detail** pages link full imaged PDFs, free and public.
+
+- **8 of 8** sampled Tulsa PB cases have imaged documents (6-14 docs each).
+- PDFs are **scanned, no text layer** — same as the foreclosure petitions, so the
+  existing `image_utils.ocr_page` 300dpi / psm 4 path applies unchanged.
+- `Results.aspx` (discovery) has **no Turnstile**. Detail + document pages **do**,
+  firing after ~12 requests. A challenge is **HTTP 201, ~2,357 bytes** — NOT an
+  error and NOT an empty docket. Misreading those as empty once produced a
+  confident "only 1 of 8 cases has documents," which was wrong by 8x.
+- 2Captcha solves it over **plain HTTP** (no Playwright): `method=turnstile`,
+  post back `cf-turnstile-response` **plus the page's hidden `source_uri`**.
+  **~$0.00145/solve, and one solve covers a whole batch** — a later 4-PDF run
+  used 0 solves on the warm session. The charge posts LATE, so compare balances
+  across runs, not within one.
+
+### What each document gives, and when
+
+| Document | Lag | Present | Carries |
+|---|---|---|---|
+| **Petition** | **day 0** | 8/8 | heirs + relationships + **mailing addresses**, marital status, children, and the sworn *"owned an interest in real property located in Tulsa County"* |
+| Order Appointing PR | +20-27d | 5/8 | the **court-adjudicated** heir list (stronger than the petition's claim); often where the **PR's own address** appears |
+| Letters issued | +20-41d | 6/8 | PR authority confirmed |
+| General Inventory | +41d | 3/8 | legal descriptions — **waivable by court order, never gate on it** |
+
+Nothing you need is late: the Petition is day 0 and carries the first-to-market
+payload. Treat the Inventory as optional enrichment.
+
+### Finding the property (the part that used to be the blocker)
+
+**Resolved.** `assessor.tulsacounty.org/Property/Search?terms={terms}&filterTag=null`
+returns results as an embedded **DevExpress dxDataGrid JSON `dataSource`**, not an
+HTML table — a `<table>` parse finds zero rows on a page holding thousands of
+records. Parse it over plain `requests`; `tulsa_assessor.py` drives this with
+Playwright and does not need to.
+
+- Several `"data":[` arrays exist; take the one whose next few KB contain `AccountNo`.
+- It is **JavaScript, not JSON** — `new Date(1, 0, 1)` literals must be replaced
+  before `json.loads`.
+- Subdivision names **are** searchable, so the Inventory's legal description works
+  both as a query and as free corroboration.
+- **Always run a gibberish control** (`ZZZQQQ NOTAREAL` -> 0) before trusting a
+  negative. Unlike DataSift's ignored `search=` param, this endpoint really filters.
+
+**THE TRAP — search the ROOT owner, not the decedent.** On a chain-of-deaths
+probate the decedent held only an *undivided interest* in an undistributed parent
+estate, so title never moved to them and the assessor returns a **true zero**.
+`FULTON, ALFRED` -> 0 records; his father `FULTON, JOHNNIE SR` -> the property.
+**A zero on the decedent is not evidence of no real property.** Search the
+surviving spouse, the PR, and any earlier-deceased relative in the heir list.
+This is the `probate-property-finder` skill's Tier 2, and on these cases it is the
+primary path, not a fallback. Trust-held property appears as
+`LAST, FIRST C/O LAST, FIRST REV LIVING TRUST`.
+
+Tells that an upstream estate exists: `"an UNDIVIDED interest in"` in the
+Inventory, heirs marked `Now Deceased/Child` in the Order, and **multiple probates
+filed the same day by the same PR with the same surname** — that is one family
+clearing a title chain, i.e. **one property investigation, not N leads**.
+
+**Confidence:** the skill's token-overlap formula scores a trust-held match ~0.33
+(LOW) because the trust name inflates the owner string. **Weight cross-source
+agreement above token overlap** — the Inventory's `Lot 36, Block 3, SUBURBAN ACRES`
+matching the assessor's `SubdivisionName` `SUBURBAN ACRES AMD` is the real signal.
+
+### Who becomes the Owner / trace subject
+
+**PR first, but only if we have their mailing address; otherwise the first listed
+heir** (user's rule, 2026-09-02). Tracing a name with no address is useless, and
+the filing usually hands us an heir whose address IS listed. The PR's address is
+often absent from the petition (only the law firm's appears) but shows up in the
+Order's heir table when the PR is also an heir.
+
+Still true: **the decedent is NEVER the Owner**, and Enrich Owners / Swap Owners
+stay **OFF** or DataSift will "correct" the PR back to the deceased owner of
+record. Trace **one** subject per record; heirs are **captured free** from the
+filing, never traced up front. A repeat PR across cases means **dedupe the trace
+subject** or you bill the same person N times.
+
+### Reference case
+
+**Fulton — PB-2026-587/588/589** is the worked end-to-end example and the
+regression case for any probate work. Johnnie Fulton Sr. (d. 2019) is the root
+owner; two of his children died after him holding shares; his daughter **Jennifer
+G. Faulk (2240 W. Newton Apt #A, Tulsa OK 74127)** is PR on all three. Property:
+**4503 N Iroquois Ave, Tulsa OK 74106** (`R40800021305520`), plus an UNPLATTED
+metes-and-bounds parcel (`R90328032815610`) with no street address. A
+grandchild-heir lives in the estate property. Artifacts in
+`output/probate_discovery/`.
+
+### Known gaps before anything gets built
+
+1. **Address resolution is proven but unbuilt** — no code path wires OSCN ->
+   assessor -> template row yet.
+2. `_read_property_template()` **silently drops any row without `Property Street`**,
+   so probate rows die before reaching the pipeline until the address step exists.
+3. `_format_petition_notes()` is hardcoded to `_PETITION_SECTIONS` and a literal
+   `"FORECLOSURE PETITION"` header — needs to be per-notice-type.
+4. **`build_datasift_csv_from_template()` never populates the probate CRM columns**
+   (`Personal Representative`, `Decedent Name`, `Heir Count`, `Signing Chain *`).
+   Only `_build_row()` (the scraper path) does. Probate records created through
+   `--create` would land with those fields empty.
+5. No probate extraction skill yet (mirror of `petition-info-extraction`).
+6. Multi-parcel estates need **one row per parcel joined on case number**;
+   `output/probate_template_SAMPLE.csv` wrongly assumes one row per case.
+7. **Buy box still not supplied** — and see the warning below.
+8. OCR mangles names and ordinals in these documents (`Faulk`->`Haulk`,
+   `49th St.`->`49" St.`, same class as the Tulsa avenue-format bug). Names and
+   street numbers feed skip trace and **phone tags are append-only**, so a human
+   check on the extracted sheet must sit BEFORE record creation.
+
+### `--create` WRITES TO THE CRM WITHOUT `--commit`
+
+`_create_records_for_batch()` runs at `main.py:1258`, **before** `dry` is computed
+at `main.py:1285`, and calls `upload_to_datasift()` unconditionally. **The dry-run
+gate protects spend, not the CRM.** Any trial of `skip-trace --create` puts real
+records in DataSift, so the buy-box gate has to exist *before* the first probate
+trial, not after.
+
 ## DataSift.ai (REISift) Integration
 
 DataSift.ai (formerly REISift) is the CRM where scraped records land for niche sequential marketing campaigns.
@@ -271,6 +400,24 @@ self-contained request — don't ask which folder or which command:
    the estimate, ask before `--commit`.
 4. Verify by reading records back: tags by TITLE, tiers against Trestle's own
    `assigned_tag`.
+
+**The `Owner Alive` column is a real spend gate — confirmed live 2026-09-04**
+(it had been built 2026-08-18 and never exercised until then). A petition whose
+owner is deceased and which names **no living person at all** — only "Unknown
+Heirs", "Unknown Spouse", "Unknown Occupants" — gets `Owner Alive = No`. The
+record is still created, enriched, tagged `deceased` and given full petition
+notes; it is simply never skip traced, because there is no one to trace. On
+2026-09-04 `main.py` logged `1 record(s) flagged Owner Alive=No - created and
+enriched but never traced: David Haggard` and the billable count dropped from
+13 to 12. **The bar is narrow**: a named Co-Personal Representative, a
+transfer-on-death beneficiary, a surviving joint tenant or a named heir all
+count as living contacts (use the first-named and mark `Yes`). Only "Unknown
+<anything>" means No.
+
+**Note the gap:** `skip-trace` WITHOUT `--create` reads the CSV for
+street/city/first/last only and does **not** honour `Owner Alive`. When
+running the trace as a separate second step, filter the deceased-no-contact
+rows out of that CSV yourself, or they get traced anyway.
 
 Each record ends up in the CRM, API-enriched, with grouped petition detail in
 Notes *and* Message Board, double skip traced, every number scored with a dial
@@ -494,6 +641,52 @@ Trestle twice.
     assigner of `DataSift`. Fixed 2026-08-24. Because phone tags are
     append-only, mis-attribution is permanent without manual UI cleanup.
 
+15. **The server rewrites addresses THREE different ways, and a real record
+    then reads as "never created."** Finding 8 recorded contraction only. The
+    full set, all verified live:
+    - **contracts**: `4920 South Troost Avenue` -> `4920 S Troost Ave`
+    - **expands**: `11300 N 118th E Ave` -> `11300 N 118Th East Ave` (2026-08-31)
+    - **drops a trailing directional**: `1752 E 56th St S` -> `1752 E 56Th St`
+      (2026-09-04)
+
+    Two separate bugs fell out of this on 2026-08-31, and both made a created,
+    indexed, CRM-visible record report as missing for a full 300s timeout plus
+    a pointless retry — which reads exactly like a create failure:
+    - `wait_for_properties.norm()` was a bare `.strip().lower()` even though
+      its own docstring claimed it normalized abbreviations, and
+      `datasift_uploader._addr_key()` was a **second copy** that had drifted
+      identically. Both now call one shared `datasift_api.address_key()`.
+      **If a match depends on both sides normalizing the same way, there must
+      be exactly one function** — two copies will drift.
+    - That scan reads the newest ~50 by `-created`, so a **pre-existing**
+      record (bulk-create leaves an existing address alone) is structurally
+      invisible to it. It now falls back to `find_property_by_address()`, which
+      searches by house number. Read-only — **not** the duplicate-400 trick,
+      which would create an invisible orphan.
+
+    `find_property_by_address()` now has three tiers: exact, ignore-street-type,
+    and ignore-trailing-directional. The third is **only accepted on a unique
+    match** — in Tulsa `E 56th St N` and `E 56th St S` are different streets, so
+    collapsing the directional could otherwise put notes, tags and skip-trace
+    spend on someone else's property. Order matters inside it: strip the
+    directional BEFORE the street type, or the two sides never line up.
+
+    **The lesson: a "not indexed" report is a claim about a LOOKUP, not about
+    existence.** Before re-submitting or waiting longer, run the lookup with a
+    positive control (an address known to exist) and a negative control
+    (gibberish, which must return None). That separated cause from symptom in
+    minutes both times.
+
+16. **`set_phone_tags()` can return success and apply nothing.** On 2026-09-04
+    it silently skipped 4 of 77 numbers on one record — same call, same payload
+    shape, same batch as 73 that worked. `verify_phone_tags()` caught it by
+    reading the record back; nothing in the response indicated a problem. This
+    is the append-only endpoint's second silent-failure mode (finding 4 was the
+    wrong payload shape). **Never treat the tagging step as done without the
+    verify pass**, and when it reports gaps, re-apply only to numbers whose tag
+    list is genuinely EMPTY — re-applying beside a correct tag is the
+    permanent mis-attribution of finding 14.
+
 #### Spend discipline
 
 **Ask the user before EVERY metered call, including Trestle** (standing
@@ -506,7 +699,18 @@ Do not infer authorization from a general "go ahead" earlier in a session.
 | DataSift skip trace | ~$0.12/owner | prepaid credits — **NOT** an unlimited plan |
 | TrestleIQ | ~$0.015/number | per unique number — **dedupe globally first** |
 
-A full record through the whole pipeline costs roughly **$0.15–$0.20**.
+A full record through the whole pipeline costs roughly **$0.15–$0.25**.
+
+**Do NOT quote a Trestle estimate by extrapolating a prior batch's phone
+count.** Tracerfy and DataSift are per-record and predictable; Trestle is per
+unique NUMBER, and numbers-per-record swings widely between batches — 4.8 on
+2026-08-31 (43 numbers / 9 records) versus 6.4 on 2026-09-04 (77 / 12). A
+projection built on the earlier batch came in 60% under on the later one and
+overshot a figure the user had already approved. The dry run's own Trestle line
+is **also** useless as a forecast: it reports ~$0 because no trace has run yet,
+so there are no numbers to score. Either quote a range wide enough to cover
+~4–8 numbers/record, or say the Trestle line cannot be known until the traces
+return — and re-confirm if it lands materially above what was approved.
 
 #### Verification discipline
 

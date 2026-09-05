@@ -29,17 +29,27 @@ Enforced, from free county data available before creation:
    fires even earlier than the assessor lookup. See `_CONDO_LEGAL_RE` for why
    the bare word "condominium" is NOT one of the signals.
 
-NOT enforced — be honest about this rather than implying otherwise:
+Deliberately NOT rejected:
 
-- **Single-family vs duplex/triplex is not distinguishable from the free data.**
+- **A duplex passes, on purpose.** User, 2026-09-04: *"I dont want condos but i
+  guess id be ok with a duplex but mostly want sfr."* So single-family is the
+  preference, a duplex is acceptable, and only condos are actually out. This
+  used to be documented here as a limitation ("cannot be distinguished from the
+  free data, a duplex will pass") — it is now the intended behaviour. **Do not
+  "fix" it by adding duplex rejection.**
+
+  The underlying detection limit is still real and still worth knowing:
   `AcctType` reads "Residential" for a duplex exactly as for a house, and the
   assessor's structure detail is rendered client-side from an endpoint that is
-  not exposed (checked 2026-09-04). A duplex will pass this gate.
-  DataSift's own `Structure Type` field arrives only AFTER enrichment, which
-  happens post-creation — too late for a gate whose whole purpose is to keep
-  the record out of the CRM. If catching duplexes matters, it needs either a
-  paid data source or a second pass that deletes after enrichment, and the
-  latter contradicts the "never hit the CRM" requirement.
+  not exposed (checked 2026-09-04). So the gate could not reject duplexes even
+  if it wanted to.
+
+  If SFR-vs-duplex is ever wanted as a *ranking* signal rather than a gate,
+  DataSift's `Structure Type` is the place to get it, and it is available
+  earlier than this file previously implied: enrichment is unmetered and runs
+  during `--create`, i.e. BEFORE any skip-trace spend. Too late to keep a
+  record out of the CRM, but in good time to deprioritise it or skip tracing
+  it. That would be a preference sort, not a rejection.
 
 `fail_open` is deliberate: a MISSING signal never rejects a record. A gate that
 silently drops leads on absent data is worse than one that lets a few through,
@@ -158,8 +168,8 @@ def apply_buy_box(rows: list[dict]) -> tuple[list[dict], list[dict]]:
 
 def describe() -> str:
     """One-line summary of the active criteria, for run logs and reports."""
-    return ("Buy box: single-family homes at minimum - must have a structure "
-            "(no bare land), a residential account type, and must not be a "
-            "condominium (unit-ownership legal description, or a unit "
-            "designator in the street address). NOTE: duplex/triplex cannot be "
-            "distinguished from free county data and will pass.")
+    return ("Buy box: single-family preferred - must have a structure (no bare "
+            "land), a residential account type, and must NOT be a condominium "
+            "(unit-ownership legal description, or a unit designator in the "
+            "street address). A duplex is acceptable and passes on purpose; "
+            "only condos are rejected on property type.")

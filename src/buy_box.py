@@ -21,6 +21,13 @@ Enforced, from free county data available before creation:
    8/8 on a real Tulsa batch. Bare land is out.
 2. **It is residential.** The assessor's `AcctType` separates Residential from
    Commercial / Agricultural / Industrial.
+3. **It is not a condominium** (added 2026-09-04, after the user deleted a
+   condo that reached the CRM). Neither criterion above catches one: a condo
+   has a structure, and `AcctType` reads "Residential" for it exactly as for a
+   house. Caught instead from the petition itself — a unit-ownership legal
+   description, or a trailing unit designator in the street address — so it
+   fires even earlier than the assessor lookup. See `_CONDO_LEGAL_RE` for why
+   the bare word "condominium" is NOT one of the signals.
 
 NOT enforced — be honest about this rather than implying otherwise:
 
@@ -112,7 +119,7 @@ def check_buy_box(row: dict) -> tuple[bool, list[str]]:
     #    earlier than the assessor lookup above, and it catches what AcctType
     #    cannot: a condo is "Residential" to the assessor exactly like a house.
     legal = str(row.get("Legal Description") or row.get("legal_description") or "")
-    if legal and _CONDO_LEGAL_RE.search(legal):
+    if legal and _CONDO_LEGAL_RE.search(legal):  # noqa: E501 - see _CONDO_LEGAL_RE on why not a bare keyword
         reasons.append("condominium - legal description is a unit-ownership "
                        "estate, not a single-family lot")
 
@@ -120,20 +127,6 @@ def check_buy_box(row: dict) -> tuple[bool, list[str]]:
     if street and _UNIT_ADDRESS_RE.search(street):
         reasons.append(f"address carries a unit designator ({street!r}) - "
                        "not a whole single-family house")
-
-    # 3. Condos / unit-ownership estates — not single-family homes.
-    #    Matched on the LEGAL DESCRIPTION's ownership language and on a unit
-    #    designator in the street address, never on the bare word
-    #    "condominium": that appears in the boilerplate rider checklist of most
-    #    uniform mortgages (14 of 22 petitions, only 1 an actual condo), so a
-    #    naive keyword match would reject most of a batch.
-    legal = str(row.get("Legal Description") or "").strip()
-    if legal and _CONDO_LEGAL_RE.search(legal):
-        reasons.append("legal description describes a condo / unit-ownership estate")
-
-    street = str(row.get("Property Street") or row.get("Property Street Address") or "").strip()
-    if street and _UNIT_ADDRESS_RE.search(street):
-        reasons.append(f"address carries a unit designator ({street}) - not a whole house")
 
     # --- future parameters go here -----------------------------------
     # Equity percentage and ZIP exclusions were named as likely additions.

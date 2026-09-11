@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Iterable
 
 import config
@@ -411,9 +411,45 @@ def tracerfy_source(subjects: list[dict], *, dry_run: bool = True) -> dict[str, 
     return people_by_subject
 
 
+#: Skip-trace job statuses that mean "still going". Anything else ("complete",
+#: or a failure state) ends the wait.
+_JOB_RUNNING = {"processing", "pending", "queued", "new", None}
+
+
+def _find_skip_trace_job(submitted_at: datetime, n_records: int) -> dict | None:
+    """The DataSift job this run just submitted, or None if not visible yet.
+
+    Newest skip-trace job created at or after the submission (2 minutes of
+    clock allowance) whose size matches. Size is `meta.total_properties`, not
+    `total`: on 2026-08-31 a 9-property job reported total=8 because one owner
+    was repeated. Matched on time + size because the submit response's shape
+    was never captured (it is logged from 2026-09-11 on).
+    """
+    floor = submitted_at - timedelta(minutes=2)
+    try:
+        jobs = _api.list_skip_trace_jobs()
+    except _api.DataSiftAPIError as e:
+        logger.warning("datasift_source: could not read the skip-trace job feed: %s", e)
+        return None
+    for j in jobs:                                   # newest first
+        try:
+            created = datetime.fromisoformat(
+                str(j.get("created") or "").replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        if created < floor:
+            break
+        size = (j.get("meta") or {}).get("total_properties", j.get("total"))
+        if size in (None, n_records):
+            return j
+    return None
+
+
 def datasift_source(subjects: list[dict], *, dry_run: bool = True,
-                     poll_seconds: float = 15.0,
-                     timeout_seconds: float = 300.0) -> dict[str, list[dict]]:
+                     poll_seconds: float = 20.0,
+                     timeout_seconds: float = 1800.0) -> dict[str, list[dict]]:
     """DataSift's own skip trace, SCOPED to these records. Second half of the
     double skip trace.
 
@@ -425,8 +461,11 @@ def datasift_source(subjects: list[dict], *, dry_run: bool = True,
     Returns {property_uuid: [Person]} for numbers that are NEW after the trace,
     so they get the DataSift source tag rather than Tracerfy's.
 
-    Asynchronous and not fast: observed 12s on one record and 150s on another.
-    Poll, don't assume failure.
+    Asynchronous and not fast: observed 12s on one record, 150s on another,
+    and ~11 MINUTES for a 2-record job on 2026-09-11. So the wait is on the
+    job's own status (_api.list_skip_trace_jobs), for up to 30 minutes, and a
+    job still running at the deadline marks its records `datasift_pending`
+    rather than reading as "found nothing". Poll, don't assume failure.
     """
     targets = [s for s in subjects if s.get("property_uuid")]
     if not targets:
@@ -444,26 +483,45 @@ def datasift_source(subjects: list[dict], *, dry_run: bool = True,
         logger.info("DRY RUN - not submitting DataSift skip trace")
         return {}
 
+    submitted_at = datetime.now(timezone.utc)
     _api.submit_skip_trace(uuids, max_records=len(uuids),
                             address_prefix=targets[0]["property_address"]
                             if len(targets) == 1 else "")
 
+    # WAIT ON THE JOB, not on a fixed clock. On 2026-09-11 the job took ~11
+    # minutes; the old 300s wait gave up at 5, scored and tagged without
+    # DataSift's numbers, and posted "no numbers returned" on a record DataSift
+    # then filled with two. The job's own status is readable
+    # (_api.list_skip_trace_jobs), so poll it until it stops "processing".
+    # The per-record signal stays as the fallback for when the job cannot be
+    # found in the feed.
     import time
     deadline = time.monotonic() + timeout_seconds
+    job: dict | None = None
     done: set[str] = set()
-    while time.monotonic() < deadline and len(done) < len(targets):
+    while time.monotonic() < deadline:
         time.sleep(poll_seconds)
+        job = _find_skip_trace_job(submitted_at, len(uuids)) or job
+        if job is not None:
+            if job.get("status") not in _JOB_RUNNING:
+                break
+            continue
         for s in targets:
             if s["property_uuid"] in done:
                 continue
             rec = _api.get_property(s["property_uuid"])
             if (rec.get("owner") or {}).get("skiptrace_attempts"):
                 done.add(s["property_uuid"])
-    if len(done) < len(targets):
-        logger.warning("datasift_source: %d/%d finished within %.0fs - the rest may "
-                        "still be running; re-read later rather than re-submitting "
-                        "(a re-submit is a second charge)",
-                        len(done), len(targets), timeout_seconds)
+        if len(done) == len(targets):
+            break
+    finished = ((job is not None and job.get("status") not in _JOB_RUNNING)
+                or len(done) == len(targets))
+    if job is not None:
+        meta = job.get("meta") or {}
+        logger.info("datasift_source: job %s %s, %s/%s processed, final cost %s "
+                     "(estimate %s)", job.get("uuid"), job.get("status"),
+                     job.get("processed"), job.get("total"),
+                     meta.get("final_cost"), meta.get("initial_cost"))
 
     out: dict[str, list[dict]] = {}
     for s in targets:
@@ -488,6 +546,21 @@ def datasift_source(subjects: list[dict], *, dry_run: bool = True,
         }]
         logger.info("datasift_source: %s -> %d new number(s)",
                      s["property_address"], len(new_phones))
+
+    if not finished:
+        # Never let a still-running job read as "DataSift found nothing". Each
+        # unfinished subject is flagged so build_message_board() says the trace
+        # is pending instead of posting "no numbers returned" - which went onto
+        # a live record on 2026-09-11 six minutes before DataSift filled it.
+        pending = [s for s in targets
+                   if s["property_uuid"] not in out and s["property_uuid"] not in done]
+        for s in pending:
+            s["datasift_pending"] = True
+        logger.warning("datasift_source: job still running after %.0fs - %d record(s) "
+                        "marked PENDING. Its numbers will land later UNSCORED and "
+                        "UNTAGGED. Do not re-submit (a second charge): once the job "
+                        "completes, score and tag only the numbers that are new.",
+                        timeout_seconds, len(pending))
     return out
 
 
@@ -755,14 +828,25 @@ def build_message_board(subject: dict, *, sources: list[str]) -> str:
     caller tie a number back to a person without the board becoming a phone
     dump.
     """
-    src = " + ".join(sources) if sources else "Skip trace"
     stamp = datetime.now().strftime("%m/%d/%Y")
     signing = _signing_chain_block(subject)
+    pending = bool(subject.get("datasift_pending"))
+    pending_note = ""
+    if pending:
+        # DataSift's job had not finished when this ran. Do not claim it as a
+        # source of the numbers below, and never say it returned nothing.
+        sources = [x for x in sources if x != SOURCE_DATASIFT]
+        pending_note = (f"DataSift skip trace still processing at {stamp} - its "
+                        f"numbers are NOT listed here and will arrive untiered.")
+    src = " + ".join(sources) if sources else "Skip trace"
     if not subject["has_results"]:
-        base = f"{src} attempted {stamp} - no numbers returned."
+        base = (f"{src} attempted {stamp} - no numbers yet. {pending_note}"
+                if pending else f"{src} attempted {stamp} - no numbers returned.")
         return f"{base}\n\n{signing}" if signing else base
 
     lines = [f"{src} - {stamp}", ""]
+    if pending:
+        lines += [pending_note, ""]
     # Who can actually sign, before the phone list. A caller needs to know
     # "this person signs alone" vs "one of ten heirs" BEFORE they talk price;
     # "best available contact" is not the same as "can convey clean title".
@@ -803,6 +887,79 @@ def build_message_board(subject: dict, *, sources: list[str]) -> str:
     return "\n".join(lines).rstrip()
 
 
+# ── Probate relationship tag ─────────────────────────────────────────
+
+#: Numbers a skip trace found. Only these can carry a person's relationship;
+#: a Pre-existing number's true owner is unknown.
+_TRACE_SOURCES = {SOURCE_TRACERFY, SOURCE_DATASIFT}
+
+#: Relationship phone tags that EXIST in the account (checked 2026-09-11:
+#: Daughter, Son, Wife, Husband, Grandchild, Relative). A filing's wording maps
+#: onto one of these, and any other family relationship becomes "Relative" -
+#: user: "just use relative and I can create niece and nephew another time".
+#: Never create a new relationship tag implicitly: phone tags are append-only,
+#: so a near-duplicate title can never be cleaned up.
+_REL_SPECIFIC = [
+    (re.compile(r"\bgrand(son|daughter|child|children|kid)s?\b"), "Grandchild"),
+    (re.compile(r"\bstep-?(son|daughter|child|children|mother|father|parent|brother|sister)s?\b"
+                r"|\b\w+[- ]in[- ]law\b"), "Relative"),
+    (re.compile(r"\bdaughters?\b"), "Daughter"),
+    (re.compile(r"\bsons?\b"), "Son"),
+    (re.compile(r"\b(wife|widow)\b"), "Wife"),
+    (re.compile(r"\b(husband|widower)\b"), "Husband"),
+]
+_REL_FAMILY = re.compile(
+    r"\b(niece|nephew|brother|sister|sibling|cousin|aunt|uncle|mother|father|"
+    r"parent|child|children|spouse|grand\w*|relative|kin)s?\b")
+
+
+def relationship_tag(text: str) -> str | None:
+    """Map a filing's relationship wording onto an EXISTING phone tag, or None.
+
+    "Daughter (first listed heir ...)"         -> "Daughter"
+    "Niece (Personal Representative)"          -> "Relative"
+    "Creditor - manager of L & S Group, LLC"   -> None (not family, no tag)
+
+    Word-bounded throughout: "Personal Representative" contains "son".
+    """
+    t = (text or "").lower()
+    for rx, tag in _REL_SPECIFIC:
+        if rx.search(t):
+            return tag
+    return "Relative" if _REL_FAMILY.search(t) else None
+
+
+def _same_person(a: str, b: str) -> bool:
+    """Loose name identity: the shorter name's first and last tokens both
+    appear in the longer. "Wendy Johnson" == "Wendy Jean Johnson" ==
+    "Johnson, Wendy"."""
+    drop = {"JR", "SR", "II", "III", "IV"}
+    ta = [t for t in re.findall(r"[A-Za-z]{2,}", a.upper()) if t not in drop]
+    tb = [t for t in re.findall(r"[A-Za-z]{2,}", b.upper()) if t not in drop]
+    if not ta or not tb:
+        return False
+    short, long_ = (ta, tb) if len(ta) <= len(tb) else (tb, ta)
+    return short[0] in long_ and short[-1] in long_
+
+
+def _primary_relationship_tag(subject: dict) -> str | None:
+    """Relationship tag for the traced subject's own numbers, or None.
+
+    Only when the record carries a probate DM Relationship AND the traced owner
+    is the Decision Maker it describes: a relationship belongs to one person,
+    and on anyone else's numbers it would be a permanent false label.
+    """
+    rel = relationship_tag(subject.get("dm_relationship") or "")
+    if not rel:
+        return None
+    dm = (subject.get("decision_maker") or "").strip()
+    if dm and not _same_person(dm, subject.get("name") or ""):
+        logger.warning("relationship tag skipped for %s: the filing's Decision "
+                        "Maker is %s", subject.get("name"), dm)
+        return None
+    return rel
+
+
 def writeback(subjects: list[dict], *, sources: list[str],
                dry_run: bool = True) -> dict:
     """Write phones + tags + one message-board post per record.
@@ -831,6 +988,12 @@ def writeback(subjects: list[dict], *, sources: list[str],
             # items carry a `tags` array of tag UUIDs.
             phones, scored_any = [], False
             number_to_tags: dict[str, list[str]] = {}
+            # Probate: the traced subject IS an heir or the PR, so the numbers
+            # a skip trace found for them get the relationship the filing
+            # states (user, 2026-09-11). Tyler Austin's rule - the owner's own
+            # numbers carry source + tier only - still holds everywhere else:
+            # a foreclosure owner is nobody's relative, and this returns None.
+            rel_tag = _primary_relationship_tag(s)
             for p in s["people"]:
                 for ph in p["phones"]:
                     entry = {"number": ph["number"]}
@@ -844,6 +1007,12 @@ def writeback(subjects: list[dict], *, sources: list[str],
                         scored_any = True
                     if p.get("relationship") and not p["is_primary"]:
                         tags.append(p["relationship"])
+                    elif (p["is_primary"] and rel_tag
+                          and set(ph.get("sources") or []) & _TRACE_SOURCES):
+                        # Only numbers a trace found for THIS person. A
+                        # Pre-existing number's owner is unknown, and the tag
+                        # is permanent.
+                        tags.append(rel_tag)
                     # All of a number's tags go in ONE item — the endpoint
                     # accepts several per number, and batching avoids N calls.
                     number_to_tags.setdefault(ph["number"], []).extend(tags)
@@ -859,19 +1028,21 @@ def writeback(subjects: list[dict], *, sources: list[str],
                 else:
                     deduped = {n: sorted(set(t)) for n, t in number_to_tags.items() if t}
                     try:
-                        _api.set_phone_tags(deduped)
-                        if not dry_run:
-                            # The tag endpoint returns an empty body whether it
-                            # worked or silently did nothing, so the record is
-                            # the only trustworthy signal.
-                            check = _api.verify_phone_tags(owner_uuid, deduped)
-                            if not check["ok"]:
-                                result["skipped"].append({
-                                    "street": s["property_address"],
-                                    "reason": f"phone tags did not land: {check['missing']}"})
-                            else:
-                                result["tagged_phones"] = (
-                                    result.get("tagged_phones", 0) + len(deduped))
+                        # Sent, read back, and re-sent ONCE to any number that
+                        # came back with no tags at all - see
+                        # _api.apply_phone_tags_verified. The endpoint returns
+                        # an empty body whether it worked or silently did
+                        # nothing, so the record is the only trustworthy signal.
+                        check = _api.apply_phone_tags_verified(owner_uuid, deduped)
+                        if check.get("retried"):
+                            result.setdefault("tag_retries", []).extend(check["retried"])
+                        if not check["ok"]:
+                            result["skipped"].append({
+                                "street": s["property_address"],
+                                "reason": f"phone tags did not land: {check['missing']}"})
+                        elif not dry_run:
+                            result["tagged_phones"] = (
+                                result.get("tagged_phones", 0) + len(deduped))
                     except _api.DataSiftAPIError as e:
                         logger.warning("phone tags failed on %s: %s", uuid, e)
                         result["skipped"].append({"street": s["property_address"],

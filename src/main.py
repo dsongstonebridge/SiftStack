@@ -1334,6 +1334,49 @@ def _enrich_probate_rows(rows: list[dict]) -> list[dict]:
     return rows
 
 
+#: Probate columns that must ride along into run_pipeline(). resolve_subjects()
+#: reads them off each row for the Message Board's SIGNING CHAIN block and the
+#: heir's relationship phone tag. Until 2026-09-11 both trace paths passed ONLY
+#: street/city/first/last, and the fallback reads CRM custom fields this
+#: account does not have - so SIGNING CHAIN was never posted on a live run and
+#: the relationship tag had nothing to read.
+_PROBATE_TRACE_COLUMNS = (
+    "Decision Maker", "DM Relationship", "Personal Representative",
+    "Decedent Name", "Date of Death", "Heir Count", "Heirs",
+    "Heirs Deceased", "Heirs Address Unknown", "Additional Parcels",
+)
+
+
+def _trace_row(r: dict) -> dict | None:
+    """One input row -> the shape run_pipeline() takes; None without a street.
+
+    Shared by `skip-trace --create` (property template) and plain
+    `skip-trace --csv-path` (DataSift-ready CSV) so the two cannot drift.
+    Probate values are passed as strings: a real Excel date would otherwise
+    reach _signing_chain_block() as a datetime and crash its .strip().
+    """
+    street = (r.get("Property Street Address") or r.get("Property Street")
+              or r.get("street") or "").strip()
+    if not street:
+        return None
+    row = {
+        "street": street,
+        "city": (r.get("Property City") or r.get("city") or "").strip(),
+        "first": (r.get("Owner First Name") or r.get("First Name")
+                  or r.get("first") or "").strip(),
+        "last": (r.get("Owner Last Name") or r.get("Last Name")
+                 or r.get("last") or "").strip(),
+    }
+    for col in _PROBATE_TRACE_COLUMNS:
+        v = r.get(col)
+        if v is None:
+            continue
+        v = v.strftime("%m/%d/%Y") if hasattr(v, "strftime") else str(v).strip()
+        if v:
+            row[col] = v
+    return row
+
+
 def _create_records_for_batch(args, csv_path: Path) -> list[dict] | None:
     """`--create` front end: raw property template -> CRM records, ready for
     run_pipeline() to trace and score.
@@ -1433,11 +1476,7 @@ def _create_records_for_batch(args, csv_path: Path) -> list[dict] | None:
         logging.error("Upload did not succeed - stopping before any billed step.")
         return None
 
-    return [{"street": (r.get("Property Street") or "").strip(),
-             "city": (r.get("Property City") or "").strip(),
-             "first": (r.get("First Name") or "").strip(),
-             "last": (r.get("Last Name") or "").strip()}
-            for r in alive]
+    return [row for row in (_trace_row(r) for r in alive) if row]
 
 
 def _run_skip_trace(args) -> None:
@@ -1489,18 +1528,9 @@ def _run_skip_trace(args) -> None:
     elif getattr(args, "csv_path", None):
         with open(args.csv_path, encoding="utf-8-sig", newline="") as fh:
             for r in _csv.DictReader(fh):
-                street = (r.get("Property Street Address") or r.get("Property Street")
-                          or r.get("street") or "").strip()
-                if not street:
-                    continue
-                rows.append({
-                    "street": street,
-                    "city": (r.get("Property City") or r.get("city") or "").strip(),
-                    "first": (r.get("Owner First Name") or r.get("First Name")
-                              or r.get("first") or "").strip(),
-                    "last": (r.get("Owner Last Name") or r.get("Last Name")
-                             or r.get("last") or "").strip(),
-                })
+                row = _trace_row(r)
+                if row:
+                    rows.append(row)
     elif getattr(args, "street", None):
         rows = [{"street": args.street, "city": getattr(args, "city", "") or "",
                  "first": getattr(args, "first", "") or "",

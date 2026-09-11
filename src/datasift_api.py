@@ -384,6 +384,34 @@ def _strip_suffix(normalized: str) -> str:
     return " ".join(toks)
 
 
+def _strip_dir(normalized: str) -> str:
+    """Drop a trailing directional ("1752 E 56TH ST S" -> "1752 E 56TH ST").
+
+    The server drops it on write (verified live 2026-09-04 and 2026-09-11).
+    Only ever used to accept a UNIQUE match: in Tulsa "E 56th St S" and
+    "E 56th St N" are different streets.
+    """
+    toks = normalized.split()
+    if len(toks) > 2 and toks[-1] in _DIRECTIONALS:
+        toks = toks[:-1]
+    return " ".join(toks)
+
+
+def _bare_street(normalized: str) -> str:
+    """Street with its trailing directional AND street type dropped.
+
+    Order matters: directional FIRST, then street type. Reversed, the sent
+    "1752 E 56TH ST S" keeps its "ST" (the trailing token is "S", not a street
+    type, so _strip_suffix is a no-op) while the stored "1752 E 56TH ST" loses
+    it - and the two never line up.
+
+    One module-level definition, shared by find_property_by_address() and
+    wait_for_properties(): when a match depends on both sides normalizing the
+    same way, two copies drift and a real record reads as missing.
+    """
+    return _strip_suffix(_strip_dir(normalized))
+
+
 def find_property_by_address(street: str, city: str = "", state: str = "") -> dict | None:
     """Resolve one property by address, or None. Read-only — unlike the
     duplicate-400 trick, it never creates anything on a miss.
@@ -448,22 +476,10 @@ def find_property_by_address(street: str, city: str = "", state: str = "") -> di
         # therefore only accepted when it resolves to exactly ONE candidate —
         # with two, there is no way to tell which was meant, and guessing
         # would put notes, tags and skip-trace spend on someone else's record.
-        def _strip_dir(normalized: str) -> str:
-            toks = normalized.split()
-            if len(toks) > 2 and toks[-1] in _DIRECTIONALS:
-                toks = toks[:-1]
-            return " ".join(toks)
-
-        # Order matters: directional FIRST, then street type. Reversed, the
-        # sent "1752 E 56TH ST S" keeps its "ST" (the trailing token is "S",
-        # not a street type, so _strip_suffix is a no-op) while the stored
-        # "1752 E 56TH ST" loses it — and the two never line up.
-        def _bare(n: str) -> str:
-            return _strip_suffix(_strip_dir(n))
-
-        want_nd = _bare(want)
+        # Directional first, then street type - see _bare_street().
+        want_nd = _bare_street(want)
         cands = [r for r in results
-                 if _bare(_norm_street((r.get("address") or {}).get("street"))) == want_nd
+                 if _bare_street(_norm_street((r.get("address") or {}).get("street"))) == want_nd
                  and city_ok(r.get("address") or {})]
         if len(cands) == 1:
             stored = (cands[0].get("address") or {}).get("street")
@@ -620,6 +636,59 @@ def bulk_create_properties(records: list[dict], *,
     return jobs
 
 
+def _scan_page_matches(items: list[dict], remaining: set[str]) -> list[tuple[str, dict]]:
+    """Match one page of the -created listing against the addresses still awaited.
+
+    Returns (awaited_key, record) pairs in page order: exact address_key()
+    matches first, then matches through a trailing directional the server
+    dropped on write - sent "4529 E Xyler St N", stored "4529 E Xyler St"
+    (verified live 2026-09-11). Before this, the scan looked straight at the
+    brand-new record on every poll without recognising it, sat out the whole
+    300s timeout, and the fallback lookup then found it and logged it as
+    "pre-existing" - on the single newest record in the CRM. Every Tulsa
+    address ending N/S/E/W paid that five minutes.
+
+    The directional match is deliberately narrow, because in Tulsa
+    "E 56th St N" and "E 56th St S" are different streets:
+      - the SENT street must end in a directional and the STORED one must not
+        (a stored street that still carries one is some other street);
+      - the bare street+city must identify exactly ONE awaited address and
+        exactly ONE otherwise-unmatched record on the page.
+    Anything ambiguous is left to the timeout fallback, which applies the same
+    unique-candidate rule across the whole account.
+    """
+    hits: list[tuple[str, dict]] = []
+    unmatched: list[tuple[str, dict]] = []
+    for rec in items:
+        addr = rec.get("address") or {}
+        key = address_key(addr.get("street"), addr.get("city"))
+        (hits if key in remaining else unmatched).append((key, rec))
+
+    exact = {k for k, _ in hits}
+    awaited: dict[str, list[str]] = {}
+    for k in remaining - exact:
+        street, _, city = k.partition("|")
+        if _strip_dir(street) != street:           # sent WITH a directional
+            awaited.setdefault(f"{_bare_street(street)}|{city}", []).append(k)
+    if not awaited:
+        return hits
+
+    on_page: dict[str, list[dict]] = {}
+    for key, rec in unmatched:
+        street, _, city = key.partition("|")
+        if _strip_dir(street) == street:           # stored WITHOUT one
+            on_page.setdefault(f"{_bare_street(street)}|{city}", []).append(rec)
+
+    for bare, keys in awaited.items():
+        recs = on_page.get(bare, [])
+        if len(keys) == 1 and len(recs) == 1:
+            logger.info("wait_for_properties: matched %r to stored %r by ignoring a "
+                        "trailing directional (server dropped it; unique on both sides)",
+                        keys[0], (recs[0].get("address") or {}).get("street"))
+            hits.append((keys[0], recs[0]))
+    return hits
+
+
 def wait_for_properties(addresses: list[tuple[str, str]], *,
                          timeout_seconds: float = 300.0,
                          poll_seconds: float = 10.0,
@@ -675,9 +744,9 @@ def wait_for_properties(addresses: list[tuple[str, str]], *,
     while True:
         body = _request("GET", f"{CORE_BASE}/api/internal/property/",
                          params={"ordering": "-created", "limit": page}) or {}
-        for rec in _page_items(body):
-            addr = rec.get("address") or {}
-            key = norm(addr.get("street"), addr.get("city"))
+        # Exact address_key() matches, then the server's dropped trailing
+        # directional (unique on both sides) - see _scan_page_matches().
+        for key, rec in _scan_page_matches(_page_items(body), remaining):
             if key not in remaining:
                 continue
             if verify_live:
@@ -709,9 +778,15 @@ def wait_for_properties(addresses: list[tuple[str, str]], *,
                 except DataSiftAPIError:
                     continue
                 if hit:
+                    # NOT proof the record pre-existed. Until 2026-09-11 this
+                    # said "pre-existing record", and on a brand-new record the
+                    # scan had failed to normalize it sent a live run chasing a
+                    # record history that did not exist.
                     logger.info("wait_for_properties: %r resolved by address "
-                                 "lookup (pre-existing record, not in the "
-                                 "newest-%d page)", street, page)
+                                 "lookup (not matched in the newest-%d page: "
+                                 "either it pre-existed, or the server rewrote "
+                                 "the address in a way the scan does not "
+                                 "normalize)", street, page)
                     found[key] = hit
                     remaining.discard(key)
         if not remaining:
@@ -1053,12 +1128,35 @@ def submit_skip_trace(property_uuids: list[str], *, address_prefix: str = "",
                     n, est.get("cost"), est.get("balance"))
     body = _skip_trace_body(property_uuids, address_prefix=address_prefix,
                              property_type=property_type, estimate=False)
-    return _request("POST", f"{CORE_BASE}/api/internal/property/skip-trace/",
+    resp = _request("POST", f"{CORE_BASE}/api/internal/property/skip-trace/",
                      json_body=body)
+    # Logged because datasift_source() used to discard it, which left no record
+    # of what DataSift said when it took the job (2026-09-11).
+    logger.info("submit_skip_trace: response %s", str(resp)[:300])
+    return resp
 
 
 def get_skip_trace_stats() -> dict:
     return _request("GET", f"{CORE_BASE}/api/internal/activity/skiptrace/stats/")
+
+
+def list_skip_trace_jobs() -> list[dict]:
+    """Every DataSift skip-trace job, NEWEST FIRST.
+
+    `GET /api/internal/activity/?type=skip_trace`. Each item carries `status`
+    ("processing" -> "complete"), `total`/`processed`, and `meta` with
+    `total_properties`, `initial_cost` and `final_cost` - the real charge; a
+    no-result record costs $0. Found 2026-09-11, and it is the ONLY place a
+    running job is visible: the owner's `skiptrace_attempts` stays 0 and the
+    account's `value_spent` does not move until the job finishes.
+
+    The endpoint ignores `ordering` when filtered by type (a limit-5 read came
+    back Jul, Jul, Jul, Aug, Jun), so every page is read and sorted here - with
+    85+ jobs the newest is not guaranteed to be on page one. Note the spelling:
+    `type=skiptrace` (no underscore) silently returns zero jobs.
+    """
+    jobs = get_all(f"{CORE_BASE}/api/internal/activity/", params={"type": "skip_trace"})
+    return sorted(jobs, key=lambda j: j.get("created") or "", reverse=True)
 
 
 def _enrich_body(property_uuids: list[str], *, search: str = "",
@@ -1256,7 +1354,10 @@ def set_phone_tags(number_to_tags: dict[str, list[str]]) -> dict:
                        json_body=items)
     if _DRY_RUN:
         return {"tagged": len(items), "dry_run": True}
-    logger.info("set_phone_tags: applied tags to %d number(s)", len(items))
+    # "sent", not "applied": the endpoint returns an empty body whether it
+    # worked or not, and it has silently applied nothing (7 of 7 numbers on
+    # 2026-09-11). Only verify_phone_tags() knows.
+    logger.info("set_phone_tags: sent tags for %d number(s) (unverified)", len(items))
     return {"tagged": len(items), "result": result, "wanted": wanted}
 
 
@@ -1289,7 +1390,57 @@ def verify_phone_tags(owner_uuid: str, number_to_tags: dict[str, list[str]]) -> 
     if missing:
         logger.warning("verify_phone_tags: %d number(s) missing tags: %s",
                         len(missing), missing)
-    return {"ok": not missing, "missing": missing}
+    return {"ok": not missing, "missing": missing,
+            "on_record": {n: sorted(t) for n, t in on_record.items()}}
+
+
+def apply_phone_tags_verified(owner_uuid: str, number_to_tags: dict[str, list[str]], *,
+                              retry_pause: float = 3.0) -> dict:
+    """set_phone_tags() + verify_phone_tags(), with ONE automatic re-send for
+    numbers that came back carrying NO tags at all.
+
+    set_phone_tags() has returned success and applied nothing: 4 of 77 numbers
+    on 2026-09-04, and all 7 of one record's numbers on 2026-09-11. Re-sending
+    the same mapping worked first time on both occasions, so the retry is part
+    of the pipeline now rather than a hand-run script.
+
+    Re-sends ONLY to numbers whose tag list is genuinely EMPTY. Tags are
+    append-only: a number carrying some of its tags is left alone and
+    reported, because re-sending beside a tag that did land is how a number
+    ends up with a permanent wrong attribution.
+
+    Returns verify_phone_tags()'s shape plus `retried` (numbers re-sent) and
+    `partial` (numbers left alone with a gap).
+    """
+    set_phone_tags(number_to_tags)
+    if _DRY_RUN:
+        return {"ok": True, "missing": {}, "on_record": {}, "retried": [],
+                "partial": {}, "dry_run": True}
+    check = verify_phone_tags(owner_uuid, number_to_tags)
+    check.update(retried=[], partial={})
+    if check["ok"]:
+        return check
+
+    on_record = check.get("on_record") or {}
+    empty = {n: number_to_tags[n] for n in check["missing"] if not on_record.get(n)}
+    partial = {n: gap for n, gap in check["missing"].items() if n not in empty}
+    if partial:
+        logger.warning("phone tags: %d number(s) PARTIALLY tagged - not re-sent "
+                        "(append-only; fix by hand): %s", len(partial), partial)
+    if not empty:
+        check["partial"] = partial
+        return check
+
+    logger.warning("phone tags: %d number(s) came back with NO tags - re-sending once",
+                    len(empty))
+    time.sleep(retry_pause)
+    set_phone_tags(empty)
+    again = verify_phone_tags(owner_uuid, number_to_tags)
+    again.update(retried=sorted(empty), partial=partial)
+    if again["ok"]:
+        logger.info("phone tags: re-send landed - all %d number(s) verified",
+                     len(number_to_tags))
+    return again
 
 
 # ── Filter presets ────────────────────────────────────────────────────

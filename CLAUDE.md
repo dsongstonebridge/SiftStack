@@ -245,11 +245,12 @@ The default obituary path extracts survivors/heirs from obituary text with an LL
 - `numpy>=1.26.0` — required by OpenCV
 - `dropbox>=12.0.2` — Dropbox SDK (minimum for post-Jan-2026 API compatibility)
 
-## Tulsa Probate Pipeline (OSCN) — BUILT, NOT YET RUN
+## Tulsa Probate Pipeline (OSCN) — BUILT, FIRST LIVE RUN 2026-09-11
 
-**Status as of 2026-09-04: the steps are built and verified. Nothing has been
-uploaded to the CRM and nothing has been skip traced.** Only the orchestration
-("the chain") is missing — every link works and is tested individually.
+**Status: first live run 2026-09-11 — 2 records (PB-2026-0760 Ross,
+PB-2026-0761 Johnson), $0.46 all in, every number verified tagged.** It exposed
+four pipeline bugs, all fixed the same day — see "Lessons from the first live
+run" below.
 
 ### What exists
 
@@ -263,6 +264,8 @@ uploaded to the CRM and nothing has been skip traced.** Only the orchestration
 | Trace at the person's address | `resolve_subjects()` -> `trace_*` | probate never falls back to the property |
 | Repeat-PR dedupe | `tracerfy_source()` | billed once, credited to every record |
 | **The chain** | `_create_records_for_batch()` | enrich -> buy box -> review, all before creation |
+| Probate columns into the trace | `main._trace_row()` | SIGNING CHAIN + relationship survive both paths |
+| Relationship phone tag | `relationship_tag()`, `_primary_relationship_tag()` | heir's numbers: Daughter/Son/Wife/Husband/Grandchild, else Relative |
 
 **The skill's column list and `_PROBATE_SECTIONS` must stay in sync.** A field
 in one and not the other is extracted and then silently dropped — same trap as
@@ -405,22 +408,79 @@ metes-and-bounds parcel (`R90328032815610`) with no street address. A
 grandchild-heir lives in the estate property. Artifacts in
 `output/probate_discovery/`.
 
+### Lessons from the first live run (2026-09-11)
+
+Fixed the same day. Offline tests: `tests/test_probate_pipeline_fixes.py` (25,
+all mocked — nothing billed), plus a read-only check against the live CRM.
+
+1. **DataSift's skip trace took ~11 minutes; the pipeline waited 5.** It then
+   scored, tagged and posted without DataSift's numbers, and told Rhonda
+   Thomas's Message Board "no numbers returned" minutes before DataSift filled
+   it with two. The job IS observable: `GET /api/internal/activity/?type=skip_trace`
+   (`status` processing -> complete; `meta.final_cost` is the real charge; the
+   endpoint ignores `ordering`, so `list_skip_trace_jobs()` reads every page and
+   sorts). `datasift_source()` now waits on the job for up to 30 minutes, and a
+   job still running at the deadline marks its records `datasift_pending`, so
+   the board says "still processing" instead of "no numbers returned".
+2. **`set_phone_tags()` silently applied nothing to 7 of 7 numbers** (4 of 77 on
+   2026-09-04). `writeback()` now goes through `apply_phone_tags_verified()`:
+   send, read back, re-send ONCE to numbers whose tag list is genuinely empty,
+   never to a partly-tagged one.
+3. **Probate phone numbers carry the heir's relationship** (user rule). The
+   traced heir/PR's numbers get the relationship the filing states, mapped onto
+   the EXISTING phone tags — Daughter, Son, Wife, Husband, Grandchild — and
+   anything else becomes `Relative`. Do not create Niece/Nephew tags; the user
+   will. Only numbers a trace found (never Pre-existing), and only when the
+   owner is the filing's Decision Maker. Foreclosure owners still get source +
+   tier only.
+4. **The 300s `wait_for_properties` stall was a dropped trailing directional.**
+   Sent `4529 E Xyler St N`, stored `4529 E Xyler St`: the newest-50 scan never
+   matched the brand-new record, and the fallback then logged it
+   "pre-existing" — a guess, on the single newest record in the CRM. The scan
+   now matches through a dropped directional when it is unique on both sides.
+   Re-checked live: 1.3s.
+
+Also fixed: **both trace paths passed only street/city/first/last into
+`run_pipeline()`, so the Message Board's SIGNING CHAIN block had never been
+posted on a live run.** `main._trace_row()` now carries the probate columns on
+both paths.
+
+**Running the billed step.** The `--create` dry run already creates the records
+and posts their notes and Message Board. Re-running the same command with
+`--commit` would post both again on every record — `upload_to_datasift()`
+writes them for every record it resolves, existing or not (read from the code,
+not tested live). So after a `--create` dry run, run the billed half
+trace-only: `skip-trace --csv-path output/datasift_ready_probate_<date>.csv
+--commit`. That path reads CSV only, never the `.xlsx`.
+
+**Common names defeat the decedent search.** "Tina Johnson" returned a 26-way
+tie at 0.67. The Johnson house was found by searching the creditor LLC named in
+the petition and matching it to the heir's listed address. A lease-to-own
+leaves title with the seller, and the buy box does not check who holds title.
+
 ### Known gaps
 
-1. **Never run live.** The chain is built and tested against the real Tulsa
-   batch with the upload stubbed, but no probate record has ever been created
-   or traced.
+1. **`--create` is not safe to re-run** — it re-posts notes and the Message
+   Board on records that already exist (see "Running the billed step" above).
+   Making it skip records already created would let both pipelines work as
+   "same command, just add `--commit`".
 2. Multi-parcel estates: parcels with no situs address ride on the addressed
    record as `additional_parcels`; `output/probate_template_SAMPLE.csv` still
    wrongly assumes one row per case.
 3. Single-family vs duplex is not detectable from free data (see above).
 4. `Signing Chain Count` / `Heirs Living` are still not computed — the Message
    Board's SIGNING CHAIN block carries the heir count and who can sign instead.
+5. No buy-box check for who holds title (lease-to-own, contract for deed).
+6. The native property fields `personal_representative` / `probate_open_date`
+   stay empty — the pipeline sends them as custom fields this account does not
+   have ("unknown custom field").
+7. The `probate-info-extraction` skill's cost section is corrupted (dollar
+   figures replaced by words: "~Two.02", "OSCN.20-2.40").
 
 ### `--create` WRITES TO THE CRM WITHOUT `--commit`
 
-`_create_records_for_batch()` runs at `main.py:1258`, **before** `dry` is computed
-at `main.py:1285`, and calls `upload_to_datasift()` unconditionally. **The dry-run
+`_create_records_for_batch()` runs in `_run_skip_trace()` **before** `dry` is
+computed, and calls `upload_to_datasift()` unconditionally. **The dry-run
 gate protects spend, not the CRM.** Any trial of `skip-trace --create` puts real
 records in DataSift — which is exactly why the buy box and `batch_review.py` run
 on the extracted sheet, before creation, rather than as a post-upload cleanup.
@@ -448,7 +508,11 @@ self-contained request — don't ask which folder or which command:
    (28 columns, fresh per batch, never appended).
 3. `python src/main.py skip-trace --csv-path "output/petition_batch.xlsx"
    --create --notice-type foreclosure --county Tulsa` — **a dry run**. Report
-   the estimate, ask before `--commit`.
+   the estimate, ask before `--commit`. **Do not re-run that command with
+   `--commit` added**: the dry run already created the records and posted their
+   notes, and a second `--create` posts them again. Run the billed half
+   trace-only from the `datasift_ready_*.csv` it wrote (and mind the Owner
+   Alive gap below).
 4. Verify by reading records back: tags by TITLE, tiers against Trestle's own
    `assigned_tag`.
 
@@ -662,8 +726,11 @@ Trestle twice.
     Ty gets removed from this repo, whether or not it currently runs. It is
     reference, not a production path.
 
-12. **Skip trace is asynchronous and slow.** Observed 12s on one record and
-    150s on another. Poll `skiptrace_attempts`/`skiptraced`; never conclude
+12. **Skip trace is asynchronous and slow.** Observed 12s on one record, 150s
+    on another, and **~11 minutes** for a 2-record job on 2026-09-11. The job is
+    visible at `GET /api/internal/activity/?type=skip_trace` (`status`,
+    `processed`/`total`, `meta.final_cost`) via `list_skip_trace_jobs()`; the
+    owner's `skiptrace_attempts` stays 0 until it finishes. Never conclude
     failure early and never re-submit to "make sure" — that is a second charge.
 
 13. **Emails as objects make bulk-create SILENTLY DROP the record.** Owner
@@ -721,6 +788,9 @@ Trestle twice.
     collapsing the directional could otherwise put notes, tags and skip-trace
     spend on someone else's property. Order matters inside it: strip the
     directional BEFORE the street type, or the two sides never line up.
+    As of 2026-09-11 `wait_for_properties()`'s own scan applies the same rule
+    (`_scan_page_matches()`, sharing `_bare_street()` with the lookup) — before
+    that, every Tulsa N/S/E/W address sat out the full 300s timeout.
 
     **The lesson: a "not indexed" report is a claim about a LOOKUP, not about
     existence.** Before re-submitting or waiting longer, run the lookup with a
@@ -736,7 +806,9 @@ Trestle twice.
     wrong payload shape). **Never treat the tagging step as done without the
     verify pass**, and when it reports gaps, re-apply only to numbers whose tag
     list is genuinely EMPTY — re-applying beside a correct tag is the
-    permanent mis-attribution of finding 14.
+    permanent mis-attribution of finding 14. It hit 7 of 7 numbers on
+    2026-09-11; `writeback()` now does the verify-and-re-send-once itself via
+    `apply_phone_tags_verified()`.
 
 #### Spend discipline
 

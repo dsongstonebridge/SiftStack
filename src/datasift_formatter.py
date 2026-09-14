@@ -1077,9 +1077,9 @@ _PROBATE_SECTIONS: list[tuple[str, list[str]]] = [
         "Testate", "Marital Status",
     ]),
     ("ESTATE", [
-        "Real Property Stated", "Title Holder of Record", "Property Confirmed",
-        "Estate Value", "Inventory Waived", "Legal Description",
-        "Additional Parcels",
+        "Real Property Stated", "Title Holder of Record", "Insider Transfer",
+        "Property Confirmed", "Estate Value", "Inventory Waived",
+        "Legal Description", "Additional Parcels",
     ]),
     ("REPRESENTATIVE", [
         "Personal Representative", "PR Status", "PR Relationship", "PR Address",

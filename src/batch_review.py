@@ -68,22 +68,39 @@ def _flag(findings: list[dict], row_no: int, sev: str, field: str,
 
 
 def _name_key_parts(name: str) -> tuple[str, str]:
-    """First and last name word, generational suffixes stripped, lowercased.
+    """First and last name TOKEN, generational suffixes stripped, lowercased -
+    the same alpha-run tokenizer as `_title_tokens`, not a naive whitespace
+    split.
+
+    Using the same tokenizer on both sides matters: "D'Angelo Bitson" split
+    naively keeps "d'angelo" as one token (apostrophe intact), while
+    `_title_tokens` regex-extracts it as "d" and "angelo" - the two would
+    never match a naive split's "d'angelo".
 
     Deliberately ignores middle names/initials - "Robert Clarence Lovelace"
     matches a title holder recorded as "LOVELACE, ROBERT C", which omits the
     middle name entirely. Requiring the full name would false-block the
     ordinary case.
     """
-    words = [w.strip(",.") for w in name.split() if w.strip(",.")]
-    words = [w for w in words if w.upper() not in {"JR", "SR", "II", "III", "IV", "V"}]
-    if not words:
+    toks = [t for t in re.findall(r"[a-z]+", name.lower())
+            if len(t) > 1 and t not in {"jr", "sr", "ii", "iii", "iv", "v"}]
+    if not toks:
         return "", ""
-    return words[0].lower(), words[-1].lower()
+    return toks[0], toks[-1]
 
 
 def _title_tokens(s: str) -> set[str]:
     return {t for t in re.findall(r"[a-z]+", s.lower()) if len(t) > 1}
+
+
+def _heir_names(heirs_field: str) -> list[str]:
+    """Names out of a "Name (Relationship); Name (Relationship)" blob."""
+    names = []
+    for chunk in (heirs_field or "").split(";"):
+        name = chunk.split("(")[0].strip()
+        if name:
+            names.append(name)
+    return names
 
 
 def review_batch(rows: list[dict], *, notice_type: str = "probate") -> list[dict]:
@@ -197,13 +214,21 @@ def review_batch(rows: list[dict], *, notice_type: str = "probate") -> list[dict
                 break
 
         # ── not-straightforward probate property: STOP AND ASK ───────
-        # User, 2026-09-11 (Johnson incident): "On all the situations that
-        # aren't straightforward, you need to stop and ask me." Straightforward
-        # = the decedent is the confirmed title holder of record. Everything
-        # else BLOCKs until the sheet marks "Property Confirmed" = Yes - set
-        # by a human, never inferred by this code.
+        # User, 2026-09-11 (Johnson incident) + 2026-09-14 (video walkthrough
+        # of Chu/Malick/Bitson): "On all the situations that aren't
+        # straightforward, you need to stop and ask me." Straightforward means
+        # the title holder of record resolves to someone ORDINARY and
+        # EXPECTED - the decedent, their own trust, or ANY named PR/heir
+        # (Bitson: the living spouse held title and was never in the
+        # decedent's own name at all) - AND there is no sign the property
+        # passed through a transfer connected to the estate to get there
+        # (Chu/Johnson: the current holder got there via a transfer FROM
+        # someone named in the filing). Everything else BLOCKs until the
+        # sheet marks "Property Confirmed" = Yes - set by a human, never
+        # inferred by this code.
         if is_probate and street:
             title_holder = str(r.get("Title Holder of Record") or "").strip()
+            insider_transfer = str(r.get("Insider Transfer") or "").strip()
             confirmed = str(r.get("Property Confirmed") or "").strip().lower() == "yes"
             sev = WARN if confirmed else BLOCK
             tail = " (user confirmed)" if confirmed else ""
@@ -214,17 +239,23 @@ def review_batch(rows: list[dict], *, notice_type: str = "probate") -> list[dict
                       "found for this property; the decedent's ownership has "
                       "not been confirmed" + tail, street)
             else:
-                dec_first, dec_last = _name_key_parts(decedent)
                 title_tok = _title_tokens(title_holder)
-                straightforward = bool(dec_first) and bool(dec_last) and \
-                    dec_first in title_tok and dec_last in title_tok
-                if not straightforward:
+
+                def _matches(name: str) -> bool:
+                    f, l = _name_key_parts(name)
+                    return bool(f) and bool(l) and f in title_tok and l in title_tok
+
+                named = [decedent, pr, f"{first} {last}".strip()]
+                named.extend(_heir_names(str(r.get("Heirs") or "")))
+                title_matches_a_named_party = any(_matches(n) for n in named if n)
+
+                if not title_matches_a_named_party:
                     _flag(findings, i, sev, "Title Holder of Record",
                           f"NOT STRAIGHTFORWARD - title holder of record is "
-                          f"{title_holder!r}, not the decedent "
-                          f"({decedent or 'unknown'}). Confirm the decedent "
-                          "actually held this property before creating the "
-                          "record" + tail, title_holder)
+                          f"{title_holder!r}, not the decedent, the PR, or any "
+                          f"named heir ({decedent or 'unknown'}). Confirm the "
+                          "decedent's estate actually held this property "
+                          "before creating the record" + tail, title_holder)
                     # The exact Johnson defect: the heir's/PR's own mailing
                     # address got used AS the decedent's property address,
                     # with no title-holder confirmation behind it.
@@ -235,6 +266,20 @@ def review_batch(rows: list[dict], *, notice_type: str = "probate") -> list[dict
                               "holder - this is the exact defect that produced "
                               "a bogus record (Johnson, 2026-09-11)" + tail,
                               mail)
+                elif insider_transfer:
+                    # Matching a named PR/heir is NOT the same question as
+                    # "did this property reach them through an ordinary path."
+                    # Video, 2026-09-14: Larry Kaiser (Johnson's petitioner)
+                    # quit-claimed the property to L&S Group LLC for $0 in
+                    # 2013, years before the estate existed - a transfer
+                    # connected to the estate is the real messy signal, even
+                    # though the eventual holder (L&S) isn't itself a named
+                    # party here and even when it IS.
+                    _flag(findings, i, sev, "Title Holder of Record",
+                          "NOT STRAIGHTFORWARD - the property passed through a "
+                          "transfer connected to this estate before reaching "
+                          "its current holder: " + insider_transfer + tail,
+                          title_holder)
 
         # ── mailing address: probate must not inherit the property ───
         if is_probate:

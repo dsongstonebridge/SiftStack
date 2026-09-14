@@ -67,6 +67,18 @@ class SigningChainTests(unittest.TestCase):
     def test_foreclosure_record_gets_no_block(self):
         self.assertEqual(agent._signing_chain_block({"name": "X", "title_holder": "Y"}), "")
 
+    def test_insider_transfer_is_shown_as_a_caution(self):
+        b = agent._signing_chain_block(_subj(
+            title_holder="Larry Kaiser",
+            insider_transfer=("12/31/2013: KAISER, LARRY A AND SHELLEY A -> "
+                              "L & S GROUP LLC (Quit Claim Deed)")))
+        self.assertIn("CAUTION - transfer connected to this estate: "
+                      "12/31/2013: KAISER, LARRY A AND SHELLEY A -> "
+                      "L & S GROUP LLC (Quit Claim Deed)", b)
+
+    def test_no_insider_transfer_prints_no_caution_line(self):
+        self.assertNotIn("CAUTION", agent._signing_chain_block(_subj()))
+
 
 class CreationNotesTests(unittest.TestCase):
     def test_notes_carry_pr_and_title_holder(self):
@@ -98,6 +110,7 @@ class EnrichTitleHolderTests(unittest.TestCase):
                         return_value={"owner": "L & S GROUP LLC"}) as gs, \
              mock.patch("tulsa_assessor.search_assessor",
                         side_effect=AssertionError("no name search for a known address")), \
+             mock.patch("tulsa_assessor.get_parcel_sales_history", return_value=[]), \
              mock.patch("time.sleep"):
             self.main._enrich_probate_rows([row])
         gs.assert_called_once_with("R12145940944450")
@@ -107,7 +120,10 @@ class EnrichTitleHolderTests(unittest.TestCase):
         row = {"Property Street": "1916 S 140th East Ave", "Vacant Lot": "No",
                "Parcel ID": "12145-94-09-44450"}
         with mock.patch("tulsa_assessor.get_parcel_situs",
-                        side_effect=AssertionError("looked up")), mock.patch("time.sleep"):
+                        side_effect=AssertionError("looked up")), \
+             mock.patch("tulsa_assessor.get_parcel_sales_history",
+                        side_effect=AssertionError("sales history looked up")), \
+             mock.patch("time.sleep"):
             self.main._enrich_probate_rows([row])
         self.assertNotIn("Title Holder of Record", row)
 
@@ -122,6 +138,7 @@ class EnrichTitleHolderTests(unittest.TestCase):
                         return_value={"is_vacant_lot": False, "land_value": 10100}), \
              mock.patch("tulsa_assessor.get_parcel_situs",
                         side_effect=AssertionError("owner came with the search hit")), \
+             mock.patch("tulsa_assessor.get_parcel_sales_history", return_value=[]), \
              mock.patch("time.sleep"):
             self.main._enrich_probate_rows([row])
         self.assertEqual(row["Title Holder of Record"], "ROSS, CLIFTON LEE")
@@ -131,6 +148,107 @@ class EnrichTitleHolderTests(unittest.TestCase):
         row = self.main._trace_row({"Property Street": "1916 S 140th East Ave",
                                     "Title Holder of Record": "L & S GROUP LLC"})
         self.assertEqual(row["Title Holder of Record"], "L & S GROUP LLC")
+
+
+class InsiderTransferTests(unittest.TestCase):
+    """batch_review's 'clean title holder' check can't see WHY the current
+    holder has title - only that a named party (PR/heir) does. Video,
+    2026-09-14: Larry Kaiser (Johnson's petitioner) quit-claimed the property
+    to L&S Group LLC for $0 in 2013, years before the estate existed. That
+    transfer is the real messy signal, whether or not the eventual holder is
+    tied to anyone in the filing."""
+
+    @classmethod
+    def setUpClass(cls):
+        import main
+        cls.main = main
+
+    #: The Johnson parcel's real sales history (fetched live 2026-09-14).
+    _JOHNSON_HISTORY = [
+        {"sale_date": "12/31/2013", "grantor": "KAISER, LARRY A AND SHELLEY A",
+         "grantee": "L & S GROUP LLC", "sale_price": 0, "deed_type": "Quit Claim Deed",
+         "document_number": "2014002906"},
+        {"sale_date": "8/1/2002", "grantor": "VA", "grantee": "KAISER LARRY A & SHELLEY A",
+         "sale_price": 0, "deed_type": "History", "document_number": "2002110783"},
+    ]
+
+    def test_flags_when_grantor_matches_the_pr(self):
+        row = {"Case Number": "PB-2026-0761", "Personal Representative": "Larry Kaiser"}
+        with mock.patch("time.sleep"):
+            self.main._check_insider_transfer(row, "R12145940944450",
+                                              lambda acct: self._JOHNSON_HISTORY)
+        self.assertIn("Insider Transfer", row)
+        self.assertIn("KAISER, LARRY A AND SHELLEY A", row["Insider Transfer"])
+        self.assertIn("L & S GROUP LLC", row["Insider Transfer"])
+
+    def test_flags_when_grantor_matches_an_heir(self):
+        row = {"Heirs": "Wendy Johnson (Daughter); Debbie Lewis (Daughter)"}
+        history = [{"sale_date": "1/1/2020", "grantor": "Wendy Johnson",
+                    "grantee": "SOME THIRD PARTY LLC", "sale_price": 0,
+                    "deed_type": "Quit Claim Deed", "document_number": "X"}]
+        with mock.patch("time.sleep"):
+            self.main._check_insider_transfer(row, "R00000000000000", lambda acct: history)
+        self.assertIn("Insider Transfer", row)
+
+    def test_no_flag_when_grantor_is_unrelated(self):
+        row = {"Decedent Name": "Clifton Lee Ross", "Personal Representative": "Rhonda Thomas"}
+        history = [{"sale_date": "11/1/1997", "grantor": "ENGMAN MARTIN F III TRUSTEE",
+                    "grantee": "MATTHEWS MICHAEL L", "sale_price": 69000,
+                    "deed_type": "History", "document_number": "1997111131"}]
+        with mock.patch("time.sleep"):
+            self.main._check_insider_transfer(row, "R30175032811080", lambda acct: history)
+        self.assertNotIn("Insider Transfer", row)
+
+    def test_no_flag_on_empty_history(self):
+        row = {"Decedent Name": "Clifton Lee Ross"}
+        with mock.patch("time.sleep"):
+            self.main._check_insider_transfer(row, "R30175032811080", lambda acct: [])
+        self.assertNotIn("Insider Transfer", row)
+
+    def test_no_lookup_without_an_account_number(self):
+        row = {}
+        self.main._check_insider_transfer(
+            row, "", lambda acct: (_ for _ in ()).throw(AssertionError("looked up with no acct")))
+        self.assertNotIn("Insider Transfer", row)
+
+
+class LivingSpouseAddressTests(unittest.TestCase):
+    def setUp(self):
+        import main
+        self.main = main
+
+    def test_pr_relationship_spouse_triggers_it(self):
+        row = {"PR Relationship": "Wife", "PR Address": "7508 South Granite"}
+        self.assertEqual(self.main._living_spouse_address(row), "7508 South Granite")
+
+    def test_marital_status_surviving_spouse_triggers_it(self):
+        row = {"Marital Status": "survived by his spouse", "Mailing Street": "123 Main St"}
+        self.assertEqual(self.main._living_spouse_address(row), "123 Main St")
+
+    def test_no_spouse_signal_returns_empty(self):
+        row = {"Marital Status": "was not married at the time of his death",
+               "Mailing Street": "123 Main St"}
+        self.assertEqual(self.main._living_spouse_address(row), "")
+
+    def test_spouse_address_searched_before_the_name_loop(self):
+        # Bitson-shaped: probate states personal property only, but the
+        # living spouse (PR) holds title - never in the decedent's own name.
+        row = {"Case Number": "PB-2026-9999", "Decedent Name": "Pamela Irene Finley Bitson",
+               "Personal Representative": "D'Angelo Bitson Sr.", "PR Relationship": "Husband",
+               "PR Address": "1234 N Somewhere Ave"}
+        hit = {"AccountNo": "R99999999999999", "FullPrimaryOwnerName": "BITSON, D ANGELO",
+               "FullPropertyStreet": "1234 N SOMEWHERE AVE", "PropertyCity": "TULSA",
+               "PropertyZipCode": "74106", "AcctType": "Residential"}
+        with mock.patch("tulsa_assessor.search_assessor") as sa, \
+             mock.patch("tulsa_assessor.get_parcel_improvements",
+                        return_value={"is_vacant_lot": False, "land_value": 5000}), \
+             mock.patch("tulsa_assessor.get_parcel_sales_history", return_value=[]), \
+             mock.patch("time.sleep"):
+            sa.return_value = [hit]
+            self.main._enrich_probate_rows([row])
+        sa.assert_called_once_with("1234 N Somewhere Ave")
+        self.assertEqual(row["Property Street"], "1234 N SOMEWHERE AVE")
+        self.assertEqual(row["Title Holder of Record"], "BITSON, D ANGELO")
 
 
 if __name__ == "__main__":

@@ -1170,6 +1170,73 @@ async def _retry_skipped_step(page, step_fn, csv_path: Path, skipped: list[dict]
     return retry_result
 
 
+def _is_assessor_account(acct: str) -> bool:
+    """Is this string shaped like an Assessor account number ("R12145940944450"),
+    not an OCR'd tax-roll parcel ("12145-94-09-44450") or anything else that
+    would 404 the Info page?"""
+    acct = (acct or "").strip().upper()
+    return len(acct) >= 10 and acct[:1].isalpha() and acct[1:].isdigit()
+
+
+def _living_spouse_address(row: dict) -> str:
+    """The living spouse-heir's own street address, when the filing clearly
+    names one - regardless of what "Real Property Stated" says.
+
+    User, 2026-09-14 (video walkthrough): "whenever a decedent leaves behind
+    a living spouse... we always always always check the mailing address of
+    that living spouse" at the Assessor. Bitson's probate stated PERSONAL
+    property only; checking the spouse's address anyway is what surfaced the
+    house. Only fires on an EXPLICIT living-spouse signal - a bare "married"
+    statement does not confirm the spouse outlived the decedent.
+    """
+    pr_rel = str(row.get("PR Relationship") or "").lower()
+    marital = str(row.get("Marital Status") or "").lower()
+    spouse_words = ("spouse", "wife", "husband", "widow")
+    if not (any(w in pr_rel for w in spouse_words)
+            or any(w in marital for w in spouse_words)):
+        return ""
+    return str(row.get("PR Address") or row.get("Mailing Street") or "").strip()
+
+
+def _apply_primary_hit(row: dict, primary: dict, matched_on: str) -> str:
+    """Write property/title fields from a resolved assessor hit onto `row`;
+    returns the account number so callers can chain into improvements/sales
+    lookups. Shared by the name-search and living-spouse-address paths."""
+    acct = primary.get("AccountNo") or ""
+    if not str(row.get("Property Street") or "").strip():
+        row["Property Street"] = (primary.get("FullPropertyStreet") or "").strip()
+        row["Property City"] = (primary.get("PropertyCity") or "").strip().title()
+        row["Property State"] = "OK"
+        row["Property Zip"] = (primary.get("PropertyZipCode") or "").strip()[:5]
+    row.setdefault("Parcel ID", acct)
+    row["AcctType"] = primary.get("AcctType") or ""
+    # Who holds title: the county's owner of record for the matched parcel.
+    # Often NOT the decedent - a lease-to-own seller, a root owner on a
+    # chain-of-deaths estate, a trust - which is why the board shows it.
+    row["Title Holder of Record"] = (row.get("Title Holder of Record")
+                                     or primary.get("FullPrimaryOwnerName") or "")
+    row["Assessor Matched On"] = matched_on
+    return acct
+
+
+def _finish_parcel_lookup(row: dict, acct: str, get_parcel_improvements,
+                          get_parcel_sales_history) -> None:
+    """Improvements (vacant lot / land value) and insider-transfer check for a
+    freshly-resolved parcel. Shared tail of the name-search and
+    living-spouse-address paths."""
+    import time
+    if not acct:
+        return
+    impr = get_parcel_improvements(acct)
+    time.sleep(2)
+    if impr:
+        row["Vacant Lot"] = "Yes" if impr["is_vacant_lot"] else "No"
+        if impr.get("land_value") is not None:
+            row["Land Value"] = impr["land_value"]
+    if _is_assessor_account(acct):
+        _check_insider_transfer(row, acct, get_parcel_sales_history)
+
+
 def _fill_title_holder(row: dict, get_parcel_situs) -> None:
     """Set row["Title Holder of Record"] from the county assessor, by parcel.
 
@@ -1180,7 +1247,7 @@ def _fill_title_holder(row: dict, get_parcel_situs) -> None:
     if str(row.get("Title Holder of Record") or "").strip():
         return
     acct = str(row.get("Parcel ID") or "").strip().upper()
-    if not (len(acct) >= 10 and acct[:1].isalpha() and acct[1:].isdigit()):
+    if not _is_assessor_account(acct):
         return
     import time
     try:
@@ -1194,6 +1261,71 @@ def _fill_title_holder(row: dict, get_parcel_situs) -> None:
     if owner:
         row["Title Holder of Record"] = owner
         logging.info("  %s: title holder of record = %s", row.get("Case Number") or acct, owner)
+
+
+def _names_overlap(a: str, b: str) -> bool:
+    """Loose first+last token overlap - good enough to tell whether a
+    sales-history Grantor string is the same person as a decedent/PR/heir
+    name, without the assessor-grid-tuned scoring `_score_name_match` needs."""
+    import re
+    def _toks(s: str) -> set[str]:
+        return {t for t in re.findall(r"[a-z]+", s.lower())
+                if len(t) > 1 and t not in {"jr", "sr", "ii", "iii", "iv", "v"}}
+    ta, tb = _toks(a), _toks(b)
+    return bool(ta) and bool(tb) and len(ta & tb) >= 2
+
+
+def _check_insider_transfer(row: dict, acct: str, get_parcel_sales_history) -> None:
+    """Flag row["Insider Transfer"] when the parcel's sales history shows the
+    property passing FROM someone named in this probate (the decedent, the
+    PR, or a listed heir) TO its current holder.
+
+    This matters even when the current holder IS itself a named PR/heir -
+    that alone reads as clean under the ordinary title-holder check. User,
+    2026-09-14 (video walkthrough): a title holder tied to someone in the
+    filing is not automatically clean if it got there through a transfer
+    connected to the estate. On Johnson, Larry Kaiser (the eventual
+    petitioner) and his wife quit-claimed the property to L&S Group LLC for
+    $0 in 2013, years before the estate existed - that transfer is the real
+    "messy" signal, independent of whether L&S is tied to anyone in the
+    filing. Free, read-only; only ever sets a field, never blocks by itself -
+    `batch_review.py` decides what to do with it.
+    """
+    if not acct:
+        return
+    import time
+    try:
+        history = get_parcel_sales_history(acct)
+    except Exception as e:                        # noqa: BLE001 - free lookup; never lose the row
+        logging.warning("  assessor: sales history lookup failed for %s: %s", acct, e)
+        return
+    finally:
+        time.sleep(2)                              # the assessor rate-limits after ~15-20 hits
+    if not history:
+        return
+
+    named = [row.get("Decedent Name"), row.get("Personal Representative")]
+    for blob in (row.get("Heirs"), row.get("Heirs Deceased")):
+        for part in str(blob or "").split(";"):
+            nm = part.split("(")[0].strip()
+            if nm:
+                named.append(nm)
+    named = [str(n).strip() for n in named if str(n or "").strip()]
+
+    # Newest first, as the Assessor lists them - the first match is the most
+    # recent transfer connected to the estate, which is the one that matters.
+    for sale in history:
+        grantor = sale.get("grantor") or ""
+        if grantor and any(_names_overlap(grantor, n) for n in named):
+            price = sale.get("sale_price")
+            row["Insider Transfer"] = (
+                f"{sale.get('sale_date') or 'unknown date'}: {grantor} -> "
+                f"{sale.get('grantee') or 'unknown'} "
+                f"({sale.get('deed_type') or 'unknown deed'}"
+                + (f", ${price:,}" if price else "") + ")")
+            logging.warning("  assessor: INSIDER TRANSFER on %s - %s",
+                            row.get("Case Number") or acct, row["Insider Transfer"])
+            return
 
 
 def _enrich_probate_rows(rows: list[dict]) -> list[dict]:
@@ -1212,10 +1344,24 @@ def _enrich_probate_rows(rows: list[dict]) -> list[dict]:
     Fulton finds nothing while his father Johnnie Sr. holds the property. So a
     miss on the decedent falls through to the PR and then the named heirs
     rather than concluding "no real property".
+
+    ALWAYS CHECK A LIVING SPOUSE'S OWN ADDRESS FIRST (user, 2026-09-14, video
+    walkthrough) — regardless of what "Real Property Stated" says. Bitson's
+    probate stated personal property only; checking the spouse's own address
+    anyway is what surfaced the marital home, owned by the spouse and never in
+    the decedent's name at all. See `_living_spouse_address()`.
+
+    Every resolved parcel also gets an insider-transfer check
+    (`_check_insider_transfer()`): a sales-history Grantor tied to the
+    decedent/PR/an heir is the real "messy" signal (Johnson: the eventual
+    petitioner quit-claimed the property to the LLC years before the estate
+    existed), independent of whether the current title holder is itself a
+    named party.
     """
     import time
     from tulsa_assessor import (search_assessor, get_parcel_improvements,
-                                get_parcel_situs, _score_name_match)
+                                get_parcel_situs, get_parcel_sales_history,
+                                _score_name_match)
 
     for row in rows:
         if str(row.get("Property Street") or "").strip() and row.get("Vacant Lot"):
@@ -1224,7 +1370,27 @@ def _enrich_probate_rows(rows: list[dict]) -> list[dict]:
             # Johnson house was titled to the lease-to-own seller, not the
             # decedent, and nothing on the record said so.
             _fill_title_holder(row, get_parcel_situs)
+            acct = str(row.get("Parcel ID") or "").strip().upper()
+            if _is_assessor_account(acct):
+                _check_insider_transfer(row, acct, get_parcel_sales_history)
             continue
+
+        spouse_street = _living_spouse_address(row)
+        if spouse_street:
+            spouse_hits = search_assessor(spouse_street)
+            time.sleep(2)
+            if spouse_hits:
+                primary = spouse_hits[0]
+                acct = _apply_primary_hit(
+                    row, primary, f"living spouse's address: {spouse_street}")
+                _finish_parcel_lookup(row, acct, get_parcel_improvements,
+                                     get_parcel_sales_history)
+                logging.info("  %s -> %s [living spouse's address]",
+                             row.get("Decedent Name"),
+                             row.get("Property Street") or "(no address)")
+                continue
+            logging.info("  assessor: living spouse's address %r returned no "
+                         "parcel - falling through to name search", spouse_street)
 
         # Search order: decedent, then root-owner candidates from the filing.
         candidates = [
@@ -1335,28 +1501,8 @@ def _enrich_probate_rows(rows: list[dict]) -> list[dict]:
 
         addressed = [h for h in hits if (h.get("FullPropertyStreet") or "").strip()]
         primary = addressed[0] if addressed else hits[0]
-        acct = primary.get("AccountNo") or ""
-
-        if not str(row.get("Property Street") or "").strip():
-            row["Property Street"] = (primary.get("FullPropertyStreet") or "").strip()
-            row["Property City"] = (primary.get("PropertyCity") or "").strip().title()
-            row["Property State"] = "OK"
-            row["Property Zip"] = (primary.get("PropertyZipCode") or "").strip()[:5]
-        row.setdefault("Parcel ID", acct)
-        row["AcctType"] = primary.get("AcctType") or ""
-        # Who holds title: the county's owner of record for the matched parcel.
-        # Often NOT the decedent - a lease-to-own seller, a root owner on a
-        # chain-of-deaths estate, a trust - which is why the board shows it.
-        row["Title Holder of Record"] = (row.get("Title Holder of Record")
-                                         or primary.get("FullPrimaryOwnerName") or "")
-        row["Assessor Matched On"] = matched_on
-
-        impr = get_parcel_improvements(acct) if acct else None
-        time.sleep(2)
-        if impr:
-            row["Vacant Lot"] = "Yes" if impr["is_vacant_lot"] else "No"
-            if impr.get("land_value") is not None:
-                row["Land Value"] = impr["land_value"]
+        acct = _apply_primary_hit(row, primary, matched_on)
+        _finish_parcel_lookup(row, acct, get_parcel_improvements, get_parcel_sales_history)
 
         # Extra parcels ride on this record rather than becoming their own —
         # a parcel number is not an address.
@@ -1380,7 +1526,7 @@ _PROBATE_TRACE_COLUMNS = (
     "Decision Maker", "DM Relationship", "Personal Representative",
     "PR Status", "Decedent Name", "Date of Death", "Heir Count", "Heirs",
     "Heirs Deceased", "Heirs Address Unknown", "Additional Parcels",
-    "Title Holder of Record",
+    "Title Holder of Record", "Insider Transfer",
 )
 
 

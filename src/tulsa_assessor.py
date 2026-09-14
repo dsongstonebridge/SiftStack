@@ -172,6 +172,70 @@ def get_parcel_improvements(account_no: str, *, timeout: int = 60) -> Optional[d
     }
 
 
+#: The Assessor renders the sales table twice - a real "desktop" <table> and
+#: a "mobile" <div> repeating the same rows in different markup. Scope to the
+#: desktop table only, or every sale gets counted twice.
+_SALES_TABLE_RE = re.compile(
+    r'<div class="py-1 table-responsive desktop">.*?</table>', re.DOTALL)
+_TR_RE = re.compile(r"<tr>(.*?)</tr>", re.DOTALL)
+_TD_RE = re.compile(r"<td[^>]*>(.*?)</td>", re.DOTALL)
+
+
+def _clean_cell(html: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", html).replace("&amp;", "&")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def get_parcel_sales_history(account_no: str, *, timeout: int = 60) -> list[dict]:
+    """Sale Date / Grantor / Grantee / Sale Price / Deed Type / Document Number,
+    off the Assessor's own "Sales/Documents" table - newest first, as the page
+    lists them. A real server-rendered <table>, unlike the search/improvements
+    pages' JS grid - parsed directly, no dxDataGrid JSON extraction needed.
+
+    Why this exists: on Johnson (2026-09-11) the title holder read as
+    "L & S GROUP LLC" with no explanation, and only a linked lawsuit later
+    showed why. This table already had the answer, for free: a 2013 row shows
+    Larry Kaiser (the eventual petitioner) and his wife quit-claiming the
+    property to L&S Group LLC for $0, years before the estate existed - the
+    kind of transfer that should stop a human before anything is created,
+    whether or not the current holder happens to be a named PR/heir.
+
+    Returns [] on a fetch failure or a parcel with no sales table at all
+    (both real and rare — verify against a control parcel known to have
+    sales before trusting a wider "no history" conclusion).
+    """
+    url = ASSESSOR_INFO_URL_HTTP.format(account_no.strip())
+    try:
+        resp = requests.get(url, headers=_HTTP_HEADERS, timeout=timeout)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        logger.warning("assessor: sales history lookup failed for %s: %s", account_no, e)
+        return []
+
+    m = _SALES_TABLE_RE.search(resp.text)
+    if not m:
+        return []
+
+    history = []
+    for row_html in _TR_RE.findall(m.group(0)):
+        cells = [_clean_cell(c) for c in _TD_RE.findall(row_html)]
+        if len(cells) != 6:
+            continue
+        sale_date, grantor, grantee, price_text, deed_type, doc_no = cells
+        price = None
+        pm = re.search(r"[\d,]+", price_text)
+        if pm:
+            try:
+                price = int(pm.group(0).replace(",", ""))
+            except ValueError:
+                pass
+        history.append({
+            "sale_date": sale_date, "grantor": grantor, "grantee": grantee,
+            "sale_price": price, "deed_type": deed_type, "document_number": doc_no,
+        })
+    return history
+
+
 def get_parcel_situs(account_no: str, *, timeout: int = 60) -> Optional[dict]:
     """Street address for one parcel, by account number.
 

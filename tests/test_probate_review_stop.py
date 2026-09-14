@@ -64,6 +64,14 @@ class StraightforwardTests(unittest.TestCase):
         self.assertEqual(_found([row], BLOCK), [])
         self.assertTrue(any("equals the property address" in w for w in _found([row], WARN)))
 
+    def test_named_heir_on_title_passes(self):
+        # Bitson-shaped (video, 2026-09-14): the living spouse/PR held title,
+        # never in the decedent's own name at all - still clean.
+        row = _row(**{"Decedent Name": "Pamela Irene Finley Bitson",
+                      "Personal Representative": "D'Angelo Bitson Sr.",
+                      "Title Holder of Record": "BITSON, D ANGELO"})
+        self.assertEqual(_found([row], BLOCK), [])
+
 
 class NotStraightforwardTests(unittest.TestCase):
     def test_johnson_blocks_twice_over(self):
@@ -87,6 +95,18 @@ class NotStraightforwardTests(unittest.TestCase):
         row = _johnson(**{"Property Confirmed": "Yes"})
         self.assertEqual(_found([row], BLOCK), [])
         self.assertTrue(any("user confirmed" in w for w in _found([row], WARN)))
+
+    def test_insider_transfer_blocks_even_when_title_matches_a_named_party(self):
+        # Johnson-shaped, but with the title holder set to the PR directly so
+        # the "title matches a named party" branch is the one being tested,
+        # isolated from the plain "title holder is a stranger" block.
+        row = _johnson(**{
+            "Title Holder of Record": "Larry Kaiser",
+            "Insider Transfer": ("12/31/2013: KAISER, LARRY A AND SHELLEY A -> "
+                                 "L & S GROUP LLC (Quit Claim Deed)")})
+        blocks = _found([row], BLOCK)
+        self.assertTrue(any("NOT STRAIGHTFORWARD" in b and "transfer connected to this estate" in b
+                            for b in blocks), blocks)
 
     def test_foreclosure_rows_are_untouched(self):
         row = {"Property Street": "7405 S Chestnut Ave", "Property City": "Broken Arrow",

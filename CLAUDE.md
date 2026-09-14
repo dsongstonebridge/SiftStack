@@ -459,6 +459,63 @@ tie at 0.67. The Johnson house was found by searching the creditor LLC named in
 the petition and matching it to the heir's listed address. A lease-to-own
 leaves title with the seller, and the buy box does not check who holds title.
 
+### STOP AND ASK — calibrated 2026-09-14 (video walkthrough of real cases)
+
+The 2026-09-11 rule ("stop on anything not straightforward") was correctly
+motivated but wrongly coded: `batch_review.py` originally BLOCKed unless the
+**decedent's own name** was the assessor's title holder — which would have
+false-positive-blocked Bitson (below), a genuinely clean case. The user
+recorded a Loom walkthrough of three real Tulsa cases
+(`Downloads/Finding Probate Property Addresses in Tulsa.srt`) that recalibrated
+the rule against real ownership patterns, not guessed ones:
+
+- **Chu — messy.** Probate says nothing about real property. Living spouse
+  Christopher lives at 7508 S Granite, but the assessor shows **Lydia Chiu**
+  (the adult daughter) as owner — and the sales history shows Christopher
+  quit-claimed it to her for $0 in 2022. *(Note: the family's real surname is
+  **Chiu**, not "Chu" — Loom's auto-caption misheard it; verified live against
+  the actual parcel, account `R27805831030640`.)* Flagged for review: an
+  ownership transfer connected to the estate, not merely "hard to find."
+- **Malick — clean, despite heavy digging.** No living spouse, no address in
+  the probate. Decedent-name search with "Sr." fails; dropping the suffix
+  finds it; cross-checked against the Tulsa County Clerk's LOCAT land-records
+  tool as a second, independent source. Lands on a single, unambiguous owner
+  (the decedent) with nothing surprising in the history — clean, just several
+  search attempts.
+- **Bitson — clean, despite title never being in the decedent's name.**
+  Probate states *personal property only*. Living spouse D'Angelo is an
+  heir/PR; checking HIS address (independent of what the probate claims about
+  real/personal property) finds he is the assessor's owner, inherited ~2 years
+  prior. No surprising history — clean.
+
+**The corrected rule, built and tested (`tests/test_probate_review_stop.py`,
+`tests/test_probate_message_board.py`):**
+
+1. **Always check a living spouse's own address first** (`main._living_spouse_address()`),
+   regardless of what "Real Property Stated" says — Bitson's probate said
+   personal property only; the check is what surfaced the house anyway.
+2. **Clean title holder = decedent, decedent's own trust, OR any named
+   PR/heir** — not just the decedent's own name. This is what makes Bitson
+   pass.
+3. **New capability: sales-history lookup.**
+   `tulsa_assessor.get_parcel_sales_history()` parses the Assessor's real
+   server-rendered "Sales/Documents" `<table>` (Grantor/Grantee/Sale
+   Price/Deed Type/Document Number) — did not exist before this date. Scope to
+   the "desktop" table only; the page repeats the same rows in a "mobile" div
+   with different markup, which double-counts if both are parsed.
+4. **Insider-transfer detection overrides an otherwise-clean title match.**
+   `main._check_insider_transfer()` flags when the sales history's Grantor on
+   the most recent sale matches the decedent/PR/an heir — **even when the
+   current title holder is itself a named party** (this is the piece that
+   closes the Chu/Chiu gap: Lydia could easily be a named heir on some other
+   estate and still not make the transfer itself ordinary). Rendered on the
+   SIGNING CHAIN Message Board block as `CAUTION - transfer connected to this
+   estate: ...`. Free, read-only; only ever sets a field, `batch_review.py`
+   decides what to do with it.
+5. Downgrades to a `WARN` (not a `BLOCK`) once a human sets the sheet's
+   `Property Confirmed` column to `Yes` — never inferred, set only by the user
+   after reviewing the evidence shown.
+
 ### Known gaps
 
 1. **`--create` is not safe to re-run** — it re-posts notes and the Message
@@ -471,10 +528,17 @@ leaves title with the seller, and the buy box does not check who holds title.
 3. Single-family vs duplex is not detectable from free data (see above).
 4. `Signing Chain Count` / `Heirs Living` are still not computed — the Message
    Board's SIGNING CHAIN block carries the heir count and who can sign instead.
-5. No buy-box check for who holds title (lease-to-own, contract for deed).
+5. ~~No buy-box check for who holds title (lease-to-own, contract for
+   deed).~~ **Addressed 2026-09-14** — not in the buy box, but in
+   `batch_review.py`'s stop-and-ask rule (see above), which blocks on both an
+   unconfirmed title holder and a transfer connected to the estate.
 6. The native property fields `personal_representative` / `probate_open_date`
    stay empty — the pipeline sends them as custom fields this account does not
    have ("unknown custom field").
+7. The insider-transfer name match (`main._names_overlap()`, >= 2 shared name
+   tokens) and the "living spouse" signal (`PR Relationship`/`Marital Status`
+   containing spouse/wife/husband/widow) are both first-pass heuristics from
+   two real cases — not yet stress-tested against a wider batch.
 
 ### `--create` WRITES TO THE CRM WITHOUT `--commit`
 

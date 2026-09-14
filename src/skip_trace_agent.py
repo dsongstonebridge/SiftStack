@@ -226,6 +226,7 @@ _PROBATE_SUBJECT_FIELDS = {
     "Decision Maker":          "decision_maker",
     "DM Relationship":         "dm_relationship",
     "Title Holder of Record":  "title_holder",
+    "Insider Transfer":        "insider_transfer",
 }
 
 
@@ -795,6 +796,14 @@ def _signing_chain_block(subject: dict) -> str:
         else:
             note = ""
         lines.append(f"  Title holder of record (county assessor): {title}{note}")
+    insider_transfer = (subject.get("insider_transfer") or "").strip()
+    if insider_transfer:
+        # A title holder tied to a named PR/heir is not "clean" if it got
+        # there through a transfer connected to the estate. Video,
+        # 2026-09-14: Larry Kaiser (Johnson's petitioner) quit-claimed the
+        # property to L&S Group LLC for $0 in 2013, years before the estate
+        # existed - a caller needs to see this before making any offer.
+        lines.append(f"  CAUTION - transfer connected to this estate: {insider_transfer}")
     if dm:
         lines.append(f"  Talking to: {dm}" + (f" ({dm_rel})" if dm_rel else ""))
 

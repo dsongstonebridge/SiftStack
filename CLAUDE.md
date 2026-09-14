@@ -266,6 +266,7 @@ run" below.
 | **The chain** | `_create_records_for_batch()` | enrich -> buy box -> review, all before creation |
 | Probate columns into the trace | `main._trace_row()` | SIGNING CHAIN + relationship survive both paths |
 | Relationship phone tag | `relationship_tag()`, `_primary_relationship_tag()` | heir's numbers: Daughter/Son/Wife/Husband/Grandchild, else Relative |
+| PR + title holder on the board | `Title Holder of Record` column, `_signing_chain_block()` | PR as the filing names them; assessor owner of record, flagged when it is not the decedent |
 
 **The skill's column list and `_PROBATE_SECTIONS` must stay in sync.** A field
 in one and not the other is extracted and then silently dropped — same trap as
@@ -474,8 +475,6 @@ leaves title with the seller, and the buy box does not check who holds title.
 6. The native property fields `personal_representative` / `probate_open_date`
    stay empty — the pipeline sends them as custom fields this account does not
    have ("unknown custom field").
-7. The `probate-info-extraction` skill's cost section is corrupted (dollar
-   figures replaced by words: "~Two.02", "OSCN.20-2.40").
 
 ### `--create` WRITES TO THE CRM WITHOUT `--commit`
 

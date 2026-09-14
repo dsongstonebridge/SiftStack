@@ -219,11 +219,13 @@ def resolve_subjects(rows: Iterable[dict]) -> tuple[list[dict], list[dict]]:
 #: of them and the block is simply omitted.
 _PROBATE_SUBJECT_FIELDS = {
     "Personal Representative": "personal_representative",
+    "PR Status":               "pr_status",
     "Decedent Name":           "decedent_name",
     "Date of Death":           "date_of_death",
     "Heir Count":              "heir_count",
     "Decision Maker":          "decision_maker",
     "DM Relationship":         "dm_relationship",
+    "Title Holder of Record":  "title_holder",
 }
 
 
@@ -752,6 +754,7 @@ def _signing_chain_block(subject: dict) -> str:
     every foreclosure record), so this is additive and safe for both types.
     """
     pr = (subject.get("personal_representative") or "").strip()
+    pr_status = (subject.get("pr_status") or "").strip()
     decedent = (subject.get("decedent_name") or "").strip()
     if not (pr or decedent):
         return ""
@@ -770,8 +773,28 @@ def _signing_chain_block(subject: dict) -> str:
     if decedent:
         dod = (subject.get("date_of_death") or "").strip()
         lines.append(f"  Decedent: {decedent}" + (f" (d. {dod})" if dod else ""))
-    if pr:
-        lines.append(f"  Personal Rep: {pr}")
+    # The PR as the COURT FILING names them, and who actually holds title.
+    # These can be three different parties: on Johnson (2026-09-11) the PR was
+    # the creditor's manager, the contact was the daughter, and title sat with
+    # the lease-to-own seller. A caller has to see all of them.
+    # A petition only ASKS for a PR - nobody holds that role until the court's
+    # Order, so a bare name reads as appointed when it may just be proposed.
+    # pr_status carries that distinction ("Petitioner - not yet appointed
+    # (hearing MM/DD/YYYY)" vs "Appointed MM/DD/YYYY") when it is known.
+    pr_line = f"  Personal Rep (per the probate filing): {pr or 'not named in the filing'}"
+    if pr and pr_status:
+        pr_line += f" - {pr_status}"
+    lines.append(pr_line)
+    title = (subject.get("title_holder") or "").strip()
+    if title:
+        if decedent and _same_person(decedent, title):
+            note = " - the decedent; title has not passed yet"
+        elif decedent:
+            note = (" - NOT the decedent; confirm what the estate actually owns "
+                    "before making an offer")
+        else:
+            note = ""
+        lines.append(f"  Title holder of record (county assessor): {title}{note}")
     if dm:
         lines.append(f"  Talking to: {dm}" + (f" ({dm_rel})" if dm_rel else ""))
 

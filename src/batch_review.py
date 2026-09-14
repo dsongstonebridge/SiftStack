@@ -67,6 +67,25 @@ def _flag(findings: list[dict], row_no: int, sev: str, field: str,
                      "message": message, "value": str(value)[:80]})
 
 
+def _name_key_parts(name: str) -> tuple[str, str]:
+    """First and last name word, generational suffixes stripped, lowercased.
+
+    Deliberately ignores middle names/initials - "Robert Clarence Lovelace"
+    matches a title holder recorded as "LOVELACE, ROBERT C", which omits the
+    middle name entirely. Requiring the full name would false-block the
+    ordinary case.
+    """
+    words = [w.strip(",.") for w in name.split() if w.strip(",.")]
+    words = [w for w in words if w.upper() not in {"JR", "SR", "II", "III", "IV", "V"}]
+    if not words:
+        return "", ""
+    return words[0].lower(), words[-1].lower()
+
+
+def _title_tokens(s: str) -> set[str]:
+    return {t for t in re.findall(r"[a-z]+", s.lower()) if len(t) > 1}
+
+
 def review_batch(rows: list[dict], *, notice_type: str = "probate") -> list[dict]:
     """Check an extracted batch and return findings, most severe first.
 
@@ -176,6 +195,46 @@ def review_batch(rows: list[dict], *, notice_type: str = "probate") -> list[dict
                 _flag(findings, i, WARN, "OCR",
                       f"Contains {w!r}, a known OCR misread - check the source", w)
                 break
+
+        # ── not-straightforward probate property: STOP AND ASK ───────
+        # User, 2026-09-11 (Johnson incident): "On all the situations that
+        # aren't straightforward, you need to stop and ask me." Straightforward
+        # = the decedent is the confirmed title holder of record. Everything
+        # else BLOCKs until the sheet marks "Property Confirmed" = Yes - set
+        # by a human, never inferred by this code.
+        if is_probate and street:
+            title_holder = str(r.get("Title Holder of Record") or "").strip()
+            confirmed = str(r.get("Property Confirmed") or "").strip().lower() == "yes"
+            sev = WARN if confirmed else BLOCK
+            tail = " (user confirmed)" if confirmed else ""
+
+            if not title_holder:
+                _flag(findings, i, sev, "Title Holder of Record",
+                      "NOT STRAIGHTFORWARD - no title holder of record was "
+                      "found for this property; the decedent's ownership has "
+                      "not been confirmed" + tail, street)
+            else:
+                dec_first, dec_last = _name_key_parts(decedent)
+                title_tok = _title_tokens(title_holder)
+                straightforward = bool(dec_first) and bool(dec_last) and \
+                    dec_first in title_tok and dec_last in title_tok
+                if not straightforward:
+                    _flag(findings, i, sev, "Title Holder of Record",
+                          f"NOT STRAIGHTFORWARD - title holder of record is "
+                          f"{title_holder!r}, not the decedent "
+                          f"({decedent or 'unknown'}). Confirm the decedent "
+                          "actually held this property before creating the "
+                          "record" + tail, title_holder)
+                    # The exact Johnson defect: the heir's/PR's own mailing
+                    # address got used AS the decedent's property address,
+                    # with no title-holder confirmation behind it.
+                    if mail and street and mail.lower() == street.lower():
+                        _flag(findings, i, sev, "Mailing Street",
+                              "The heir's/PR's MAILING address is being used "
+                              "as the PROPERTY address with no confirmed title "
+                              "holder - this is the exact defect that produced "
+                              "a bogus record (Johnson, 2026-09-11)" + tail,
+                              mail)
 
         # ── mailing address: probate must not inherit the property ───
         if is_probate:

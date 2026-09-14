@@ -1170,6 +1170,32 @@ async def _retry_skipped_step(page, step_fn, csv_path: Path, skipped: list[dict]
     return retry_result
 
 
+def _fill_title_holder(row: dict, get_parcel_situs) -> None:
+    """Set row["Title Holder of Record"] from the county assessor, by parcel.
+
+    Only when it is missing and the Parcel ID is an assessor account number
+    ("R12145940944450"). Leaves it blank when it cannot be found - a blank is
+    honest; a guessed title holder is not.
+    """
+    if str(row.get("Title Holder of Record") or "").strip():
+        return
+    acct = str(row.get("Parcel ID") or "").strip().upper()
+    if not (len(acct) >= 10 and acct[:1].isalpha() and acct[1:].isdigit()):
+        return
+    import time
+    try:
+        situs = get_parcel_situs(acct) or {}
+    except Exception as e:                      # noqa: BLE001 - free lookup; never lose the row
+        logging.warning("  assessor: title-holder lookup failed for %s: %s", acct, e)
+        return
+    finally:
+        time.sleep(2)                           # the assessor rate-limits after ~15-20 hits
+    owner = (situs.get("owner") or "").strip()
+    if owner:
+        row["Title Holder of Record"] = owner
+        logging.info("  %s: title holder of record = %s", row.get("Case Number") or acct, owner)
+
+
 def _enrich_probate_rows(rows: list[dict]) -> list[dict]:
     """Fill each probate row's property facts from the county assessor.
 
@@ -1178,7 +1204,8 @@ def _enrich_probate_rows(rows: list[dict]) -> list[dict]:
     CRM can hold. Free, read-only, no browser.
 
     Fills, only where the row does not already have it:
-      Property Street/City/Zip, Parcel ID, AcctType, Vacant Lot, Land Value
+      Property Street/City/Zip, Parcel ID, AcctType, Vacant Lot, Land Value,
+      Title Holder of Record (also on rows whose address was already known)
 
     THE ROOT-OWNER TRAP: on a chain-of-deaths estate the decedent owns nothing
     in their own name and the assessor returns a true zero — searching Alfred
@@ -1188,10 +1215,15 @@ def _enrich_probate_rows(rows: list[dict]) -> list[dict]:
     """
     import time
     from tulsa_assessor import (search_assessor, get_parcel_improvements,
-                                _score_name_match)
+                                get_parcel_situs, _score_name_match)
 
     for row in rows:
         if str(row.get("Property Street") or "").strip() and row.get("Vacant Lot"):
+            # Address already known (resolved by hand, or an earlier pass) - but
+            # the Message Board still needs WHO HOLDS TITLE. On 2026-09-11 the
+            # Johnson house was titled to the lease-to-own seller, not the
+            # decedent, and nothing on the record said so.
+            _fill_title_holder(row, get_parcel_situs)
             continue
 
         # Search order: decedent, then root-owner candidates from the filing.
@@ -1312,7 +1344,11 @@ def _enrich_probate_rows(rows: list[dict]) -> list[dict]:
             row["Property Zip"] = (primary.get("PropertyZipCode") or "").strip()[:5]
         row.setdefault("Parcel ID", acct)
         row["AcctType"] = primary.get("AcctType") or ""
-        row["Assessor Owner"] = primary.get("FullPrimaryOwnerName") or ""
+        # Who holds title: the county's owner of record for the matched parcel.
+        # Often NOT the decedent - a lease-to-own seller, a root owner on a
+        # chain-of-deaths estate, a trust - which is why the board shows it.
+        row["Title Holder of Record"] = (row.get("Title Holder of Record")
+                                         or primary.get("FullPrimaryOwnerName") or "")
         row["Assessor Matched On"] = matched_on
 
         impr = get_parcel_improvements(acct) if acct else None
@@ -1342,8 +1378,9 @@ def _enrich_probate_rows(rows: list[dict]) -> list[dict]:
 #: the relationship tag had nothing to read.
 _PROBATE_TRACE_COLUMNS = (
     "Decision Maker", "DM Relationship", "Personal Representative",
-    "Decedent Name", "Date of Death", "Heir Count", "Heirs",
+    "PR Status", "Decedent Name", "Date of Death", "Heir Count", "Heirs",
     "Heirs Deceased", "Heirs Address Unknown", "Additional Parcels",
+    "Title Holder of Record",
 )
 
 

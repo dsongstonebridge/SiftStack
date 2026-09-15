@@ -281,6 +281,15 @@ def review_batch(rows: list[dict], *, notice_type: str = "probate") -> list[dict
                           "its current holder: " + insider_transfer + tail,
                           title_holder)
 
+        # NOTE: a Treasurer fallback discovery (main._treasurer_true_negative_
+        # check(), 2026-09-15) writes Property Street + Title Holder of Record
+        # directly when it finds a corroborated hit the Assessor missed - it
+        # flows through the SAME "if is_probate and street" check above, not
+        # a separate branch. A note-only field here would never be seen: any
+        # row with no Property Street is already excluded by check_buy_box's
+        # "no property address could be resolved" rule, above, before this
+        # point in the loop.
+
         # ── mailing address: probate must not inherit the property ───
         if is_probate:
             if not mail:

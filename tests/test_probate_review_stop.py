@@ -115,6 +115,45 @@ class NotStraightforwardTests(unittest.TestCase):
         self.assertFalse(any("STRAIGHTFORWARD" in b
                              for b in _found([row], BLOCK, notice_type="foreclosure")))
 
+    def test_row_with_no_property_street_is_excluded_not_blocked(self):
+        # A Treasurer-only finding with no street (an unplatted parcel, or no
+        # corroborated hit at all) never reaches STOP-AND-ASK - check_buy_box
+        # excludes it first ("no property address could be resolved"), same
+        # as any other addressless row. review_batch() has no separate branch
+        # for this; a note-only field would never be seen.
+        row = _row(**{"Property Street": "", "Title Holder of Record": "",
+                      "Treasurer Check": "decedent: Johnnie Fulton Sr. -> "
+                                        "(no street - unplatted parcel)"})
+        self.assertEqual(_found([row], BLOCK), [])
+        excludes = [" ".join(str(v) for v in f.values())
+                   for f in review_batch([row], notice_type="probate")
+                   if f["severity"] == "EXCLUDE"]
+        self.assertTrue(any("no property address could be resolved" in e for e in excludes), excludes)
+
+    def test_treasurer_populated_row_goes_through_the_ordinary_title_check(self):
+        # main._treasurer_true_negative_check() writes Property Street AND
+        # Title Holder of Record together (mirroring _apply_primary_hit()) -
+        # once that happens, a Treasurer-sourced row is indistinguishable
+        # from an Assessor-sourced one to review_batch. A clean match (title
+        # holder IS the decedent) passes; the Treasurer Check note rides
+        # along as extra context, not a separate gate.
+        row = _row(**{
+            "Property Street": "4503 N Iroquois Av E", "Property City": "Tulsa",
+            "Title Holder of Record": "FULTON, JOHNNIE SR",
+            "Decedent Name": "Johnnie Fulton Sr.", "First Name": "Jennifer", "Last Name": "Faulk",
+            "Treasurer Check": "decedent: Johnnie Fulton Sr. -> 4503 N Iroquois Av E"})
+        self.assertEqual(_found([row], BLOCK), [])
+
+    def test_treasurer_populated_row_still_blocks_on_a_stranger_title_holder(self):
+        row = _row(**{
+            "Property Street": "649 E Apache St N", "Property City": "Tulsa",
+            "Title Holder of Record": "SOME UNRELATED LLC",
+            "Decedent Name": "Johnnie Fulton Sr.", "First Name": "Jennifer", "Last Name": "Faulk",
+            "Treasurer Check": "PR: Jennifer Faulk -> 649 E Apache St N"})
+        blocks = _found([row], BLOCK)
+        self.assertTrue(any("NOT STRAIGHTFORWARD" in b and "SOME UNRELATED LLC" in b
+                            for b in blocks), blocks)
+
 
 class PRStatusTests(unittest.TestCase):
     def test_petitioner_is_not_presented_as_appointed(self):

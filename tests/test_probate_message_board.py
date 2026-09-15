@@ -369,5 +369,142 @@ class TrustNameSearchTests(unittest.TestCase):
         self.assertEqual(row["Property Street"], "789 W OAK ST")
 
 
+class TreasurerTrueNegativeTests(unittest.TestCase):
+    """Video, 2026-09-15 ("Using Tulsa County Treasurer for Probate
+    Properties"): when the Assessor finds nothing for anyone named in the
+    filing, the Treasurer's independent owner-name index is a fallback
+    corroboration source, not a replacement. A name-only hit is never
+    trusted (common-name collision, user-flagged live 2026-09-15) - it needs
+    an address match to something already known from the filing, and a hit
+    under an heir's own name additionally needs the decedent to show up in
+    that parcel's own tax-payer history or it's presumed to be the heir's
+    own unrelated property (the Coleman/Lewis case from the same video)."""
+
+    def setUp(self):
+        import main
+        self.main = main
+
+    def test_uncorroborated_name_hit_is_never_trusted(self):
+        # The actual live discrepancy this guards against: a real hit under
+        # the decedent's own name, but nothing to say it's the same person.
+        row = {"Decedent Name": "Elizabeth Coleman", "PR Address": "999 N Nowhere Ave"}
+        hits = [{"tax_data_id": "1", "parcel_id": "82150-84-21-02630",
+                 "owner_name": "COLEMAN, ELIZABETH", "tax_type": "Real Estate"}]
+        detail = {"owner_street": "1500 S Unrelated St", "property_street": "",
+                  "parcel_id": "82150-84-21-02630"}
+        with mock.patch("tulsa_treasurer.search_owner_name", return_value=hits), \
+             mock.patch("tulsa_treasurer.get_parcel_detail", return_value=detail), \
+             mock.patch("time.sleep"):
+            self.main._treasurer_true_negative_check(
+                row, [("decedent", "Elizabeth Coleman")])
+        self.assertNotIn("Treasurer Check", row)
+
+    def test_corroborated_decedent_hit_is_recorded(self):
+        row = {"Decedent Name": "Johnnie Fulton Sr.", "PR Address": "1807 N Main"}
+        hits = [{"tax_data_id": "1", "parcel_id": "40800-02-13-05520",
+                 "owner_name": "FULTON, JOHNNIE SR", "tax_type": "Real Estate"}]
+        detail = {"owner_name": "FULTON, JOHNNIE SR",
+                  "owner_street": "1807 N Main", "property_street": "4503 N Iroquois Av E",
+                  "property_city": "Tulsa",
+                  "parcel_id": "40800-02-13-05520", "legal_description": "LT 36 BK 3 SUBURBAN ACRES AMD"}
+        with mock.patch("tulsa_treasurer.search_owner_name", return_value=hits), \
+             mock.patch("tulsa_treasurer.get_parcel_detail", return_value=detail), \
+             mock.patch("time.sleep"):
+            self.main._treasurer_true_negative_check(
+                row, [("decedent", "Johnnie Fulton Sr.")])
+        self.assertIn("Treasurer Check", row)
+        self.assertIn("4503 N Iroquois Av E", row["Treasurer Check"])
+        # The critical part: this discovery must flow into the REAL fields the
+        # rest of the pipeline reads, or check_buy_box excludes the row before
+        # STOP-AND-ASK ever sees the Treasurer Check note.
+        self.assertEqual(row["Property Street"], "4503 N Iroquois Av E")
+        self.assertEqual(row["Property City"], "Tulsa")
+        self.assertEqual(row["Property State"], "OK")
+        self.assertEqual(row["Parcel ID"], "40800-02-13-05520")
+        self.assertEqual(row["Title Holder of Record"], "FULTON, JOHNNIE SR")
+        self.assertIn("Treasurer fallback", row["Assessor Matched On"])
+
+    def test_never_overwrites_an_already_known_property_street(self):
+        row = {"Decedent Name": "Johnnie Fulton Sr.", "PR Address": "1807 N Main",
+               "Property Street": "ALREADY SET ELSEWHERE"}
+        hits = [{"tax_data_id": "1", "parcel_id": "40800-02-13-05520",
+                 "owner_name": "FULTON, JOHNNIE SR", "tax_type": "Real Estate"}]
+        detail = {"owner_street": "1807 N Main", "property_street": "4503 N Iroquois Av E",
+                  "parcel_id": "40800-02-13-05520"}
+        with mock.patch("tulsa_treasurer.search_owner_name", return_value=hits), \
+             mock.patch("tulsa_treasurer.get_parcel_detail", return_value=detail), \
+             mock.patch("time.sleep"):
+            self.main._treasurer_true_negative_check(
+                row, [("decedent", "Johnnie Fulton Sr.")])
+        self.assertEqual(row["Property Street"], "ALREADY SET ELSEWHERE")
+
+    def test_corroborated_hit_with_no_street_records_note_only(self):
+        # An unplatted parcel: corroborated, real, but no street to write -
+        # Property Street stays unset (never a guess), Treasurer Check still
+        # records the finding as evidence.
+        row = {"Decedent Name": "Johnnie Fulton Sr.", "PR Address": "1807 N Main"}
+        hits = [{"tax_data_id": "1", "parcel_id": "90328-03-28-15610",
+                 "owner_name": "FULTON, JOHNNIE L", "tax_type": "Real Estate"}]
+        detail = {"owner_street": "1807 N Main", "property_street": "",
+                  "parcel_id": "90328-03-28-15610", "legal_description": "UNPLATTED"}
+        with mock.patch("tulsa_treasurer.search_owner_name", return_value=hits), \
+             mock.patch("tulsa_treasurer.get_parcel_detail", return_value=detail), \
+             mock.patch("time.sleep"):
+            self.main._treasurer_true_negative_check(
+                row, [("decedent", "Johnnie Fulton Sr.")])
+        self.assertIn("Treasurer Check", row)
+        self.assertNotIn("Property Street", row)
+
+    def test_heir_hit_without_decedent_in_history_is_rejected(self):
+        # The Coleman/Lewis case: the heir has his OWN property, corroborated
+        # by his own address, but the decedent never shows up in its history -
+        # it's not an inheritance.
+        row = {"Decedent Name": "Elizabeth Coleman", "PR Address": "500 Lewis Home St"}
+        hits = [{"tax_data_id": "2", "parcel_id": "11111-11-11-11111",
+                 "owner_name": "COLEMAN, LEWIS", "tax_type": "Real Estate"}]
+        detail = {"owner_street": "500 Lewis Home St", "property_street": "",
+                  "parcel_id": "11111-11-11-11111"}
+        history = [{"tax_year": 2025, "owner_name": "COLEMAN, LEWIS"},
+                   {"tax_year": 2020, "owner_name": "COLEMAN, LEWIS"}]
+        with mock.patch("tulsa_treasurer.search_owner_name", return_value=hits), \
+             mock.patch("tulsa_treasurer.get_parcel_detail", return_value=detail), \
+             mock.patch("tulsa_treasurer.get_owner_history", return_value=history), \
+             mock.patch("time.sleep"):
+            self.main._treasurer_true_negative_check(
+                row, [("heir", "Lewis Coleman")])
+        self.assertNotIn("Treasurer Check", row)
+
+    def test_heir_hit_with_decedent_in_history_is_recorded(self):
+        row = {"Decedent Name": "Elizabeth Coleman", "PR Address": "500 Family Home St"}
+        hits = [{"tax_data_id": "3", "parcel_id": "22222-22-22-22222",
+                 "owner_name": "COLEMAN, LEWIS", "tax_type": "Real Estate"}]
+        detail = {"owner_street": "500 Family Home St", "property_street": "",
+                  "parcel_id": "22222-22-22-22222"}
+        history = [{"tax_year": 2025, "owner_name": "COLEMAN, LEWIS"},
+                   {"tax_year": 2015, "owner_name": "COLEMAN, ELIZABETH"}]
+        with mock.patch("tulsa_treasurer.search_owner_name", return_value=hits), \
+             mock.patch("tulsa_treasurer.get_parcel_detail", return_value=detail), \
+             mock.patch("tulsa_treasurer.get_owner_history", return_value=history), \
+             mock.patch("time.sleep"):
+            self.main._treasurer_true_negative_check(
+                row, [("heir", "Lewis Coleman")])
+        self.assertIn("Treasurer Check", row)
+
+    def test_no_hits_anywhere_leaves_row_untouched(self):
+        row = {"Decedent Name": "Nobody Real"}
+        with mock.patch("tulsa_treasurer.search_owner_name", return_value=[]), \
+             mock.patch("time.sleep"):
+            self.main._treasurer_true_negative_check(row, [("decedent", "Nobody Real")])
+        self.assertNotIn("Treasurer Check", row)
+
+    def test_blank_candidate_names_are_skipped_without_searching(self):
+        row = {}
+        with mock.patch("tulsa_treasurer.search_owner_name",
+                        side_effect=AssertionError("searched with a blank name")), \
+             mock.patch("time.sleep"):
+            self.main._treasurer_true_negative_check(row, [("decedent", ""), ("PR", None)])
+        self.assertNotIn("Treasurer Check", row)
+
+
 if __name__ == "__main__":
     unittest.main()

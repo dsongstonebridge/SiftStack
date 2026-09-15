@@ -263,10 +263,12 @@ run" below.
 | Probate Notes / Message Board | `_PROBATE_SECTIONS`, `_NOTES_SECTION_SETS`, `_signing_chain_block()` | signing chain + mailing address |
 | Trace at the person's address | `resolve_subjects()` -> `trace_*` | probate never falls back to the property |
 | Repeat-PR dedupe | `tracerfy_source()` | billed once, credited to every record |
-| **The chain** | `_create_records_for_batch()` | enrich -> buy box -> review, all before creation |
+| **The chain** | `_create_records_for_batch()` | enrich -> buy box -> review, all before creation; STOP-AND-ASK gates per ROW, not the whole batch |
 | Probate columns into the trace | `main._trace_row()` | SIGNING CHAIN + relationship survive both paths |
 | Relationship phone tag | `relationship_tag()`, `_primary_relationship_tag()` | heir's numbers: Daughter/Son/Wife/Husband/Grandchild, else Relative |
 | PR + title holder on the board | `Title Holder of Record` column, `_signing_chain_block()` | PR as the filing names them; assessor owner of record, flagged when it is not the decedent |
+| Trust-name search + LOCCAT | `main._trust_name_search()`, `src/tulsa_loccat.py` | trust searched BEFORE the decedent's own name |
+| Treasurer true-negative fallback | `main._treasurer_true_negative_check()`, `src/tulsa_treasurer.py` | runs only when the Assessor found nothing; never trusts a name-only hit |
 
 **The skill's column list and `_PROBATE_SECTIONS` must stay in sync.** A field
 in one and not the other is extracted and then silently dropped — same trap as
@@ -552,6 +554,75 @@ capabilities came out of it:
    transaction (document `2014002906`, Larry Kaiser → L&S Group) that the sales-history lookup
    also found independently, and confirms L&S Group LLC holds **12** Tulsa County parcels —
    matching a fact already on record in this file from the original Johnson incident.
+
+### Tulsa County Treasurer — true-negative fallback + per-row STOP-AND-ASK (2026-09-15, third video)
+
+A third video ("Using Tulsa County Treasurer for Probate Properties") pointed at adapting the
+downloaded `probate-property-finder` skill's Tier 1 (name search) / Tier 2 (executor family
+search) / Tier 3 (people search) for Tulsa specifically — its Knox County TN tiers don't apply
+directly, but Tier 1 led to checking whether Tulsa County has an equivalent, and it does: the
+County **Treasurer**, not just the Assessor.
+
+**New module: `src/tulsa_treasurer.py`**, wrapping `oktaxrolls.com` (Tulsa County Treasurer) —
+plain HTTP, no login, no Playwright. Found the real name-search route by reading the site's own
+`custom_data_table.js` rather than guessing: `POST /searchResult/Tulsa/owner_name` with
+`first_name`/`last_name`/`business_owner_name` query params genuinely filters (gibberish control →
+0 rows) — the DataTables global `search[value]` parameter on this site's OTHER endpoint
+(`/searchResult/Tulsa/amount`, already used by `tulsa_tax_delinquent.py`) is silently ignored, the
+same trap as DataSift's `search=` param elsewhere in this codebase; caught by testing a real name
+against gibberish before trusting either.
+
+- `search_owner_name()` — searches all years by default (the site's own "All Years" default).
+  Live-tested against the Fulton reference case (Johnnie Fulton Sr., PB-2026-587/588/589):
+  found **FIVE** real-estate parcels, not the two already on record from the Assessor-only
+  investigation. Two were previously known (`40800-02-13-05520` = the reference property at 4503 N
+  Iroquois Ave; `90328-03-28-15610` = the known unplatted parcel). **Three more
+  (`02575-02-24-00480`, `06100-02-26-00100`, `11225-02-24-03090`) were never found by the
+  Assessor-only search at all** — concrete proof this is a genuinely independent second source, not
+  a slower path to the same answer.
+- `get_owner_history()` — the site's own "History" button (real link is `owner_history/Tulsa`, not
+  `history/Tulsa` — caught a self-inflicted false 404 from chopping the `owner_` prefix off via a
+  sloppy regex before re-verifying against the raw HTML). Parses a real server-rendered
+  `<table class="table-tax-data">`: who paid the tax, per year, for a parcel's lineage. This is a
+  second, independent chain-of-title signal from the Assessor's deed-based sales history — tax
+  *payer* history, not deed *grantor/grantee* history.
+- **COMMON-NAME COLLISION IS REAL, confirmed live (user-flagged 2026-09-15):** searching a name
+  recalled from an earlier true-negative case ("COLEMAN, ELIZABETH") returned a real, direct hit on
+  an actual parcel, with nothing to say whether it was the same Elizabeth Coleman or a different
+  person sharing a common name — the same trap already on record for the Assessor ("Tina Johnson",
+  26-way tie at 0.67). **A name-only hit here is never trusted.** `address_corroborates()` requires
+  an exact house-number match plus a shared street-name word against an address already known from
+  the filing before a hit counts as anything.
+
+**Role: fallback corroboration, not a replacement for the Assessor** — the video's own framing:
+*"Do we need it if the assessor has already verified? No, of course not. But if the assessor
+hasn't, then it could be very helpful."* `main._treasurer_true_negative_check()` runs ONLY when the
+Assessor found nothing for anyone named in the filing (decedent, PR, every heir) — it searches the
+same candidates on the Treasurer, requires `address_corroborates()` before accepting any hit, and
+for a hit under an heir's/PR's own name additionally requires the decedent to appear in that
+parcel's own tax-payer history (`history_contains_name()`) — otherwise it's presumed to be the
+heir's own unrelated property, not an inheritance (the Coleman/Lewis case the video walked through:
+Lewis Coleman had a real hit, but it was his own pre-existing property; the decedent never once
+appears in that parcel's payer history).
+
+**A corroborated finding writes the SAME fields an Assessor hit would** (Property Street/City,
+Parcel ID, Title Holder of Record) — not just an informational note. This was a real bug caught by
+writing the test before trusting the feature: the first version only set a side-field
+(`Treasurer Check`), which meant the discovery was invisible to the rest of the pipeline —
+`check_buy_box()`'s "no property address could be resolved" rule excludes any row with no Property
+Street *before* `batch_review.py`'s STOP-AND-ASK section ever runs on it, so the note would sit on
+a row that had already been thrown out. Fixed to populate the real fields, so a Treasurer discovery
+flows into the *same*, already-tested title-holder check as an Assessor hit, rather than needing
+(or getting) a separate code path.
+
+**STOP-AND-ASK IS PER-ROW, NOT PER-BATCH (user, 2026-09-15):** *"I don't want the stop and ask
+properties to slow down the work on the easy ones... the tougher ones can be saved for my manual
+review last while the easy ones are running."* Before this, ANY row with a BLOCK finding halted
+`_create_records_for_batch()` for the ENTIRE batch — one messy case held up every clean one behind
+it. `_create_records_for_batch()` now partitions rows by whether they actually earned a BLOCK: the
+clean rows proceed to creation in the same run, and only the flagged rows are held back (reported
+in the review sheet) for a later manual pass. Mirrors how `apply_buy_box()` already splits
+kept/rejected rows rather than failing the whole batch on one exclusion.
 
 ### Known gaps
 

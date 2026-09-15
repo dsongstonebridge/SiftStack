@@ -1426,6 +1426,122 @@ def _check_insider_transfer(row: dict, acct: str, get_parcel_sales_history) -> N
             return
 
 
+def _treasurer_true_negative_check(row: dict, candidates: list[tuple[str, str]]) -> None:
+    """Last-resort corroboration when the Assessor found nothing for anyone
+    named in the filing - see tulsa_treasurer.py.
+
+    User, 2026-09-15 (video walkthrough, "Using Tulsa County Treasurer for
+    Probate Properties"): the Treasurer's owner-name index is a second,
+    independent source from the Assessor and has already found real parcels
+    the Assessor-only search missed (Fulton: 3 additional parcels beyond the
+    2 already on record). Run it as a fallback when the Assessor path came up
+    completely empty, not as a replacement.
+
+    A hit is NEVER accepted on name alone - common-name collision is real and
+    confirmed live (searching a recalled "Elizabeth Coleman" returned a real
+    hit with nothing to say whether it was the same person as any given
+    probate). Every hit must be corroborated against a mailing address
+    already known from the filing (`address_corroborates()`). And a hit under
+    an heir's/PR's own name additionally needs the decedent's name to appear
+    in that parcel's own tax-payer history (`history_contains_name()`) or it
+    is presumed to be the heir's own pre-existing property, not an
+    inheritance - the Coleman/Lewis case from the same video.
+
+    Free, read-only. Always sets row["Treasurer Check"] as evidence. When a
+    corroborated finding carries a street address, ALSO writes it to
+    Property Street/City/Parcel ID/Title Holder of Record - the same fields
+    `_apply_primary_hit()` writes for an Assessor hit - so the discovery
+    flows into the ordinary buy-box + STOP-AND-ASK review instead of dying
+    silently: `check_buy_box()` excludes any row with no Property Street
+    before review ever sees it, so a note-only field would never surface.
+    Never overrides fields the Assessor already found (row.get(...) or ...
+    throughout) and never sets Vacant Lot/Land Value/Insider Transfer - those
+    need an Assessor-format account number, which the Treasurer's own
+    dash-formatted parcel ID deliberately is not (`_is_assessor_account()`
+    rejects it on sight, same as an OCR'd tax-roll parcel).
+    """
+    import time
+    import tulsa_treasurer as treasurer
+
+    known_addresses = [
+        str(a).strip() for a in (row.get("PR Address"), row.get("Mailing Street"))
+        if str(a or "").strip()
+    ]
+    decedent_name = str(row.get("Decedent Name") or "").strip()
+    _SUFFIXES = {"JR", "SR", "II", "III", "IV", "V", "ESQ"}
+    findings: list[tuple[str, str, dict]] = []
+
+    for label, name in candidates:
+        name = str(name or "").strip()
+        if not name:
+            continue
+        parts = [p.strip(".,") for p in name.replace(",", " ").split() if p.strip(".,")]
+        while len(parts) > 1 and parts[-1].upper() in _SUFFIXES:
+            parts.pop()
+        if not parts:
+            continue
+        last, first = parts[-1], (parts[0] if len(parts) > 1 else "")
+
+        try:
+            hits = treasurer.search_owner_name(last, first)
+        except Exception as e:                    # noqa: BLE001 - free lookup; never lose the row
+            logging.debug("  treasurer: search error for %s: %s", name, e)
+            continue
+        time.sleep(0.5)
+        if not hits:
+            continue
+
+        seen_parcels: set[str] = set()
+        for h in hits:
+            if h["parcel_id"] in seen_parcels:
+                continue
+            seen_parcels.add(h["parcel_id"])
+            detail = treasurer.get_parcel_detail(h["tax_data_id"])
+            time.sleep(0.5)
+            if not any(treasurer.address_corroborates(detail, addr) for addr in known_addresses):
+                continue  # name-only hit - never trusted alone (common-name risk)
+
+            if label != "decedent" and decedent_name:
+                hist = treasurer.get_owner_history(h["tax_data_id"])
+                time.sleep(0.5)
+                if not treasurer.history_contains_name(hist, decedent_name):
+                    logging.info(
+                        "  treasurer: %s (%s) owns %s but the decedent never appears "
+                        "in its tax-payer history - looks like their own pre-existing "
+                        "property, not an inheritance", name, label,
+                        detail.get("property_street") or detail.get("parcel_id"))
+                    continue
+
+            findings.append((label, name, detail))
+
+    if not findings:
+        return
+
+    row["Treasurer Check"] = "; ".join(
+        f"{label}: {name} -> "
+        f"{d.get('property_street') or d.get('legal_description') or d.get('parcel_id')}"
+        for label, name, d in findings)
+
+    # This discovery IS the property record - write it where the rest of the
+    # pipeline looks, or it never reaches review (check_buy_box excludes any
+    # row with no Property Street before STOP-AND-ASK ever sees it).
+    if not str(row.get("Property Street") or "").strip():
+        addressed = [f for f in findings if f[2].get("property_street")]
+        best_label, best_name, best_detail = addressed[0] if addressed else findings[0]
+        if best_detail.get("property_street"):
+            row["Property Street"] = best_detail["property_street"]
+            row["Property City"] = best_detail.get("property_city") or ""
+            row["Property State"] = "OK"
+            row.setdefault("Parcel ID", best_detail.get("parcel_id") or "")
+            row["Title Holder of Record"] = (row.get("Title Holder of Record")
+                                             or best_detail.get("owner_name") or "")
+            row["Assessor Matched On"] = f"Treasurer fallback - {best_label}: {best_name}"
+
+    logging.warning(
+        "  treasurer: %d corroborated hit(s) the Assessor missed - review before "
+        "concluding no real property: %s", len(findings), row["Treasurer Check"])
+
+
 def _enrich_probate_rows(rows: list[dict]) -> list[dict]:
     """Fill each probate row's property facts from the county assessor.
 
@@ -1462,6 +1578,17 @@ def _enrich_probate_rows(rows: list[dict]) -> list[dict]:
     parcel. See `_trust_name_search()`, which tries the Assessor first and
     falls back to `tulsa_loccat`'s document-by-grantee search (a different
     index) when the Assessor misses.
+
+    WHEN THE ASSESSOR FINDS NOTHING FOR ANYONE NAMED, CHECK THE TREASURER
+    BEFORE CALLING IT A TRUE NEGATIVE (user, 2026-09-15, second video
+    walkthrough). `_treasurer_true_negative_check()` searches the Tulsa
+    County Treasurer's independent owner-name index for the same candidates
+    and has already found real parcels the Assessor missed on the Fulton
+    reference case. Never trusts a name-only hit (common-name collision is
+    real - confirmed live) - every hit must be corroborated against a known
+    mailing address, and a hit under an heir's own name additionally needs
+    the decedent to appear in that parcel's own tax-payer history or it is
+    presumed to be the heir's own unrelated property.
     """
     import time
     from tulsa_assessor import (search_assessor, get_parcel_improvements,
@@ -1608,6 +1735,7 @@ def _enrich_probate_rows(rows: list[dict]) -> list[dict]:
                             "This is NOT proof of no real property; check the filing.",
                             row.get("Decedent Name"), row.get("Case Number"),
                             len([c for _, c in candidates if c]))
+            _treasurer_true_negative_check(row, candidates)
             continue
 
         addressed = [h for h in hits if (h.get("FullPropertyStreet") or "").strip()]
@@ -1638,6 +1766,7 @@ _PROBATE_TRACE_COLUMNS = (
     "PR Status", "Decedent Name", "Date of Death", "Heir Count", "Heirs",
     "Heirs Deceased", "Heirs Address Unknown", "Additional Parcels",
     "Title Holder of Record", "Insider Transfer", "Trust Name",
+    "Treasurer Check",
 )
 
 
@@ -1687,6 +1816,15 @@ def _create_records_for_batch(args, csv_path: Path) -> list[dict] | None:
     upsert_phones + set_phone_tags path and therefore carries an honest
     source tag. See [[feedback-phone-source-tags-must-be-true]].
 
+    STOP-AND-ASK IS PER-ROW, NOT PER-BATCH (user, 2026-09-15): a straightforward
+    case - one that resolves cleanly off the Assessor, the Treasurer, or the
+    probate filing itself - should never wait on a human, and must not be held
+    up by an unrelated messy case elsewhere in the same batch. Only rows that
+    actually earned a BLOCK finding in review_batch() are held back; every
+    other row in the batch proceeds to creation in the SAME run. Held rows sit
+    in the review sheet for later manual pass, re-run with --create once
+    reviewed.
+
     Returns the rows to hand to run_pipeline, or None if the batch failed.
     """
     import asyncio as _asyncio
@@ -1713,7 +1851,7 @@ def _create_records_for_batch(args, csv_path: Path) -> list[dict] | None:
         template_rows = _enrich_probate_rows(template_rows)
 
     from buy_box import apply_buy_box, describe as describe_buy_box
-    from batch_review import review_batch, print_review, write_review_sheet
+    from batch_review import BLOCK, review_batch, print_review, write_review_sheet
 
     template_rows, rejected = apply_buy_box(template_rows)
     if rejected:
@@ -1734,8 +1872,29 @@ def _create_records_for_batch(args, csv_path: Path) -> list[dict] | None:
 
     findings = review_batch(template_rows, notice_type=notice_type)
     sheet = write_review_sheet(template_rows, findings)
-    if not print_review(findings, total_rows=len(template_rows)):
-        logging.error("Stopping BEFORE any record is created. Fix %s and re-run.", sheet)
+    print_review(findings, total_rows=len(template_rows))  # logs everything; see below for the gate
+
+    # PER-ROW gate, not all-or-nothing (user, 2026-09-15): one messy case must
+    # never hold up the easy ones behind it. A row that clears the Assessor
+    # (or now the Treasurer) outright needs no human input at all - only rows
+    # that actually earned a BLOCK finding get held back. Everything else
+    # proceeds to creation in THIS run; held rows wait for a human to review
+    # `sheet`, mark Property Confirmed=Yes where appropriate, and re-run.
+    blocked_rows = {f["row"] for f in findings if f["severity"] == BLOCK}
+    if blocked_rows:
+        held = [r for i, r in enumerate(template_rows, start=1) if i in blocked_rows]
+        clean = [r for i, r in enumerate(template_rows, start=1) if i not in blocked_rows]
+        logging.warning("")
+        logging.warning("=== HELD FOR MANUAL REVIEW - NOT CREATED YET (%d of %d) ===",
+                        len(held), len(template_rows))
+        logging.warning("  %d clean row(s) proceed in this run. Review %s, mark "
+                        "Property Confirmed=Yes where appropriate, and re-run "
+                        "(--create) with just the held rows once satisfied.",
+                        len(clean), sheet)
+        logging.warning("")
+        template_rows = clean
+    if not template_rows:
+        logging.error("Every row needs manual review - nothing to create yet. See %s.", sheet)
         return None
     list_name = (getattr(args, "list_name", None)
                  or f"SiftStack {datetime.now().strftime('%Y-%m-%d')}")

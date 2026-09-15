@@ -1198,6 +1198,104 @@ def _living_spouse_address(row: dict) -> str:
     return str(row.get("PR Address") or row.get("Mailing Street") or "").strip()
 
 
+def _trust_name_search_terms(trust_name: str) -> list[str]:
+    """A few natural variants to try for a stated trust name - deed records
+    phrase this inconsistently (REV LIVING TRUST vs REVOCABLE TRUST vs a
+    bare TRUST), and a DTD/DATED suffix often is not repeated verbatim on
+    every recorded document."""
+    import re
+    name = trust_name.strip()
+    if not name:
+        return []
+    variants = [name]
+    stripped = re.split(r"\bDTD\b|\bDATED\b", name, flags=re.I)[0].strip().rstrip(",")
+    if stripped and stripped not in variants:
+        variants.append(stripped)
+    return variants
+
+
+def _trust_name_search(row: dict, search_assessor, get_parcel_situs,
+                       get_parcel_improvements, get_parcel_sales_history) -> bool:
+    """If the filing names a trust everything is held in, search for it
+    FIRST - a will stating "everything I own is in the X Revocable Trust" is
+    a stronger signal than searching the decedent's own name, which a
+    trust-titled parcel will not match at all.
+
+    User, 2026-09-15 (video walkthrough, Scott/Coleman cases): both named
+    their trust explicitly, and the Assessor's owner-name search for the
+    trust name (tried FIRST, before the decedent's own name) is the correct
+    starting point. When the Assessor search misses, `tulsa_loccat`'s
+    document search by GRANTEE is a genuinely different index that can still
+    find a parcel the trust holds. Its matching is LOOSE (verified live: a
+    short trust/company name can return 1,000+ raw hits on common filler
+    words like "GROUP"/"LLC"), so only `verified_hits()` results are ever
+    used - see that module's docstring for the "L & S GROUP LLC" case this
+    was built and tested against.
+
+    Returns True if a property was resolved (row mutated in place).
+    """
+    import time
+    trust_name = str(row.get("Trust Name") or "").strip()
+    variants = _trust_name_search_terms(trust_name)
+    if not variants:
+        return False
+
+    for variant in variants:
+        hits = search_assessor(variant)
+        time.sleep(2)
+        if not hits:
+            continue
+        addressed = [h for h in hits if (h.get("FullPropertyStreet") or "").strip()]
+        if len(hits) > 1 and not addressed:
+            logging.warning("  assessor: %d hit(s) for trust %r, none addressed - "
+                            "skipping rather than guessing", len(hits), variant)
+            continue
+        primary = addressed[0] if addressed else hits[0]
+        acct = _apply_primary_hit(row, primary, f"trust name: {variant!r} (assessor)")
+        _finish_parcel_lookup(row, acct, get_parcel_improvements, get_parcel_sales_history)
+        extras = [h for h in hits if h.get("AccountNo") != acct]
+        if extras and not row.get("Additional Parcels"):
+            row["Additional Parcels"] = "; ".join(
+                f"{h.get('AccountNo')} ({(h.get('FullPropertyStreet') or 'no street address').strip()})"
+                for h in extras)
+        return True
+
+    # The Assessor's owner-name search missed every variant - try LOCCAT's
+    # document search, a genuinely different index (see tulsa_loccat's
+    # module docstring for why this can succeed where the Assessor misses).
+    import tulsa_loccat
+    for variant in variants:
+        raw = tulsa_loccat.search_advanced(doc_grantor_grantee=variant)
+        verified = tulsa_loccat.verified_hits(raw)
+        if not verified:
+            continue
+        parcels = sorted({v["properties"].get("PARCELNB") for v in verified
+                          if v["properties"].get("PARCELNB")})
+        if not parcels:
+            continue
+        primary_acct = f"R{parcels[0]}"
+        situs = get_parcel_situs(primary_acct) or {}
+        time.sleep(2)
+        if not situs.get("street"):
+            logging.warning("  loccat: trust %r verified on document search but parcel "
+                            "%s has no situs address - skipping", variant, primary_acct)
+            continue
+        if not str(row.get("Property Street") or "").strip():
+            row["Property Street"] = situs["street"]
+            row["Property City"] = (situs.get("city") or "").title()
+            row["Property State"] = "OK"
+            row["Property Zip"] = situs.get("zip") or ""
+        row.setdefault("Parcel ID", primary_acct)
+        row["Title Holder of Record"] = (row.get("Title Holder of Record")
+                                         or situs.get("owner") or "")
+        row["Assessor Matched On"] = f"trust name: {variant!r} (LOCCAT document search)"
+        if len(parcels) > 1 and not row.get("Additional Parcels"):
+            row["Additional Parcels"] = "; ".join(f"R{p}" for p in parcels[1:])
+        _finish_parcel_lookup(row, primary_acct, get_parcel_improvements, get_parcel_sales_history)
+        return True
+    return False
+
+
 def _apply_primary_hit(row: dict, primary: dict, matched_on: str) -> str:
     """Write property/title fields from a resolved assessor hit onto `row`;
     returns the account number so callers can chain into improvements/sales
@@ -1357,6 +1455,13 @@ def _enrich_probate_rows(rows: list[dict]) -> list[dict]:
     petitioner quit-claimed the property to the LLC years before the estate
     existed), independent of whether the current title holder is itself a
     named party.
+
+    WHEN A TRUST IS NAMED, SEARCH IT FIRST (user, 2026-09-15, video
+    walkthrough). A will stating "everything I own is in the X Revocable
+    Trust" means the decedent's own name will never match a trust-titled
+    parcel. See `_trust_name_search()`, which tries the Assessor first and
+    falls back to `tulsa_loccat`'s document-by-grantee search (a different
+    index) when the Assessor misses.
     """
     import time
     from tulsa_assessor import (search_assessor, get_parcel_improvements,
@@ -1373,6 +1478,12 @@ def _enrich_probate_rows(rows: list[dict]) -> list[dict]:
             acct = str(row.get("Parcel ID") or "").strip().upper()
             if _is_assessor_account(acct):
                 _check_insider_transfer(row, acct, get_parcel_sales_history)
+            continue
+
+        if _trust_name_search(row, search_assessor, get_parcel_situs,
+                              get_parcel_improvements, get_parcel_sales_history):
+            logging.info("  %s -> %s [trust name]", row.get("Decedent Name"),
+                         row.get("Property Street") or "(no address)")
             continue
 
         spouse_street = _living_spouse_address(row)
@@ -1526,7 +1637,7 @@ _PROBATE_TRACE_COLUMNS = (
     "Decision Maker", "DM Relationship", "Personal Representative",
     "PR Status", "Decedent Name", "Date of Death", "Heir Count", "Heirs",
     "Heirs Deceased", "Heirs Address Unknown", "Additional Parcels",
-    "Title Holder of Record", "Insider Transfer",
+    "Title Holder of Record", "Insider Transfer", "Trust Name",
 )
 
 

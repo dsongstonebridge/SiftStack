@@ -251,5 +251,123 @@ class LivingSpouseAddressTests(unittest.TestCase):
         self.assertEqual(row["Title Holder of Record"], "BITSON, D ANGELO")
 
 
+class TrustNameSearchTests(unittest.TestCase):
+    """Video, 2026-09-15 (Scott/Coleman): a will naming a trust means the
+    decedent's own name will never match a trust-titled parcel - search the
+    trust FIRST. Assessor first; tulsa_loccat's document search (a different
+    index) as fallback when the Assessor misses."""
+
+    def setUp(self):
+        import main
+        self.main = main
+
+    def test_no_trust_name_is_a_pure_noop(self):
+        row = {"Decedent Name": "Clifton Lee Ross"}
+        with mock.patch("tulsa_assessor.search_assessor",
+                        side_effect=AssertionError("searched with no trust name")):
+            result = self.main._trust_name_search(row, __import__("tulsa_assessor").search_assessor,
+                                                   None, None, None)
+        self.assertFalse(result)
+
+    def test_trust_found_via_assessor_wins_immediately(self):
+        row = {"Decedent Name": "Elizabeth S. Coleman",
+               "Trust Name": "Elizabeth S. Coleman Revocable Trust"}
+        hit = {"AccountNo": "R11111111111111", "FullPrimaryOwnerName": "COLEMAN, ELIZABETH S REV TRUST",
+               "FullPropertyStreet": "123 E MAIN ST", "PropertyCity": "TULSA",
+               "PropertyZipCode": "74103", "AcctType": "Residential"}
+        with mock.patch("tulsa_assessor.search_assessor", return_value=[hit]) as sa, \
+             mock.patch("tulsa_assessor.get_parcel_improvements",
+                        return_value={"is_vacant_lot": False, "land_value": 8000}), \
+             mock.patch("tulsa_assessor.get_parcel_sales_history", return_value=[]), \
+             mock.patch("time.sleep"):
+            result = self.main._trust_name_search(
+                row, __import__("tulsa_assessor").search_assessor,
+                __import__("tulsa_assessor").get_parcel_situs,
+                __import__("tulsa_assessor").get_parcel_improvements,
+                __import__("tulsa_assessor").get_parcel_sales_history)
+        self.assertTrue(result)
+        sa.assert_called_once_with("Elizabeth S. Coleman Revocable Trust")
+        self.assertEqual(row["Property Street"], "123 E MAIN ST")
+        self.assertEqual(row["Title Holder of Record"], "COLEMAN, ELIZABETH S REV TRUST")
+
+    def test_dtd_suffix_variant_tried_when_full_name_misses(self):
+        row = {"Trust Name": "John Smith Living Trust DTD 3/12/2010"}
+        calls = []
+        def fake_search(term):
+            calls.append(term)
+            if term == "John Smith Living Trust":
+                return [{"AccountNo": "R22222222222222", "FullPrimaryOwnerName": "SMITH TRUST",
+                         "FullPropertyStreet": "456 S ELM AVE", "PropertyCity": "TULSA",
+                         "PropertyZipCode": "74105", "AcctType": "Residential"}]
+            return []
+        with mock.patch("tulsa_assessor.get_parcel_improvements", return_value=None), \
+             mock.patch("tulsa_assessor.get_parcel_sales_history", return_value=[]), \
+             mock.patch("time.sleep"):
+            result = self.main._trust_name_search(
+                row, fake_search, __import__("tulsa_assessor").get_parcel_situs,
+                __import__("tulsa_assessor").get_parcel_improvements,
+                __import__("tulsa_assessor").get_parcel_sales_history)
+        self.assertTrue(result)
+        self.assertIn("John Smith Living Trust DTD 3/12/2010", calls)
+        self.assertIn("John Smith Living Trust", calls)
+        self.assertEqual(row["Property Street"], "456 S ELM AVE")
+
+    def test_falls_back_to_loccat_when_assessor_misses(self):
+        row = {"Trust Name": "L & S Group LLC"}
+        loccat_hit = {"properties": {"PARCELNB": "12145940944450", "GRANTOR": "KAISER LARRY A",
+                                     "GRANTEE": "L&S GROUP"}, "verified": True}
+        with mock.patch("tulsa_assessor.search_assessor", return_value=[]), \
+             mock.patch("tulsa_loccat.search_advanced", return_value=[loccat_hit]), \
+             mock.patch("tulsa_assessor.get_parcel_situs",
+                        return_value={"street": "1916 S 140TH EAST AVE", "city": "TULSA",
+                                     "zip": "74108", "owner": "L & S GROUP LLC"}) as gs, \
+             mock.patch("tulsa_assessor.get_parcel_improvements", return_value=None), \
+             mock.patch("tulsa_assessor.get_parcel_sales_history", return_value=[]), \
+             mock.patch("time.sleep"):
+            result = self.main._trust_name_search(
+                row, __import__("tulsa_assessor").search_assessor,
+                __import__("tulsa_assessor").get_parcel_situs,
+                __import__("tulsa_assessor").get_parcel_improvements,
+                __import__("tulsa_assessor").get_parcel_sales_history)
+        self.assertTrue(result)
+        gs.assert_called_once_with("R12145940944450")
+        self.assertEqual(row["Property Street"], "1916 S 140TH EAST AVE")
+        self.assertEqual(row["Title Holder of Record"], "L & S GROUP LLC")
+
+    def test_unverified_loccat_hits_are_never_used(self):
+        row = {"Trust Name": "L & S Group LLC"}
+        unverified_hit = {"properties": {"PARCELNB": "99999999999999"}, "verified": False}
+        with mock.patch("tulsa_assessor.search_assessor", return_value=[]), \
+             mock.patch("tulsa_loccat.search_advanced", return_value=[unverified_hit]), \
+             mock.patch("tulsa_assessor.get_parcel_situs",
+                        side_effect=AssertionError("looked up an unverified hit")), \
+             mock.patch("time.sleep"):
+            result = self.main._trust_name_search(
+                row, __import__("tulsa_assessor").search_assessor,
+                __import__("tulsa_assessor").get_parcel_situs, None, None)
+        self.assertFalse(result)
+
+    def test_enrich_tries_trust_before_spouse_address(self):
+        # A row that has BOTH a trust name AND a living-spouse signal - the
+        # trust must be searched first (video: trust presence is the
+        # stronger, more specific signal when stated).
+        row = {"Decedent Name": "Elizabeth S. Coleman",
+               "Trust Name": "Elizabeth S. Coleman Revocable Trust",
+               "PR Relationship": "Spouse", "PR Address": "999 Should Not Be Searched Ave"}
+        hit = {"AccountNo": "R33333333333333", "FullPrimaryOwnerName": "COLEMAN TRUST",
+               "FullPropertyStreet": "789 W OAK ST", "PropertyCity": "TULSA",
+               "PropertyZipCode": "74107", "AcctType": "Residential"}
+        with mock.patch("tulsa_assessor.search_assessor") as sa, \
+             mock.patch("tulsa_assessor.get_parcel_situs",
+                        side_effect=AssertionError("known-address branch should not run")), \
+             mock.patch("tulsa_assessor.get_parcel_improvements", return_value=None), \
+             mock.patch("tulsa_assessor.get_parcel_sales_history", return_value=[]), \
+             mock.patch("time.sleep"):
+            sa.return_value = [hit]
+            self.main._enrich_probate_rows([row])
+        sa.assert_called_once_with("Elizabeth S. Coleman Revocable Trust")
+        self.assertEqual(row["Property Street"], "789 W OAK ST")
+
+
 if __name__ == "__main__":
     unittest.main()

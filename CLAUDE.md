@@ -516,6 +516,43 @@ the rule against real ownership patterns, not guessed ones:
    `Property Confirmed` column to `Yes` — never inferred, set only by the user
    after reviewing the evidence shown.
 
+### Trust-name search + LOCCAT (2026-09-15, second video walkthrough)
+
+A follow-up video ("Tulsa Probate Home Ownership True Negatives") walked three cases where the
+decedent turns out to have owned no real property at all (Scott, Coleman, Pruitt) — worked through
+to distinguish a genuine "true negative" from a search that just gave up too early. Two real
+capabilities came out of it:
+
+1. **Search a named trust FIRST, before the decedent's own name.** A will stating "everything I
+   own is in the X Revocable Trust" means the decedent's own name will never match a trust-titled
+   parcel — searching it anyway (as the old order did) just wastes a step before falling through.
+   New `Trust Name` extraction field; `main._trust_name_search()` tries the Assessor (full name,
+   then the DTD/DATED-stripped variant), and only if that misses, falls back to `tulsa_loccat`
+   (below). Runs before even the living-spouse-address check, since trust presence is the
+   strongest signal when the will states one.
+2. **New module: `src/tulsa_loccat.py`**, wrapping the Tulsa County Clerk's LOCCAT tool
+   (`ais-usc-tulsacounty-web.azurewebsites.net`) — plain HTTP, no browser, no auth. Found by
+   reading its page's own unminified JS (`/Scripts/map/map.js`) rather than guessing at its Mapbox
+   map UI, the same discipline that cracked the Assessor's sales-history table. Two endpoints:
+   - `search_parcel()` -> `POST /api/Parcels/Search` (owner/parcel/address/section-township-range)
+     — TIGHT matching, verified: `KAISER,LARRY` returns exactly the one real hit. A second,
+     complementary source to the Assessor's own search.
+   - `search_advanced()` -> `POST /api/Parcels/SearchAdvanced` (document search by
+     grantor/grantee, or subdivision/lot/block) — **the only source in this codebase that can find
+     a trust by name without already knowing a parcel.** Its matching is **LOOSE, confirmed live**:
+     `L & S GROUP LLC` returned **1,315** raw results (OR-matching on filler words like
+     "GROUP"/"LLC"). This is the exact false-hit gotcha the video called out by hand ("Patricia
+     Pruitt" surfacing "Patricia... Party" as a "hit"). Fixed and tested: `verified_hits()` filters
+     to records whose GRANTOR/GRANTEE is a genuine normalized-substring match — token-overlap
+     ("≥ 2 shared words") was tried first and is WRONG for entity names, since it let 1,153 of
+     those 1,315 false hits through. **Never call `search_advanced()` and trust the raw result —
+     always go through `verified_hits()`.**
+
+   Live validation, not just synthetic tests: the corrected matching finds the exact real Johnson
+   transaction (document `2014002906`, Larry Kaiser → L&S Group) that the sales-history lookup
+   also found independently, and confirms L&S Group LLC holds **12** Tulsa County parcels —
+   matching a fact already on record in this file from the original Johnson incident.
+
 ### Known gaps
 
 1. **`--create` is not safe to re-run** — it re-posts notes and the Message

@@ -407,13 +407,16 @@ class TreasurerTrueNegativeTests(unittest.TestCase):
                   "owner_street": "1807 N Main", "property_street": "4503 N Iroquois Av E",
                   "property_city": "Tulsa",
                   "parcel_id": "40800-02-13-05520", "legal_description": "LT 36 BK 3 SUBURBAN ACRES AMD"}
+        history = [{"tax_year": 2025, "owner_name": "FULTON, JOHNNIE SR"}]
         with mock.patch("tulsa_treasurer.search_owner_name", return_value=hits), \
              mock.patch("tulsa_treasurer.get_parcel_detail", return_value=detail), \
+             mock.patch("tulsa_treasurer.get_owner_history", return_value=history), \
              mock.patch("time.sleep"):
             self.main._treasurer_true_negative_check(
                 row, [("decedent", "Johnnie Fulton Sr.")])
         self.assertIn("Treasurer Check", row)
         self.assertIn("4503 N Iroquois Av E", row["Treasurer Check"])
+        self.assertNotIn("CHAIN", row["Treasurer Check"])  # newest payer IS still the decedent
         # The critical part: this discovery must flow into the REAL fields the
         # rest of the pipeline reads, or check_buy_box excludes the row before
         # STOP-AND-ASK ever sees the Treasurer Check note.
@@ -433,6 +436,7 @@ class TreasurerTrueNegativeTests(unittest.TestCase):
                   "parcel_id": "40800-02-13-05520"}
         with mock.patch("tulsa_treasurer.search_owner_name", return_value=hits), \
              mock.patch("tulsa_treasurer.get_parcel_detail", return_value=detail), \
+             mock.patch("tulsa_treasurer.get_owner_history", return_value=[]), \
              mock.patch("time.sleep"):
             self.main._treasurer_true_negative_check(
                 row, [("decedent", "Johnnie Fulton Sr.")])
@@ -449,6 +453,7 @@ class TreasurerTrueNegativeTests(unittest.TestCase):
                   "parcel_id": "90328-03-28-15610", "legal_description": "UNPLATTED"}
         with mock.patch("tulsa_treasurer.search_owner_name", return_value=hits), \
              mock.patch("tulsa_treasurer.get_parcel_detail", return_value=detail), \
+             mock.patch("tulsa_treasurer.get_owner_history", return_value=[]), \
              mock.patch("time.sleep"):
             self.main._treasurer_true_negative_check(
                 row, [("decedent", "Johnnie Fulton Sr.")])
@@ -504,6 +509,165 @@ class TreasurerTrueNegativeTests(unittest.TestCase):
              mock.patch("time.sleep"):
             self.main._treasurer_true_negative_check(row, [("decedent", ""), ("PR", None)])
         self.assertNotIn("Treasurer Check", row)
+
+    def test_heir_pr_search_skipped_when_decedent_already_found_something(self):
+        # User, 2026-09-15: "checking the treasurer for the heir/pr is less
+        # valuable than checking for the decedent" - heir/PR search must not
+        # even run once the decedent search already found a corroborated hit.
+        row = {"Decedent Name": "Johnnie Fulton Sr.", "PR Address": "1807 N Main"}
+        decedent_hit = [{"tax_data_id": "1", "parcel_id": "40800-02-13-05520",
+                         "owner_name": "FULTON, JOHNNIE SR", "tax_type": "Real Estate"}]
+        detail = {"owner_name": "FULTON, JOHNNIE SR", "owner_street": "1807 N Main",
+                  "property_street": "4503 N Iroquois Av E", "parcel_id": "40800-02-13-05520"}
+
+        def fake_search(last, first):
+            if last.upper() == "FULTON":
+                return decedent_hit
+            raise AssertionError(f"heir/PR search should not have run: {last} {first}")
+
+        with mock.patch("tulsa_treasurer.search_owner_name", side_effect=fake_search), \
+             mock.patch("tulsa_treasurer.get_parcel_detail", return_value=detail), \
+             mock.patch("tulsa_treasurer.get_owner_history",
+                        return_value=[{"tax_year": 2025, "owner_name": "FULTON, JOHNNIE SR"}]), \
+             mock.patch("time.sleep"):
+            self.main._treasurer_true_negative_check(
+                row, [("decedent", "Johnnie Fulton Sr."), ("PR", "Jennifer Faulk")])
+        self.assertIn("Treasurer Check", row)
+
+    def test_heir_pr_search_runs_when_decedent_search_is_dry(self):
+        row = {"Decedent Name": "Johnnie Fulton Sr.", "PR Address": "500 Faulk Home St"}
+        heir_hit = [{"tax_data_id": "9", "parcel_id": "99999-99-99-99999",
+                     "owner_name": "FAULK, JENNIFER", "tax_type": "Real Estate"}]
+        detail = {"owner_street": "500 Faulk Home St", "property_street": "500 Faulk Home St",
+                  "parcel_id": "99999-99-99-99999"}
+        history = [{"tax_year": 2025, "owner_name": "FAULK, JENNIFER"},
+                   {"tax_year": 2010, "owner_name": "FULTON, JOHNNIE SR"}]
+
+        def fake_search(last, first):
+            return [] if last.upper() == "FULTON" else heir_hit
+
+        with mock.patch("tulsa_treasurer.search_owner_name", side_effect=fake_search), \
+             mock.patch("tulsa_treasurer.get_parcel_detail", return_value=detail), \
+             mock.patch("tulsa_treasurer.get_owner_history", return_value=history), \
+             mock.patch("time.sleep"):
+            self.main._treasurer_true_negative_check(
+                row, [("decedent", "Johnnie Fulton Sr."), ("PR", "Jennifer Faulk")])
+        self.assertIn("Treasurer Check", row)
+        self.assertIn("Jennifer Faulk", row["Treasurer Check"])
+
+    def test_chain_note_when_property_has_since_changed_hands(self):
+        row = {"Decedent Name": "Johnnie Fulton Sr.", "PR Address": "1807 N Main"}
+        hits = [{"tax_data_id": "1", "parcel_id": "40800-02-13-05520",
+                 "owner_name": "FULTON, JOHNNIE SR", "tax_type": "Real Estate"}]
+        detail = {"owner_name": "FULTON, JOHNNIE SR", "owner_street": "1807 N Main",
+                  "property_street": "4503 N Iroquois Av E", "parcel_id": "40800-02-13-05520"}
+        history = [{"tax_year": 2025, "owner_name": "NEW BUYER LLC"},
+                   {"tax_year": 2015, "owner_name": "FULTON, JOHNNIE SR"}]
+        with mock.patch("tulsa_treasurer.search_owner_name", return_value=hits), \
+             mock.patch("tulsa_treasurer.get_parcel_detail", return_value=detail), \
+             mock.patch("tulsa_treasurer.get_owner_history", return_value=history), \
+             mock.patch("time.sleep"):
+            self.main._treasurer_true_negative_check(
+                row, [("decedent", "Johnnie Fulton Sr.")])
+        self.assertIn("CHAIN", row["Treasurer Check"])
+        self.assertIn("NEW BUYER LLC", row["Treasurer Check"])
+
+    def test_zero_improvements_flags_for_manual_check_never_excludes(self):
+        # Live-tested 2026-09-15: Improvements == $0 showed on the KNOWN real
+        # Fulton house too - never a reliable vacant-lot signal by itself.
+        row = {"Decedent Name": "Johnnie Fulton Sr.", "PR Address": "1807 N Main"}
+        hits = [{"tax_data_id": "1", "parcel_id": "40800-02-13-05520",
+                 "owner_name": "FULTON, JOHNNIE SR", "tax_type": "Real Estate"}]
+        detail = {"owner_name": "FULTON, JOHNNIE SR", "owner_street": "1807 N Main",
+                  "property_street": "4503 N Iroquois Av E", "parcel_id": "40800-02-13-05520",
+                  "improvements_value": 0.0}
+        with mock.patch("tulsa_treasurer.search_owner_name", return_value=hits), \
+             mock.patch("tulsa_treasurer.get_parcel_detail", return_value=detail), \
+             mock.patch("tulsa_treasurer.get_owner_history",
+                        return_value=[{"tax_year": 2025, "owner_name": "FULTON, JOHNNIE SR"}]), \
+             mock.patch("time.sleep"):
+            self.main._treasurer_true_negative_check(
+                row, [("decedent", "Johnnie Fulton Sr.")])
+        self.assertIn("CHECK IMPROVEMENTS", row["Treasurer Check"])
+        self.assertIn("Zillow", row["Treasurer Check"])
+        self.assertNotIn("Vacant Lot", row)   # never auto-excluded on this signal
+        self.assertEqual(row["Property Street"], "4503 N Iroquois Av E")  # still created
+
+    def test_nonzero_improvements_has_no_check_flag(self):
+        row = {"Decedent Name": "Johnnie Fulton Sr.", "PR Address": "1807 N Main"}
+        hits = [{"tax_data_id": "1", "parcel_id": "40800-02-13-05520",
+                 "owner_name": "FULTON, JOHNNIE SR", "tax_type": "Real Estate"}]
+        detail = {"owner_name": "FULTON, JOHNNIE SR", "owner_street": "1807 N Main",
+                  "property_street": "4503 N Iroquois Av E", "parcel_id": "40800-02-13-05520",
+                  "improvements_value": 45000.0}
+        with mock.patch("tulsa_treasurer.search_owner_name", return_value=hits), \
+             mock.patch("tulsa_treasurer.get_parcel_detail", return_value=detail), \
+             mock.patch("tulsa_treasurer.get_owner_history",
+                        return_value=[{"tax_year": 2025, "owner_name": "FULTON, JOHNNIE SR"}]), \
+             mock.patch("time.sleep"):
+            self.main._treasurer_true_negative_check(
+                row, [("decedent", "Johnnie Fulton Sr.")])
+        self.assertNotIn("CHECK IMPROVEMENTS", row["Treasurer Check"])
+
+    def test_newest_year_kept_per_parcel_not_oldest(self):
+        # The real bug found live 2026-09-15: the Fulton reference parcel
+        # showed Improvements=$0 for 2019-2022 and a real nonzero figure from
+        # 2023 on. The site returns oldest-year-first, so picking the FIRST
+        # occurrence of a parcel (not the newest) reads stale data and would
+        # wrongly flag a known real house.
+        row = {"Decedent Name": "Johnnie Fulton Sr.", "PR Address": "1807 N Main"}
+        hits = [
+            {"tax_data_id": "old", "parcel_id": "40800-02-13-05520", "tax_year": 2019,
+             "owner_name": "FULTON, JOHNNIE SR", "tax_type": "Real Estate"},
+            {"tax_data_id": "new", "parcel_id": "40800-02-13-05520", "tax_year": 2025,
+             "owner_name": "FULTON, JOHNNIE SR", "tax_type": "Real Estate"},
+        ]
+        details = {
+            "old": {"owner_name": "FULTON, JOHNNIE SR", "owner_street": "1807 N Main",
+                   "property_street": "4503 N Iroquois Av E", "parcel_id": "40800-02-13-05520",
+                   "improvements_value": 0.0},
+            "new": {"owner_name": "FULTON, JOHNNIE SR", "owner_street": "1807 N Main",
+                   "property_street": "4503 N Iroquois Av E", "parcel_id": "40800-02-13-05520",
+                   "improvements_value": 3664.0},
+        }
+        with mock.patch("tulsa_treasurer.search_owner_name", return_value=hits), \
+             mock.patch("tulsa_treasurer.get_parcel_detail",
+                        side_effect=lambda tax_data_id, **kw: details[tax_data_id]), \
+             mock.patch("tulsa_treasurer.get_owner_history",
+                        return_value=[{"tax_year": 2025, "owner_name": "FULTON, JOHNNIE SR"}]), \
+             mock.patch("time.sleep"):
+            self.main._treasurer_true_negative_check(
+                row, [("decedent", "Johnnie Fulton Sr.")])
+        self.assertNotIn("CHECK IMPROVEMENTS", row["Treasurer Check"])
+
+    def test_improvements_note_names_the_specific_property_not_the_candidate(self):
+        # A reviewer seeing "decedent: X" for a flag is useless when X shows
+        # up on several parcels - the note must name the actual property.
+        row = {"Decedent Name": "Johnnie Fulton Sr.", "PR Address": "1807 N Main"}
+        hits = [
+            {"tax_data_id": "a", "parcel_id": "40800-02-13-05520", "tax_year": 2025,
+             "owner_name": "FULTON, JOHNNIE SR", "tax_type": "Real Estate"},
+            {"tax_data_id": "b", "parcel_id": "90328-03-28-15610", "tax_year": 2025,
+             "owner_name": "FULTON, JOHNNIE SR", "tax_type": "Real Estate"},
+        ]
+        details = {
+            "a": {"owner_name": "FULTON, JOHNNIE SR", "owner_street": "1807 N Main",
+                 "property_street": "4503 N Iroquois Av E", "parcel_id": "40800-02-13-05520",
+                 "improvements_value": 3664.0},
+            "b": {"owner_name": "FULTON, JOHNNIE L", "owner_street": "1807 N Main",
+                 "property_street": "", "parcel_id": "90328-03-28-15610",
+                 "improvements_value": 0.0},
+        }
+        with mock.patch("tulsa_treasurer.search_owner_name", return_value=hits), \
+             mock.patch("tulsa_treasurer.get_parcel_detail",
+                        side_effect=lambda tax_data_id, **kw: details[tax_data_id]), \
+             mock.patch("tulsa_treasurer.get_owner_history",
+                        return_value=[{"tax_year": 2025, "owner_name": "FULTON, JOHNNIE SR"}]), \
+             mock.patch("time.sleep"):
+            self.main._treasurer_true_negative_check(
+                row, [("decedent", "Johnnie Fulton Sr.")])
+        self.assertIn("90328-03-28-15610", row["Treasurer Check"])   # the flagged one, named
+        self.assertNotIn("4503 N Iroquois Av E", row["Treasurer Check"].split("CHECK IMPROVEMENTS")[1])
 
 
 if __name__ == "__main__":

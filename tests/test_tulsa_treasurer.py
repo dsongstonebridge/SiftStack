@@ -59,6 +59,8 @@ Location : 1047  E APACHE ST N&nbsp;&nbsp; CITY OF TULSA School District : T1A T
 Mills : 137.02 Type of Tax : Real Estate Code : Tax ID : 38390
 Legal Description and Other Information: LTS 1 2 &amp; 3  BLK 1&nbsp;<br />BANFIELD ADDN
 History
+Assessed Valuations Amount Land 3317 Improvements 3664 Net Assessed 6981
+Tax Values Amount Base Tax 358.00 Penalty 0.00 Fees 0.00 Payments 358.00
 Total Due 0.00
 </body></html>
 """
@@ -150,6 +152,24 @@ class ParcelDetailTests(unittest.TestCase):
         self.assertEqual(detail["parcel_id"], "02575-02-24-00480")
         self.assertIn("BANFIELD ADDN", detail["legal_description"])
         self.assertEqual(detail["total_due"], 0.0)
+        self.assertEqual(detail["improvements_value"], 3664.0)
+
+    def test_zero_improvements_parses_as_a_real_zero_not_missing(self):
+        # 0.0 (a real, meaningful signal) must be distinguishable from None
+        # (couldn't find the figure at all) - see improvements_value's own
+        # docstring note on this.
+        html = _DETAIL_HTML.replace("Improvements 3664", "Improvements 0")
+        with mock.patch("requests.get", return_value=_mock_get(html)):
+            detail = tt.get_parcel_detail("1889092")
+        self.assertEqual(detail["improvements_value"], 0.0)
+        self.assertIsNotNone(detail["improvements_value"])
+
+    def test_missing_improvements_figure_is_none_not_zero(self):
+        html = _DETAIL_HTML.replace(
+            "Assessed Valuations Amount Land 3317 Improvements 3664 Net Assessed 6981", "")
+        with mock.patch("requests.get", return_value=_mock_get(html)):
+            detail = tt.get_parcel_detail("1889092")
+        self.assertIsNone(detail["improvements_value"])
 
     def test_unplatted_parcel_has_no_street_but_keeps_legal_description(self):
         html = _DETAIL_HTML.replace(

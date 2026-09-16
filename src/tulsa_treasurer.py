@@ -272,7 +272,11 @@ def get_parcel_detail(tax_data_id: str, *, from_year: int = EARLIEST_YEAR, to_ye
 
     Returns {owner_name, owner_street, owner_city, owner_state, owner_zip,
     property_street, property_city, parcel_id, legal_description, total_due,
-    source_url}. Any field that can't be found stays "" / 0.0 — never guessed.
+    improvements_value, source_url}. Any field that can't be found stays
+    "" / 0.0 — never guessed. `improvements_value` is the exception: it
+    stays None (not 0.0) when the page's "Improvements" figure can't be
+    found, because 0.0 is itself a real, meaningful signal (a confirmed-empty
+    lot) that must never be confused with "we don't know."
     """
     url = detail_url_for(tax_data_id, from_year=from_year, to_year=to_year)
     result = {
@@ -280,6 +284,7 @@ def get_parcel_detail(tax_data_id: str, *, from_year: int = EARLIEST_YEAR, to_ye
         "owner_state": "OK", "owner_zip": "",
         "property_street": "", "property_city": "",
         "parcel_id": "", "legal_description": "", "total_due": 0.0,
+        "improvements_value": None,
         "source_url": url,
     }
 
@@ -348,6 +353,20 @@ def get_parcel_detail(tax_data_id: str, *, from_year: int = EARLIEST_YEAR, to_ye
     due_m = re.search(r"Total Due\s+([\d,]+\.\d{2})", text)
     if due_m:
         result["total_due"] = _safe_float(due_m.group(1))
+
+    # "Assessed Valuations ... Land 2497 Improvements 0 Net Assessed 2497".
+    # NOT a reliable vacant-lot signal by itself — live-tested 2026-09-15 on
+    # the KNOWN, real, structure-confirmed Fulton house at 4503 N Iroquois
+    # Ave: this figure reads $0 there too. Oklahoma ad valorem assessed
+    # improvement value is not the same concept as "a structure exists" (age,
+    # condition, and exemptions can drive it near zero on a real house) —
+    # unlike the Assessor's own get_parcel_improvements(), which states
+    # vacancy outright ("This property has no improvements", verified 8/8
+    # elsewhere in this codebase). Never auto-conclude vacant from this
+    # number alone; surface it for a human to check (Zillow/Maps) instead.
+    impr_m = re.search(r"\bImprovements\s+([\d,]+(?:\.\d+)?)", text, re.IGNORECASE)
+    if impr_m:
+        result["improvements_value"] = _safe_float(impr_m.group(1))
 
     return result
 

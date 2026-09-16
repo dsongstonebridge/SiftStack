@@ -1437,6 +1437,15 @@ def _treasurer_true_negative_check(row: dict, candidates: list[tuple[str, str]])
     2 already on record). Run it as a fallback when the Assessor path came up
     completely empty, not as a replacement.
 
+    THE DECEDENT GOES FIRST, ALONE (user, 2026-09-15): "checking the
+    treasurer for the heir/pr is less valuable than checking for the
+    decedent and then exploring the history." Heir/PR names are tried only
+    if the decedent search returns nothing corroborated - not searched
+    alongside the decedent as equal priority. Every corroborated decedent hit
+    also gets its full tax-payer history pulled as supporting evidence (not
+    only as the heir-hit disambiguator below) - the "what do we find"
+    instruction, not just a yes/no check.
+
     A hit is NEVER accepted on name alone - common-name collision is real and
     confirmed live (searching a recalled "Elizabeth Coleman" returned a real
     hit with nothing to say whether it was the same person as any given
@@ -1446,6 +1455,12 @@ def _treasurer_true_negative_check(row: dict, candidates: list[tuple[str, str]])
     in that parcel's own tax-payer history (`history_contains_name()`) or it
     is presumed to be the heir's own pre-existing property, not an
     inheritance - the Coleman/Lewis case from the same video.
+
+    IMPROVEMENTS == $0 IS NOT PROOF OF A VACANT LOT (live-tested 2026-09-15
+    against the KNOWN, real, structure-confirmed Fulton house - it reads $0
+    there too, unlike the Assessor's own reliable vacancy statement). Never
+    auto-excludes on it; flags it in Treasurer Check for a human to verify
+    (Zillow/Google Maps) instead.
 
     Free, read-only. Always sets row["Treasurer Check"] as evidence. When a
     corroborated finding carries a street address, ALSO writes it to
@@ -1469,41 +1484,53 @@ def _treasurer_true_negative_check(row: dict, candidates: list[tuple[str, str]])
     ]
     decedent_name = str(row.get("Decedent Name") or "").strip()
     _SUFFIXES = {"JR", "SR", "II", "III", "IV", "V", "ESQ"}
-    findings: list[tuple[str, str, dict]] = []
+    #: (label, name, detail, history) - history is the parcel's full
+    #: tax-payer timeline, pulled for every corroborated hit now, not only
+    #: to disambiguate an heir's own property.
+    findings: list[tuple[str, str, dict, list[dict]]] = []
 
-    for label, name in candidates:
+    def _search_one(label: str, name: str) -> list[tuple[str, str, dict, list[dict]]]:
         name = str(name or "").strip()
         if not name:
-            continue
+            return []
         parts = [p.strip(".,") for p in name.replace(",", " ").split() if p.strip(".,")]
         while len(parts) > 1 and parts[-1].upper() in _SUFFIXES:
             parts.pop()
         if not parts:
-            continue
+            return []
         last, first = parts[-1], (parts[0] if len(parts) > 1 else "")
 
         try:
             hits = treasurer.search_owner_name(last, first)
         except Exception as e:                    # noqa: BLE001 - free lookup; never lose the row
             logging.debug("  treasurer: search error for %s: %s", name, e)
-            continue
+            return []
         time.sleep(0.5)
         if not hits:
-            continue
+            return []
 
-        seen_parcels: set[str] = set()
+        # One row per PARCEL, keeping its NEWEST tax year - the site returns
+        # one row per (parcel, year), oldest first. Live-tested 2026-09-15:
+        # the Fulton reference parcel shows Improvements=$0 for 2019-2022 and
+        # a real, nonzero figure from 2023 on. Taking the first-seen (oldest)
+        # row read the stale figure and would have wrongly flagged a known
+        # real house as possibly vacant - keep the newest instead.
+        newest_by_parcel: dict[str, dict] = {}
         for h in hits:
-            if h["parcel_id"] in seen_parcels:
-                continue
-            seen_parcels.add(h["parcel_id"])
+            pid = h["parcel_id"]
+            if pid not in newest_by_parcel or h["tax_year"] > newest_by_parcel[pid]["tax_year"]:
+                newest_by_parcel[pid] = h
+
+        results: list[tuple[str, str, dict, list[dict]]] = []
+        for h in newest_by_parcel.values():
             detail = treasurer.get_parcel_detail(h["tax_data_id"])
             time.sleep(0.5)
             if not any(treasurer.address_corroborates(detail, addr) for addr in known_addresses):
                 continue  # name-only hit - never trusted alone (common-name risk)
 
+            hist = treasurer.get_owner_history(h["tax_data_id"])
+            time.sleep(0.5)
             if label != "decedent" and decedent_name:
-                hist = treasurer.get_owner_history(h["tax_data_id"])
-                time.sleep(0.5)
                 if not treasurer.history_contains_name(hist, decedent_name):
                     logging.info(
                         "  treasurer: %s (%s) owns %s but the decedent never appears "
@@ -1512,7 +1539,18 @@ def _treasurer_true_negative_check(row: dict, candidates: list[tuple[str, str]])
                         detail.get("property_street") or detail.get("parcel_id"))
                     continue
 
-            findings.append((label, name, detail))
+            results.append((label, name, detail, hist))
+        return results
+
+    decedent_candidates = [(label, name) for label, name in candidates if label == "decedent"]
+    other_candidates = [(label, name) for label, name in candidates if label != "decedent"]
+
+    for label, name in decedent_candidates:
+        findings.extend(_search_one(label, name))
+
+    if not findings:                # heir/PR search only when decedent search was dry
+        for label, name in other_candidates:
+            findings.extend(_search_one(label, name))
 
     if not findings:
         return
@@ -1520,14 +1558,40 @@ def _treasurer_true_negative_check(row: dict, candidates: list[tuple[str, str]])
     row["Treasurer Check"] = "; ".join(
         f"{label}: {name} -> "
         f"{d.get('property_street') or d.get('legal_description') or d.get('parcel_id')}"
-        for label, name, d in findings)
+        for label, name, d, hist in findings)
+
+    # A decedent hit whose history shows the NEWEST payer is no longer the
+    # decedent means the property has since moved - worth surfacing, not
+    # silently dropped just because the parcel itself still corroborated.
+    chain_notes = [
+        f"{d.get('parcel_id')}: now paid by {hist[0].get('owner_name')} "
+        f"as of {hist[0].get('tax_year')}, not the decedent"
+        for label, name, d, hist in findings
+        if label == "decedent" and hist
+        and not treasurer.history_contains_name([hist[0]], decedent_name)
+    ]
+    if chain_notes:
+        row["Treasurer Check"] += " | CHAIN: " + "; ".join(chain_notes)
+
+    # Never auto-exclude on Improvements == $0 - see docstring. Flag only,
+    # and name the SPECIFIC property - multiple findings can share the same
+    # candidate label (one decedent, several parcels), so "decedent: X" alone
+    # would not tell a reviewer which of several properties to double check.
+    zero_impr = [d.get("property_street") or d.get("parcel_id") or "(unknown parcel)"
+                for label, name, d, hist in findings if d.get("improvements_value") == 0]
+    if zero_impr:
+        row["Treasurer Check"] += (
+            " | CHECK IMPROVEMENTS: Treasurer shows $0 improvements for "
+            + "; ".join(zero_impr) + " - NOT reliable proof of a vacant lot "
+            "(a known real house tested $0 too); verify via Zillow/Google "
+            "Maps before assuming no structure")
 
     # This discovery IS the property record - write it where the rest of the
     # pipeline looks, or it never reaches review (check_buy_box excludes any
     # row with no Property Street before STOP-AND-ASK ever sees it).
     if not str(row.get("Property Street") or "").strip():
         addressed = [f for f in findings if f[2].get("property_street")]
-        best_label, best_name, best_detail = addressed[0] if addressed else findings[0]
+        best_label, best_name, best_detail, best_hist = addressed[0] if addressed else findings[0]
         if best_detail.get("property_street"):
             row["Property Street"] = best_detail["property_street"]
             row["Property City"] = best_detail.get("property_city") or ""

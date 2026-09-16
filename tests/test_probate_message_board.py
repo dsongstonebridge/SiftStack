@@ -181,6 +181,43 @@ class InsiderTransferTests(unittest.TestCase):
         self.assertIn("KAISER, LARRY A AND SHELLEY A", row["Insider Transfer"])
         self.assertIn("L & S GROUP LLC", row["Insider Transfer"])
 
+    def test_minimal_name_match_is_labeled_possible_not_confirmed(self):
+        """A bare first+last match (2 tokens) has nothing on the
+        sales-history table to corroborate it against (no address, unlike
+        tulsa_treasurer.address_corroborates()) - same common-name collision
+        risk as 'Tina Johnson'/'Elizabeth Coleman'. It still flags (never
+        silently passes), but as POSSIBLE, not a settled fact."""
+        row = {"Personal Representative": "Larry Kaiser"}
+        with mock.patch("time.sleep"):
+            self.main._check_insider_transfer(row, "R12145940944450",
+                                              lambda acct: self._JOHNSON_HISTORY)
+        self.assertIn("POSSIBLE insider transfer", row["Insider Transfer"])
+
+    def test_three_token_match_is_labeled_confirmed(self):
+        """A match on 3+ tokens (e.g. a middle name lining up too) carries
+        more identifying detail than a bare first+last hit, so it's reported
+        as a confirmed finding rather than downgraded."""
+        row = {"Personal Representative": "Larry Allen Kaiser"}
+        history = [{"sale_date": "12/31/2013", "grantor": "KAISER, LARRY ALLEN",
+                    "grantee": "L & S GROUP LLC", "sale_price": 0,
+                    "deed_type": "Quit Claim Deed", "document_number": "2014002906"}]
+        with mock.patch("time.sleep"):
+            self.main._check_insider_transfer(row, "R12145940944450", lambda acct: history)
+        self.assertIn("INSIDER TRANSFER", row["Insider Transfer"])
+        self.assertNotIn("POSSIBLE", row["Insider Transfer"])
+
+    def test_partial_three_token_overlap_no_longer_matches(self):
+        """The old '>= 2 of N shared tokens' rule let a 3-token name match on
+        only 2 of its 3 tokens against an unrelated person. Full containment
+        of the shorter name closes that gap."""
+        row = {"Personal Representative": "James Robert Wilson"}
+        history = [{"sale_date": "1/1/2020", "grantor": "WILSON, JAMES MICHAEL",
+                    "grantee": "SOME THIRD PARTY LLC", "sale_price": 0,
+                    "deed_type": "Warranty Deed", "document_number": "X"}]
+        with mock.patch("time.sleep"):
+            self.main._check_insider_transfer(row, "R00000000000000", lambda acct: history)
+        self.assertNotIn("Insider Transfer", row)
+
     def test_flags_when_grantor_matches_an_heir(self):
         row = {"Heirs": "Wendy Johnson (Daughter); Debbie Lewis (Daughter)"}
         history = [{"sale_date": "1/1/2020", "grantor": "Wendy Johnson",

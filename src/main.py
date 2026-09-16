@@ -1361,16 +1361,38 @@ def _fill_title_holder(row: dict, get_parcel_situs) -> None:
         logging.info("  %s: title holder of record = %s", row.get("Case Number") or acct, owner)
 
 
-def _names_overlap(a: str, b: str) -> bool:
-    """Loose first+last token overlap - good enough to tell whether a
-    sales-history Grantor string is the same person as a decedent/PR/heir
-    name, without the assessor-grid-tuned scoring `_score_name_match` needs."""
+def _names_overlap(a: str, b: str) -> tuple[bool, bool]:
+    """Token-overlap match between a sales-history Grantor string and a
+    decedent/PR/heir name, without the assessor-grid-tuned scoring
+    `_score_name_match` needs. Returns (matches, high_confidence).
+
+    `matches` requires the SHORTER name's full token set to be contained in
+    the longer one - not just any 2 of N tokens. The old ">= 2 shared" rule
+    let a 3+-token name partially match (2 of 3 tokens) a different person
+    who happened to share two of them; full containment closes that.
+
+    `high_confidence` is False for a bare 2-token (first+last) match. Unlike
+    tulsa_treasurer.address_corroborates(), there is no address on the
+    Assessor's sales-history table (Grantor/Grantee/Sale Price/Deed
+    Type/Doc# only) to corroborate a name hit against - so a minimal
+    first+last match carries the same common-name collision risk already
+    confirmed live for "Tina Johnson" (26-way tie) and "Elizabeth Coleman"
+    (see [[probate-stop-and-ask-nonstraightforward]]) and is surfaced as
+    POSSIBLE rather than asserted as settled fact. A 3+-token match (a
+    middle name/suffix also lined up) carries more identifying detail and
+    is reported as a confirmed finding, as before.
+    """
     import re
     def _toks(s: str) -> set[str]:
         return {t for t in re.findall(r"[a-z]+", s.lower())
                 if len(t) > 1 and t not in {"jr", "sr", "ii", "iii", "iv", "v"}}
     ta, tb = _toks(a), _toks(b)
-    return bool(ta) and bool(tb) and len(ta & tb) >= 2
+    if not ta or not tb:
+        return False, False
+    shorter, longer = (ta, tb) if len(ta) <= len(tb) else (tb, ta)
+    if len(shorter) < 2 or not shorter <= longer:
+        return False, False
+    return True, len(shorter) >= 3
 
 
 def _check_insider_transfer(row: dict, acct: str, get_parcel_sales_history) -> None:
@@ -1414,16 +1436,28 @@ def _check_insider_transfer(row: dict, acct: str, get_parcel_sales_history) -> N
     # recent transfer connected to the estate, which is the one that matters.
     for sale in history:
         grantor = sale.get("grantor") or ""
-        if grantor and any(_names_overlap(grantor, n) for n in named):
-            price = sale.get("sale_price")
-            row["Insider Transfer"] = (
-                f"{sale.get('sale_date') or 'unknown date'}: {grantor} -> "
-                f"{sale.get('grantee') or 'unknown'} "
-                f"({sale.get('deed_type') or 'unknown deed'}"
-                + (f", ${price:,}" if price else "") + ")")
-            logging.warning("  assessor: INSIDER TRANSFER on %s - %s",
-                            row.get("Case Number") or acct, row["Insider Transfer"])
-            return
+        if not grantor:
+            continue
+        high_conf = False
+        matched = False
+        for n in named:
+            matched, high_conf = _names_overlap(grantor, n)
+            if matched:
+                break
+        if not matched:
+            continue
+        price = sale.get("sale_price")
+        label = "INSIDER TRANSFER" if high_conf else (
+            "POSSIBLE insider transfer - verify (common-name match, no "
+            "address on the sales-history table to corroborate it against)")
+        row["Insider Transfer"] = (
+            f"{label}: {sale.get('sale_date') or 'unknown date'}: {grantor} -> "
+            f"{sale.get('grantee') or 'unknown'} "
+            f"({sale.get('deed_type') or 'unknown deed'}"
+            + (f", ${price:,}" if price else "") + ")")
+        logging.warning("  assessor: %s on %s - %s", label,
+                        row.get("Case Number") or acct, row["Insider Transfer"])
+        return
 
 
 def _treasurer_true_negative_check(row: dict, candidates: list[tuple[str, str]]) -> None:

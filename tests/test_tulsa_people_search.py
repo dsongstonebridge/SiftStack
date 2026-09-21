@@ -208,9 +208,12 @@ class OrchestrationTests(unittest.TestCase):
              mock.patch("time.sleep"), \
              mock.patch("config.CAPTCHA_API_KEY", "fake-key"):
             report = tps.find_property_via_people_search(
-                "William", "Fulton", ["13113 E 17th Pl"], max_candidates=5)
+                "William", "Fulton", ["13113 E 17th Pl"], max_candidates=5,
+                assessor_search=lambda street: [])
         self.assertIsNotNone(report["corroborated_hit"])
         self.assertTrue(report["candidates"][0]["corroborated"])
+        # Corroborated, but the Assessor found no parcel - not a verified property.
+        self.assertIsNone(report["verified_property"])
 
     def test_no_known_address_means_never_corroborated(self):
         """A common-name collision (5 real 'William Fulton's found live) must
@@ -252,7 +255,8 @@ class OrchestrationTests(unittest.TestCase):
         with mock.patch("tulsa_people_search.search_person", return_value=[]), \
              mock.patch("config.CAPTCHA_API_KEY", "fake-key"):
             report = tps.find_property_via_people_search("Nobody", "Real", ["1 Main St"])
-        self.assertEqual(report, {"candidates": [], "corroborated_hit": None})
+        self.assertEqual(report, {"candidates": [], "corroborated_hit": None,
+                                  "verified_property": None, "skipped_by_age": []})
 
     def test_max_candidates_caps_detail_lookups(self):
         candidates = [
@@ -275,6 +279,157 @@ class OrchestrationTests(unittest.TestCase):
                 "Person", "X", ["1 Main St"], max_candidates=3)
         self.assertEqual(len(detail_calls), 3)
         self.assertEqual(len(report["candidates"]), 3)
+
+
+_TULSA_DETAIL = {
+    "current_address": None,
+    "previous_addresses": [
+        {"street": "13113 E 17th Pl", "city": "Tulsa", "state": "OK", "zip": "74108",
+         "county": "Tulsa County", "date_range": ""},
+        {"street": "9804 Jordan Ave #A", "city": "Lubbock", "state": "TX", "zip": "79423",
+         "county": "Lubbock County", "date_range": ""},
+    ],
+    "relatives": [], "also_seen_as": [],
+}
+
+
+def _rec(street, owner):
+    return {"AccountNo": "R1", "FullPropertyStreet": street, "FullPrimaryOwnerName": owner}
+
+
+class OwnerMatchesEstateTests(unittest.TestCase):
+    """User's rule, 2026-09-21: the decedent's surname (or full name) in a
+    person/LLC/trust name is a match; a stranger or unrelated entity is a miss."""
+
+    def test_person_with_decedent_surname(self):
+        self.assertTrue(tps.owner_matches_estate("FULTON, JOHNNIE SR", "Johnnie Fulton Sr."))
+
+    def test_trust_with_decedent_surname(self):
+        self.assertTrue(tps.owner_matches_estate(
+            "FULTON, JOHNNIE C/O FULTON FAMILY REV LIVING TRUST", "Johnnie Fulton"))
+
+    def test_llc_with_decedent_surname(self):
+        self.assertTrue(tps.owner_matches_estate("FULTON PROPERTIES LLC", "Johnnie Fulton"))
+
+    def test_stranger_is_a_miss(self):
+        self.assertFalse(tps.owner_matches_estate("SMITH, ROBERT", "Johnnie Fulton"))
+
+    def test_unrelated_entity_is_a_miss(self):
+        self.assertFalse(tps.owner_matches_estate("L & S GROUP LLC", "Johnnie Fulton"))
+
+    def test_surname_must_be_a_whole_word(self):
+        self.assertFalse(tps.owner_matches_estate("FULTONVILLE HOLDINGS LLC", "Johnnie Fulton"))
+
+    def test_last_first_format_decedent(self):
+        self.assertTrue(tps.owner_matches_estate("FULTON FAMILY TRUST", "FULTON, JOHNNIE"))
+
+    def test_named_heir_full_name_counts(self):
+        self.assertTrue(tps.owner_matches_estate(
+            "FAULK, JENNIFER G", "Johnnie Fulton", ["Jennifer Faulk"]))
+
+    def test_heir_first_name_alone_does_not_count(self):
+        self.assertFalse(tps.owner_matches_estate(
+            "SMITH, JENNIFER", "Johnnie Fulton", ["Jennifer Faulk"]))
+
+    def test_blank_owner_is_a_miss(self):
+        self.assertFalse(tps.owner_matches_estate("", "Johnnie Fulton"))
+
+
+class AssessorVerificationTests(unittest.TestCase):
+    def _run(self, recs, detail=None):
+        with mock.patch("time.sleep"):
+            return tps.verify_addresses_with_assessor(
+                detail or _TULSA_DETAIL, "Johnnie Fulton", assessor_search=lambda s: recs)
+
+    def test_match_when_owner_carries_decedent_surname(self):
+        out = self._run([_rec("13113 E 17TH PL", "FULTON FAMILY TRUST")])
+        self.assertEqual(out[0]["verdict"], "match")
+
+    def test_miss_when_owner_is_a_stranger(self):
+        out = self._run([_rec("13113 E 17TH PL", "SMITH, ROBERT")])
+        self.assertEqual(out[0]["verdict"], "miss")
+
+    def test_no_parcel_when_assessor_returns_nothing(self):
+        self.assertEqual(self._run([])[0]["verdict"], "no_parcel")
+
+    def test_other_house_on_the_street_is_ignored(self):
+        """A search can return neighbors - only the exact house counts."""
+        out = self._run([_rec("13115 E 17TH PL", "FULTON, JOHNNIE")])
+        self.assertEqual(out[0]["verdict"], "no_parcel")
+
+    def test_only_tulsa_county_addresses_are_checked(self):
+        calls = []
+        with mock.patch("time.sleep"):
+            tps.verify_addresses_with_assessor(
+                _TULSA_DETAIL, "Johnnie Fulton",
+                assessor_search=lambda s: calls.append(s) or [])
+        self.assertEqual(calls, ["13113 E 17th Pl"])
+
+    def test_assessor_error_is_reported_not_raised(self):
+        def boom(s):
+            raise RuntimeError("down")
+        with mock.patch("time.sleep"):
+            out = tps.verify_addresses_with_assessor(
+                _TULSA_DETAIL, "Johnnie Fulton", assessor_search=boom)
+        self.assertEqual(out[0]["verdict"], "no_parcel")
+
+    def test_orchestration_surfaces_verified_property(self):
+        cands = [{"name": "Johnnie Fulton", "age": "80", "current_city": "Tulsa, OK",
+                  "used_to_live_in": [], "related_to": [], "detail_href": "/find/person/z"}]
+        with mock.patch("tulsa_people_search.search_person", return_value=cands),              mock.patch("tulsa_people_search.get_person_detail", return_value=_TULSA_DETAIL),              mock.patch("time.sleep"),              mock.patch("config.CAPTCHA_API_KEY", "fake-key"):
+            report = tps.find_property_via_people_search(
+                "Johnnie", "Fulton", ["13113 E 17th Pl"],
+                assessor_search=lambda s: [_rec("13113 E 17TH PL", "FULTON FAMILY TRUST")])
+        self.assertEqual(report["verified_property"]["address"]["street"], "13113 E 17th Pl")
+
+    def test_orchestration_stranger_owner_is_not_verified(self):
+        cands = [{"name": "Johnnie Fulton", "age": "80", "current_city": "Tulsa, OK",
+                  "used_to_live_in": [], "related_to": [], "detail_href": "/find/person/z"}]
+        with mock.patch("tulsa_people_search.search_person", return_value=cands),              mock.patch("tulsa_people_search.get_person_detail", return_value=_TULSA_DETAIL),              mock.patch("time.sleep"),              mock.patch("config.CAPTCHA_API_KEY", "fake-key"):
+            report = tps.find_property_via_people_search(
+                "Johnnie", "Fulton", ["13113 E 17th Pl"],
+                assessor_search=lambda s: [_rec("13113 E 17TH PL", "SMITH, ROBERT")])
+        self.assertIsNone(report["verified_property"])
+        self.assertIsNotNone(report["corroborated_hit"])
+
+
+class AgeFilterTests(unittest.TestCase):
+    """Age only saves captcha solves - it never confirms anyone."""
+
+    def _cands(self, *ages):
+        return [{"name": "X Y", "age": a, "current_city": "Tulsa, OK", "used_to_live_in": [],
+                 "related_to": [], "detail_href": f"/find/person/{i}"}
+                for i, a in enumerate(ages)]
+
+    def _run(self, cands, **kw):
+        opened = []
+
+        def _detail(href, **k):
+            opened.append(href)
+            return {"current_address": None, "previous_addresses": [],
+                    "relatives": [], "also_seen_as": []}
+
+        with mock.patch("tulsa_people_search.search_person", return_value=cands),              mock.patch("tulsa_people_search.get_person_detail", side_effect=_detail),              mock.patch("time.sleep"), mock.patch("config.CAPTCHA_API_KEY", "k"):
+            report = tps.find_property_via_people_search("X", "Y", ["1 Main St"], **kw)
+        return report, opened
+
+    def test_far_off_ages_never_have_pages_opened(self):
+        report, opened = self._run(self._cands("30", "93", "80"), decedent_age=80)
+        self.assertEqual(opened, ["/find/person/2"])
+        self.assertEqual(len(report["skipped_by_age"]), 2)
+
+    def test_unreadable_age_is_kept(self):
+        report, opened = self._run(self._cands("", "unknown"), decedent_age=80)
+        self.assertEqual(len(opened), 2)
+
+    def test_no_age_means_no_filtering(self):
+        report, opened = self._run(self._cands("30", "93"))
+        self.assertEqual(len(opened), 2)
+
+    def test_matching_age_alone_never_corroborates(self):
+        report, _ = self._run(self._cands("80"), decedent_age=80)
+        self.assertIsNone(report["corroborated_hit"])
+        self.assertIsNone(report["verified_property"])
 
 
 if __name__ == "__main__":

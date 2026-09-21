@@ -333,34 +333,171 @@ def get_person_detail(
             browser.close()
 
 
+_NAME_SUFFIXES = {"JR", "SR", "II", "III", "IV", "V", "ESQ"}
+
+#: The Assessor rate-limits after ~15-20 hits in a row.
+_ASSESSOR_DELAY_SEC = 2
+_MAX_ASSESSOR_ADDRESSES = 6
+
+
+def _name_tokens(s: str) -> set[str]:
+    return {t for t in re.split(r"[^A-Za-z]+", (s or "").upper())
+            if len(t) > 1 and t not in _NAME_SUFFIXES}
+
+
+def _surname(decedent_name: str) -> str:
+    """'LAST, FIRST' -> LAST; 'First Middle Last Jr' -> LAST."""
+    name = (decedent_name or "").strip()
+    if "," in name:
+        return re.sub(r"[^A-Za-z]", "", name.split(",", 1)[0]).upper()
+    parts = [p.strip(".,") for p in name.split() if p.strip(".,")]
+    while len(parts) > 1 and parts[-1].upper() in _NAME_SUFFIXES:
+        parts.pop()
+    return re.sub(r"[^A-Za-z]", "", parts[-1]).upper() if parts else ""
+
+
+def owner_matches_estate(owner: str, decedent_name: str,
+                         related_names: Optional[list[str]] = None) -> bool:
+    """User's rule, 2026-09-21: a person, LLC or trust on title counts as the
+    decedent's when its name carries the decedent's SURNAME (or full name).
+    Anything else - a stranger, or an unrelated entity - is a miss.
+
+    A named PR/heir's full name (first AND last) also counts, consistent with
+    batch_review's "clean title holder" rule. Surname-only matching is the
+    user's call and is loose on a common surname - the caller reports the
+    owner string verbatim so a human can see what matched.
+    """
+    owner_tokens = _name_tokens(owner)
+    if not owner_tokens:
+        return False
+    surname = _surname(decedent_name)
+    if surname and surname in owner_tokens:
+        return True
+    for rel in related_names or []:
+        toks = _name_tokens(rel)
+        if len(toks) >= 2 and toks <= owner_tokens:
+            return True
+    return False
+
+
+def verify_addresses_with_assessor(
+    candidate_detail: dict, decedent_name: str,
+    related_names: Optional[list[str]] = None, *, assessor_search=None,
+) -> list[dict]:
+    """Free Assessor cross-check of a candidate's Tulsa County addresses.
+
+    People search only says where someone LIVED. The Assessor says who holds
+    title there - which separates "owns it" from the rental / out-of-county
+    pattern that took the old CyberBackgroundChecks tier to 0 for 10.
+
+    One result per address: {"street", "city", "verdict", "records"} where
+    verdict is "match" (owner carries the decedent's surname / a named
+    PR-heir), "miss" (a parcel exists but title is held by a stranger or an
+    unrelated entity), or "no_parcel" (nothing at that address). Only Tulsa
+    County addresses are checked (the Assessor covers nothing else), current
+    address first, capped to protect the Assessor's rate limit.
+    """
+    if assessor_search is None:
+        from tulsa_assessor import search_assessor as assessor_search
+
+    addrs = [candidate_detail["current_address"]] if candidate_detail.get("current_address") else []
+    addrs += candidate_detail.get("previous_addresses") or []
+    addrs = [a for a in addrs if "TULSA" in (a.get("county") or "").upper()]
+
+    results = []
+    for addr in addrs[:_MAX_ASSESSOR_ADDRESSES]:
+        street = addr.get("street", "")
+        try:
+            recs = assessor_search(street)
+        except Exception as e:                    # noqa: BLE001 - free lookup; report, never crash
+            logger.warning("people-search: assessor lookup failed for %r: %s", street, e)
+            recs = []
+        time.sleep(_ASSESSOR_DELAY_SEC)
+
+        at_address = [
+            r for r in recs
+            if address_corroborates({"owner_street": r.get("FullPropertyStreet", "")}, street)
+        ]
+        records = [{
+            "account_no": r.get("AccountNo", ""),
+            "situs": r.get("FullPropertyStreet", ""),
+            "owner": (r.get("FullPrimaryOwnerName") or "").strip(),
+            "matches_estate": owner_matches_estate(
+                r.get("FullPrimaryOwnerName") or "", decedent_name, related_names),
+        } for r in at_address]
+
+        if not records:
+            verdict = "no_parcel"
+        elif any(r["matches_estate"] for r in records):
+            verdict = "match"
+        else:
+            verdict = "miss"
+        results.append({"street": street, "city": addr.get("city", ""),
+                        "verdict": verdict, "records": records})
+    return results
+
+
+def _candidate_age(cand: dict) -> Optional[int]:
+    m = re.search(r"\d+", str(cand.get("age") or ""))
+    return int(m.group()) if m else None
+
+
 def find_property_via_people_search(
     first: str, last: str, known_addresses: list[str],
     *, city: str = "Tulsa", state: str = "OK", max_candidates: int = 5,
-    headless: bool = True,
+    headless: bool = True, decedent_name: str = "",
+    related_names: Optional[list[str]] = None, assessor_search=None,
+    decedent_age: Optional[int] = None, age_tolerance: int = 5,
 ) -> dict:
     """The Tier 3 orchestration: search, open up to `max_candidates` detail
     pages, and report which (if any) has an address that corroborates one of
     `known_addresses` (PR/heir mailing address from the filing, or a property
     address already known some other way).
 
-    Returns {"candidates": [...one dict per candidate checked, each with its
-    full detail plus "corroborated": bool...], "corroborated_hit": dict or
-    None}. ALWAYS returns every candidate checked, corroborated or not - this
-    is a manual tool for a human to review, not an auto-accept/reject gate.
-    A corroborated hit still belongs in front of the same STOP-AND-ASK
-    review as any other probate property finding, not written to the CRM
-    directly from here.
+    For every CORROBORATED candidate it then runs the free Assessor check
+    (verify_addresses_with_assessor) on that person's Tulsa County addresses.
+    `decedent_name` defaults to "first last"; pass it explicitly when the
+    person searched is a PR/heir rather than the decedent, since the
+    surname rule is about the decedent.
+
+    Returns {"candidates": [...], "corroborated_hit": dict or None,
+    "verified_property": dict or None}. "verified_property" is the first
+    corroborated candidate with an Assessor "match" address - a straight hit
+    needing no extra stop-and-ask per the user's rule. ALWAYS returns every
+    candidate checked - this is a manual tool for a human to review, and a
+    hit is still never written to the CRM directly from here.
+
+    `decedent_age` (from the filing) is a COST SAVER only: a candidate whose
+    listed age is more than `age_tolerance` years off is skipped before its
+    detail page is opened, saving requests and captcha solves. It never
+    confirms anyone - only the known-address match does. A candidate with an
+    unreadable age is kept, not skipped. Skipped candidates are returned
+    under "skipped_by_age" so nothing disappears silently.
     """
     import config
     api_key = config.CAPTCHA_API_KEY
     known_addresses = [a for a in (known_addresses or []) if str(a or "").strip()]
+    decedent_name = decedent_name or f"{first} {last}".strip()
 
     candidates = search_person(first, last, city, state, api_key=api_key, headless=headless)
     if not candidates:
-        return {"candidates": [], "corroborated_hit": None}
+        return {"candidates": [], "corroborated_hit": None, "verified_property": None,
+                "skipped_by_age": []}
+
+    skipped_by_age: list[dict] = []
+    if decedent_age is not None:
+        kept = []
+        for cand in candidates:
+            age = _candidate_age(cand)
+            if age is not None and abs(age - decedent_age) > age_tolerance:
+                skipped_by_age.append(cand)
+            else:
+                kept.append(cand)
+        candidates = kept
 
     checked: list[dict] = []
     corroborated_hit = None
+    verified_property = None
     for cand in candidates[:max_candidates]:
         time.sleep(_REQUEST_DELAY_SEC)
         detail = get_person_detail(cand["detail_href"], api_key=api_key, headless=headless)
@@ -385,11 +522,19 @@ def find_property_via_people_search(
         cand["detail"] = detail
         cand["corroborated"] = bool(matched_against)
         cand["matched_against"] = matched_against
+        if matched_against:
+            cand["assessor_check"] = verify_addresses_with_assessor(
+                detail, decedent_name, related_names, assessor_search=assessor_search)
+            if verified_property is None:
+                good = next((r for r in cand["assessor_check"] if r["verdict"] == "match"), None)
+                if good:
+                    verified_property = {"candidate": cand, "address": good}
         checked.append(cand)
         if matched_against and corroborated_hit is None:
             corroborated_hit = cand
 
-    return {"candidates": checked, "corroborated_hit": corroborated_hit}
+    return {"candidates": checked, "corroborated_hit": corroborated_hit,
+            "verified_property": verified_property, "skipped_by_age": skipped_by_age}
 
 
 if __name__ == "__main__":
@@ -408,6 +553,16 @@ if __name__ == "__main__":
                     help="A known address to corroborate against (repeatable). "
                         "E.g. the PR's mailing address from the filing.")
     ap.add_argument("--max-candidates", type=int, default=5)
+    ap.add_argument("--decedent-name", default="",
+                    help="Full decedent name for the Assessor surname rule. "
+                        "Defaults to --first --last; set it when searching a PR/heir.")
+    ap.add_argument("--age", type=int, default=None,
+                    help="Decedent's age from the filing. Skips candidates clearly off by "
+                        "age BEFORE opening their pages (saves captcha solves). "
+                        "A cost saver only - never confirms anyone.")
+    ap.add_argument("--age-tolerance", type=int, default=5)
+    ap.add_argument("--related-name", action="append", default=[],
+                    help="A named PR/heir (repeatable) - a full-name match on title also counts.")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -417,7 +572,13 @@ if __name__ == "__main__":
     report = find_property_via_people_search(
         args.first, args.last, args.known_address,
         city=args.city, state=args.state, max_candidates=args.max_candidates,
+        decedent_name=args.decedent_name, related_names=args.related_name,
+        decedent_age=args.age, age_tolerance=args.age_tolerance,
     )
+    if report["skipped_by_age"]:
+        print(f"Skipped {len(report['skipped_by_age'])} candidate(s) by age "
+              f"(no pages opened): " + ", ".join(
+                  f"{c['name']} ({c['age']})" for c in report["skipped_by_age"]))
 
     for c in report["candidates"]:
         print(f"\n{'='*60}\n{c['name']} (age {c['age']}, currently {c['current_city']})")
@@ -437,13 +598,24 @@ if __name__ == "__main__":
         if c["corroborated"]:
             print(f"  *** CORROBORATED against known address: {c['matched_against'][1]!r} "
                   f"(matched {c['matched_against'][0]!r}) ***")
+            for chk in c.get("assessor_check", []):
+                print(f"  ASSESSOR {chk['verdict'].upper()}: {chk['street']}, {chk['city']}")
+                for r in chk["records"]:
+                    print(f"      {r['account_no']}  owner of record: {r['owner']!r}"
+                          f"{'  <- carries the estate surname/name' if r['matches_estate'] else ''}")
 
     hit = report["corroborated_hit"]
+    vp = report["verified_property"]
     print(f"\n{'='*60}")
-    if hit:
-        print(f"CORROBORATED HIT: {hit['name']} - review before creating/updating any "
-              f"CRM record. This still goes through the normal STOP-AND-ASK review, "
-              f"not a direct write.")
+    if vp:
+        a = vp["address"]
+        owners = "; ".join(r["owner"] for r in a["records"] if r["matches_estate"])
+        print(f"VERIFIED PROPERTY: {a['street']}, {a['city']} - Assessor owner of record "
+              f"{owners!r} carries the decedent's name. Straight hit, no extra stop needed; "
+              f"still not written to the CRM from here.")
+    elif hit:
+        print("Corroborated candidate found, but NO Tulsa County address checks out with the "
+              "Assessor (stranger/unrelated owner, or no parcel) - treat as a miss.")
     else:
         print("No corroborated hit among the candidates checked. "
               "Not proof of a true negative on its own - review the candidates above.")

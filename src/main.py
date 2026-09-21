@@ -1898,6 +1898,22 @@ def _trace_row(r: dict) -> dict | None:
     return row
 
 
+def _report_already_processed(repeats: list[dict]) -> None:
+    """Say loudly which rows were held out because the case was already done.
+    A repeat that vanishes silently is indistinguishable from one never seen."""
+    import processed_cases
+    if not repeats:
+        return
+    logging.warning("")
+    logging.warning("=== ALREADY PROCESSED - NOT CREATED AGAIN (%d) ===", len(repeats))
+    for r in repeats:
+        logging.warning("  %s | %s", r.get("Decedent Name") or r.get("Property Street") or "?",
+                        processed_cases.describe(r))
+    logging.warning("  Creating them again would re-post their notes and Message Board. "
+                    "Remove the filing(s) from the folder, or tell me if one is a genuine re-run.")
+    logging.warning("")
+
+
 def _create_records_for_batch(args, csv_path: Path) -> list[dict] | None:
     """`--create` front end: raw property template -> CRM records, ready for
     run_pipeline() to trace and score.
@@ -1940,6 +1956,17 @@ def _create_records_for_batch(args, csv_path: Path) -> list[dict] | None:
     county = getattr(args, "county", "") or ""
     trial_tag = getattr(args, "trial_tag", None)
 
+    # ── ALREADY PROCESSED? (user, 2026-09-21) ────────────────────────────
+    # Days will come when the Probates folder is not cleared. Catch a repeat
+    # here, before any lookup, from the ledger of cases already created.
+    if notice_type == "probate":
+        import processed_cases
+        template_rows, repeats = processed_cases.check_rows(template_rows)
+        _report_already_processed(repeats)
+        if not template_rows:
+            logging.error("Every row was already processed - nothing to create.")
+            return None
+
     # ── THE CHAIN: enrich -> buy box -> review, all BEFORE creation ──────
     # This ordering is the whole point. `--create` writes to the CRM whether
     # or not --commit is passed, so these gates cannot sit after it: by then
@@ -1947,6 +1974,17 @@ def _create_records_for_batch(args, csv_path: Path) -> list[dict] | None:
     if notice_type == "probate":
         logging.info("Probate: resolving property from the county assessor...")
         template_rows = _enrich_probate_rows(template_rows)
+        # Second net, now that addresses are known: a CRM record at the address
+        # whose Notes carry the case number (covers cases created before the
+        # ledger existed).
+        import processed_cases
+        from datasift_api import find_property_by_address, get_property
+        template_rows, repeats = processed_cases.crm_check_rows(
+            template_rows, find_property_by_address, get_property)
+        _report_already_processed(repeats)
+        if not template_rows:
+            logging.error("Every row was already in the CRM - nothing to create.")
+            return None
 
     from buy_box import apply_buy_box, describe as describe_buy_box
     from batch_review import BLOCK, review_batch, print_review, write_review_sheet
@@ -2026,6 +2064,21 @@ def _create_records_for_batch(args, csv_path: Path) -> list[dict] | None:
     if not upload_result.get("success"):
         logging.error("Upload did not succeed - stopping before any billed step.")
         return None
+
+    if notice_type == "probate":
+        import processed_cases
+        from datasift_api import find_property_by_address
+        for r in template_rows:
+            uuid = ""
+            try:
+                found = find_property_by_address(str(r.get("Property Street") or ""),
+                                                 str(r.get("Property City") or ""), "OK")
+                uuid = (found or {}).get("uuid", "")
+            except Exception as e:                      # noqa: BLE001 - the ledger entry matters more than the uuid
+                logging.warning("ledger: could not read the uuid for %s: %s",
+                                r.get("Property Street"), e)
+            recorded = processed_cases.record_row(r, uuid=uuid)
+            logging.info("ledger: recorded %s", ", ".join(recorded) or "(no case number)")
 
     return [row for row in (_trace_row(r) for r in alive) if row]
 

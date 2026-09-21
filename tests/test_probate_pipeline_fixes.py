@@ -317,6 +317,134 @@ class ScanPageMatchesTests(_Offline):
                                                 self._keys("4529 E Xyler St N")), [])
 
 
+class OrdinalStreetTests(_Offline):
+    """The Assessor writes numbered streets without the ordinal; the server
+    stores '12Th'. Sherman (PB-2026-777, 2026-09-21) read as 'never created'
+    through two 300s timeouts and got no notes or Message Board."""
+
+    def test_assessor_form_matches_server_form(self):
+        sent = api._bare_street(api._norm_street("3012 S 12 ST E"))
+        stored = api._bare_street(api._norm_street("3012 S 12Th St"))
+        self.assertEqual(sent, stored)
+
+    def test_ordinal_suffixes_all_strip(self):
+        for a, b in (("1ST", "1"), ("22ND", "22"), ("3RD", "3"), ("56TH", "56")):
+            self.assertEqual(api._norm_street(f"10 E {a} ST"), api._norm_street(f"10 E {b} ST"))
+
+    def test_different_street_numbers_still_differ(self):
+        self.assertNotEqual(api._norm_street("3012 S 12 ST E"), api._norm_street("3012 S 13 ST E"))
+
+    def test_words_ending_in_th_are_untouched(self):
+        self.assertEqual(api._norm_street("5 Smith St"), "5 SMITH ST")
+        self.assertEqual(api._norm_street("5 North Ave"), "5 N AVE")
+
+
+class RecordTypeScopeTests(_Offline):
+    """Cape (2026-09-21) is typed 'incomplete'; a 'clean' scope estimates 0 for
+    it, so the DataSift half of the double skip trace was silently skipped."""
+
+    TYPES = {"S": "clean", "C": "incomplete", "C2": "incomplete"}
+
+    def _run(self, fn, uuids, **kw):
+        posted = []
+
+        def fake_request(method, url, json_body=None, **k):
+            if json_body is not None:
+                posted.append(json_body)
+                must = json_body["query"]["must"]
+                # Emulate the server: the scope only sees records of its own type.
+                n = sum(1 for u in must["properties"] if self.TYPES[u] == must["property_type"])
+                return {"number_of_records": n, "cost": 0.12 * n, "cost_per_owner": 0.12,
+                        "balance": 10.0, "count": n}
+            return {}
+
+        with mock.patch.object(api, "_request", side_effect=fake_request),              mock.patch.object(api, "get_property", side_effect=lambda u: {"type": self.TYPES[u]}):
+            out = fn(uuids, **kw)
+        return out, posted
+
+    def test_incomplete_record_is_now_found_by_the_estimate(self):
+        out, posted = self._run(api.estimate_skip_trace, ["C"])
+        self.assertEqual(out["number_of_records"], 1)
+        self.assertEqual(posted[0]["query"]["must"]["property_type"], "incomplete")
+
+    def test_clean_record_still_uses_the_clean_scope(self):
+        out, posted = self._run(api.estimate_skip_trace, ["S"])
+        self.assertEqual(out["number_of_records"], 1)
+        self.assertEqual(posted[0]["query"]["must"]["property_type"], "clean")
+
+    def test_mixed_batch_is_split_and_summed(self):
+        out, posted = self._run(api.estimate_skip_trace, ["S", "C"])
+        self.assertEqual(out["number_of_records"], 2)
+        self.assertEqual({b["query"]["must"]["property_type"] for b in posted}, {"clean", "incomplete"})
+        for b in posted:                       # every call is still scoped to specific uuids
+            self.assertTrue(b["query"]["must"]["properties"])
+
+    def test_submit_mixed_batch_makes_one_guarded_call_per_type(self):
+        out, posted = self._run(api.submit_skip_trace, ["S", "C", "C2"], max_records=3)
+        billed = [b for b in posted if b["estimate"] == 0]
+        self.assertEqual(len(billed), 2)
+        sizes = sorted(len(b["query"]["must"]["properties"]) for b in billed)
+        self.assertEqual(sizes, [1, 2])
+
+    def test_explicit_type_is_respected(self):
+        out, posted = self._run(api.estimate_skip_trace, ["C"], property_type="clean")
+        self.assertEqual(out["number_of_records"], 0)
+
+    def test_enrich_finds_an_incomplete_record(self):
+        out, posted = self._run(api.enrich_properties, ["C"])
+        self.assertEqual(out["count"], 1)
+
+    def test_enrich_still_refuses_an_empty_list(self):
+        with self.assertRaises(api.DataSiftAPIError):
+            api.enrich_properties([])
+
+    def test_unreadable_type_falls_back_to_clean(self):
+        with mock.patch.object(api, "get_property", side_effect=RuntimeError("down")):
+            self.assertEqual(api._group_uuids_by_record_type(["S"]), {"clean": ["S"]})
+
+
+class PeopleSearchNumberTests(unittest.TestCase):
+    """A number added by hand/people search BEFORE the traces keeps its tag and
+    shows agreement when a provider returns it too (Copley, 2026-09-21)."""
+
+    def _rec(self, tags):
+        return {"owner": {"phones": [{"number": "(918) 555-0142", "type": "MOBILE", "tags": tags}]}}
+
+    def test_people_search_tag_is_kept_not_relabelled_preexisting(self):
+        out = agent._existing_phones(self._rec([agent.SOURCE_PEOPLE_SEARCH]))
+        self.assertEqual(out[0]["sources"], [agent.SOURCE_PEOPLE_SEARCH])
+
+    def test_untagged_existing_number_is_still_preexisting(self):
+        out = agent._existing_phones(self._rec([]))
+        self.assertEqual(out[0]["sources"], ["Pre-existing"])
+
+    def test_other_tags_do_not_count_as_people_search(self):
+        out = agent._existing_phones(self._rec(["Tracerfy", "Dial First"]))
+        self.assertEqual(out[0]["sources"], ["Pre-existing"])
+
+    def _subject(self, existing, incoming_sources):
+        person = {"first": "Dallas", "last": "Copley", "name": "Dallas Copley", "key": "dallas|copley",
+                  "relationship": None, "age": "", "deceased": False, "is_primary": True,
+                  "mailing_street": "", "mailing_city": "", "mailing_state": "",
+                  "sources": ["Tracerfy"], "emails": [],
+                  "phones": [{"number": "9185550142", "sources": incoming_sources, "type_raw": "",
+                              "tier": None, "score": None}]}
+        return {"property_uuid": "p1", "first": "Dallas", "last": "Copley", "name": "Dallas Copley",
+                "people": [person], "existing_phones": existing}
+
+    def test_provider_agreement_records_both_sources(self):
+        subj = self._subject(agent._existing_phones(self._rec([agent.SOURCE_PEOPLE_SEARCH])), ["Tracerfy"])
+        agent.merge_sources([subj], {})
+        ph = subj["people"][0]["phones"]
+        self.assertEqual(len(ph), 1)
+        self.assertEqual(sorted(ph[0]["sources"]), sorted([agent.SOURCE_PEOPLE_SEARCH, "Tracerfy"]))
+
+    def test_bare_preexisting_never_adds_a_tag_to_a_provider_number(self):
+        subj = self._subject(agent._existing_phones(self._rec([])), ["Tracerfy"])
+        agent.merge_sources([subj], {})
+        self.assertEqual(subj["people"][0]["phones"][0]["sources"], ["Tracerfy"])
+
+
 class WaitForPropertiesTests(_Offline):
     def test_found_on_first_poll_without_the_fallback(self):
         page = {"results": [_rec("4529 E Xyler St", uuid="ross")]}

@@ -936,6 +936,19 @@ _API_CORE_COLUMNS = {
 }
 
 
+def clean_owner_first_name(first: str) -> str:
+    """Owner first name as DataSift wants it: no middle initials, no stray
+    punctuation. A first name of "Joel E." left Joel Cape's owner typed
+    "incomplete" and the property with it, which hid the record from the
+    pipeline's "clean" scopes; changing it to "Joel" fixed it (live, user,
+    2026-09-21). Only single-letter initials are dropped - "Mary Ann" and
+    "Wendy Jean" are real given names and stay."""
+    raw = (first or "").strip()
+    toks = [t.strip(".,;") for t in raw.split()]
+    toks = [t for t in toks if t and not re.fullmatch(r"[A-Za-z]", t)]
+    return " ".join(toks) or raw.strip(".,; ")
+
+
 def build_api_payload(row: dict) -> dict:
     """Map a DATASIFT_COLUMNS CSV row (as built by _build_row) to the REST API's
     request shapes: address, owner, tags (array), lists, notes, phones, emails,
@@ -988,7 +1001,7 @@ def build_api_payload(row: dict) -> dict:
     if is_entity:
         owner["company"] = row.get("Company Name") or ""
     else:
-        owner["first_name"] = row.get("Owner First Name") or ""
+        owner["first_name"] = clean_owner_first_name(row.get("Owner First Name") or "")
         owner["last_name"] = row.get("Owner Last Name") or ""
 
     # Tags MUST be an array — a comma string creates one tag literally named

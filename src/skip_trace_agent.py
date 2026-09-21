@@ -56,6 +56,11 @@ SOURCE_DATASIFT = "DataSift"          # found by DataSift's own skip trace
 #: comparisons stay honest: a number tagged `DataSift` must mean DataSift's
 #: skip trace returned it, never "it happened to be sitting there already".
 SOURCE_PREEXISTING = "Pre-existing"
+#: A number a human (or the people-search tool) put on the record BEFORE the
+#: traces, tagged with this source title. Its origin is KNOWN, so it must keep
+#: this tag rather than be relabelled `Pre-existing`, and a provider that later
+#: returns the same number is recorded beside it - that overlap is the point.
+SOURCE_PEOPLE_SEARCH = "true people search"   # the account's EXISTING phone tag title, exactly
 
 #: The DOUBLE SKIP TRACE, verified end to end on a real record 2026-08-21.
 #: Tracerfy and DataSift genuinely return different numbers - on the proving
@@ -287,7 +292,9 @@ def _existing_phones(rec: dict) -> list[dict]:
     for p in ((rec.get("owner") or {}).get("phones") or []):
         n = norm_phone(p.get("number") if isinstance(p, dict) else p)
         if n:
-            out.append({"number": n, "sources": [SOURCE_PREEXISTING],
+            tags = (p.get("tags") or []) if isinstance(p, dict) else []
+            sources = [SOURCE_PEOPLE_SEARCH] if SOURCE_PEOPLE_SEARCH in tags else [SOURCE_PREEXISTING]
+            out.append({"number": n, "sources": sources,
                         "type_raw": (p.get("type") or "") if isinstance(p, dict) else "",
                         "tier": None, "score": None})
     return out
@@ -632,8 +639,16 @@ def merge_sources(subjects: list[dict],
         for ph in subj.get("existing_phones", []):
             if primary is None:
                 break
-            if not any(q["number"] == ph["number"] for q in primary["phones"]):
+            match = next((q for q in primary["phones"] if q["number"] == ph["number"]), None)
+            if match is None:
                 primary["phones"].append(ph)
+            elif ph["sources"] != [SOURCE_PREEXISTING]:
+                # A provider returned a number we already hold with a KNOWN
+                # source (People Search): keep both tags. Never fold a bare
+                # Pre-existing in - its origin is unknown, so it earns no tag.
+                for src in ph["sources"]:
+                    if src not in match["sources"]:
+                        match["sources"].append(src)
         subj["has_results"] = any(p["phones"] for p in subj["people"])
     return subjects
 

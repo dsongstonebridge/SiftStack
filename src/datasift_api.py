@@ -357,9 +357,24 @@ _STREET_SUFFIXES = {"ST", "AVE", "DR", "RD", "PL", "LN", "CT", "BLVD", "CIR",
 _DIRECTIONALS = {"N", "S", "E", "W", "NE", "NW", "SE", "SW"}
 
 
+_ORDINAL_RE = re.compile(r"^(\d+)(?:ST|ND|RD|TH)$")
+
+
 def _norm_street(street: str) -> str:
+    """Uppercase, abbreviate, and drop ordinal suffixes ("12TH" -> "12").
+
+    The Assessor writes numbered Tulsa streets without the ordinal
+    ("3012 S 12 ST E") while the server stores "3012 S 12Th St" - the same
+    house, read as "never created" (300s timeout, twice, then a record with no
+    notes or Message Board). Caught live 2026-09-21 on Sherman, PB-2026-777.
+    Both sides pass through here, so stripping it on both makes them agree.
+    """
     toks = re.sub(r"[^\w\s]", " ", (street or "").upper()).split()
-    return " ".join(_STREET_ABBR.get(t, t) for t in toks)
+    out = []
+    for t in toks:
+        m = _ORDINAL_RE.match(t)
+        out.append(m.group(1) if m else _STREET_ABBR.get(t, t))
+    return " ".join(out)
 
 
 def address_key(street: str, city: str) -> str:
@@ -1034,6 +1049,25 @@ def update_custom_field_values(property_uuid: str, values: dict[str, str]) -> di
             "mismatched": mismatched}
 
 
+def _group_uuids_by_record_type(property_uuids: list[str]) -> dict[str, list[str]]:
+    """{"clean": [...], "incomplete": [...]} - each record's OWN type, read from
+    the CRM. The skip-trace and enrich scopes filter on `property_type`, and a
+    record typed "incomplete" is invisible to a "clean" scope: on 2026-09-21
+    Cape (PB-2026-778/780) estimated 0 records under "clean" and 1 under
+    "incomplete", so the DataSift half of the double skip trace would have been
+    silently skipped. A record whose type cannot be read is treated as "clean",
+    the old behaviour."""
+    groups: dict[str, list[str]] = {}
+    for u in property_uuids:
+        try:
+            ptype = (get_property(u) or {}).get("type") or "clean"
+        except Exception as e:                      # noqa: BLE001 - fall back to the old default
+            logger.warning("record type unreadable for %s (%s) - assuming clean", u, e)
+            ptype = "clean"
+        groups.setdefault(ptype, []).append(u)
+    return groups
+
+
 # ── Skip trace ────────────────────────────────────────────────────────
 
 def _skip_trace_body(property_uuids: list[str], *, address_prefix: str = "",
@@ -1071,7 +1105,7 @@ def _skip_trace_body(property_uuids: list[str], *, address_prefix: str = "",
 
 
 def estimate_skip_trace(property_uuids: list[str], *, address_prefix: str = "",
-                         property_type: str = "clean") -> dict:
+                         property_type: str = "auto") -> dict:
     """Cost preview — **FREE**. Returns what a skip trace would cost and how
     many records it would touch, without running it.
 
@@ -1081,7 +1115,20 @@ def estimate_skip_trace(property_uuids: list[str], *, address_prefix: str = "",
     what you intended. If it reports the whole account, the scoping is wrong —
     stop. This is the pre-flight that would have prevented the 2026-08-21
     account-wide incident, and it existed the whole time.
+
+    `property_type="auto"` (the default) reads each record's own type and sums
+    the per-type estimates; pass "clean"/"incomplete" to force one scope.
     """
+    if property_type == "auto":
+        groups = _group_uuids_by_record_type(property_uuids)
+        if len(groups) > 1:
+            parts = [estimate_skip_trace(g, address_prefix=address_prefix, property_type=t)
+                     for t, g in groups.items()]
+            return {"number_of_records": sum(int(x.get("number_of_records") or 0) for x in parts),
+                    "cost": round(sum(float(x.get("cost") or 0) for x in parts), 4),
+                    "cost_per_owner": parts[0].get("cost_per_owner"),
+                    "balance": parts[-1].get("balance")}
+        property_type = next(iter(groups), "clean")
     body = _skip_trace_body(property_uuids, address_prefix=address_prefix,
                              property_type=property_type, estimate=True)
     result = _request("POST", f"{CORE_BASE}/api/internal/property/skip-trace/",
@@ -1093,7 +1140,7 @@ def estimate_skip_trace(property_uuids: list[str], *, address_prefix: str = "",
 
 
 def submit_skip_trace(property_uuids: list[str], *, address_prefix: str = "",
-                       property_type: str = "clean",
+                       property_type: str = "auto",
                        max_records: int | None = None) -> dict:
     """Skip trace SPECIFIC records. **BILLED** — prepaid credits, ~$0.12/owner.
 
@@ -1113,6 +1160,17 @@ def submit_skip_trace(property_uuids: list[str], *, address_prefix: str = "",
     if not property_uuids:
         logger.info("submit_skip_trace: nothing to submit")
         return {}
+
+    if property_type == "auto":
+        groups = _group_uuids_by_record_type(property_uuids)
+        if len(groups) > 1:
+            # Mixed clean/incomplete: one guarded submission per type, each
+            # with its own ceiling, so the account-wide guard still applies.
+            resps = [submit_skip_trace(g, address_prefix=address_prefix,
+                                       property_type=t, max_records=len(g))
+                     for t, g in groups.items()]
+            return {"groups": resps}
+        property_type = next(iter(groups), "clean")
 
     est = estimate_skip_trace(property_uuids, address_prefix=address_prefix,
                                property_type=property_type)
@@ -1203,7 +1261,7 @@ def _enrich_body(property_uuids: list[str], *, search: str = "",
 
 
 def enrich_properties(property_uuids: list[str], *, search: str = "",
-                      property_type: str = "clean",
+                      property_type: str = "auto",
                       enrich_property: bool = True,
                       enrich_owner: bool = False,
                       replace_owner: bool = False,
@@ -1227,6 +1285,17 @@ def enrich_properties(property_uuids: list[str], *, search: str = "",
             "REFUSING enrich: empty property list. An enrich with no "
             "`properties` scopes to the ENTIRE ACCOUNT."
         )
+
+    if property_type == "auto":
+        groups = _group_uuids_by_record_type(property_uuids)
+        if len(groups) > 1:
+            parts = [enrich_properties(g, search=search, property_type=t,
+                                       enrich_property=enrich_property,
+                                       enrich_owner=enrich_owner,
+                                       replace_owner=replace_owner, max_records=len(g))
+                     for t, g in groups.items()]
+            return {"count": sum(int((x or {}).get("count") or 0) for x in parts)}
+        property_type = next(iter(groups), "clean")
 
     ceiling = max_records if max_records is not None else len(property_uuids)
     est = estimate_skip_trace(property_uuids, property_type=property_type)
@@ -1295,8 +1364,10 @@ def list_phone_tags(force_refresh: bool = False) -> dict[str, dict]:
     global _phone_tag_cache
     if _phone_tag_cache and not force_refresh:
         return _phone_tag_cache
-    body = _request("GET", f"{CORE_BASE}/api/internal/phone/tag/") or {}
-    _phone_tag_cache = {t["title"]: t for t in _page_items(body)}
+    # Every page: the account has more tags than one page holds (16 vs a
+    # page of 10 on 2026-09-21), and a truncated list makes existing tags look
+    # missing to get_or_create_phone_tag().
+    _phone_tag_cache = {t["title"]: t for t in get_all(f"{CORE_BASE}/api/internal/phone/tag/")}
     return _phone_tag_cache
 
 

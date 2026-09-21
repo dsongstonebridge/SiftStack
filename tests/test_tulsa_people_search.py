@@ -432,5 +432,56 @@ class AgeFilterTests(unittest.TestCase):
         self.assertIsNone(report["verified_property"])
 
 
+class PhoneParsingTests(unittest.TestCase):
+    """Real markup from a live detail page (2026-09-16), trimmed."""
+
+    HTML = """
+    <div class="col-12 col-md-6 mb-3"><div>
+    <a href="/find/phone/8063921417" class="dt-hd link-to-more olnk" data-link-to-more="phone"><span>(806) 392-1417</span></a> - <span class="smaller">Wireless</span>
+    <div class="mt-1 dt-ln">
+        <span class="dt-sb"><b>Possible Primary Phone</b></span><br>
+        <span class="dt-sb">Last reported Jul 2026</span>
+<br>        <span class="dt-sb">T-Mobile</span>
+    </div></div></div>
+    <div><a href="/find/phone/9185550100" class="dt-hd link-to-more olnk" data-link-to-more="phone"><span>(918) 555-0100</span></a> - <span class="smaller">Landline</span>
+    <div class="mt-1 dt-ln"><span class="dt-sb">Last reported Jan 2019</span></div></div>
+    <a href="/find/person/xyz" data-link-to-more="relative"><span>A Relative</span></a>
+    """
+
+    def test_primary_and_secondary_numbers(self):
+        d = tps._parse_person_detail("<html><body>" + self.HTML + "</body></html>")
+        self.assertEqual(len(d["phones"]), 2)
+        first, second = d["phones"]
+        self.assertEqual(first["number"], "8063921417")
+        self.assertTrue(first["is_primary"])
+        self.assertEqual(first["line_type"], "Wireless")
+        self.assertEqual(first["carrier"], "T-Mobile")
+        self.assertEqual(first["last_reported"], "Jul 2026")
+        self.assertFalse(second["is_primary"])
+        self.assertEqual(second["line_type"], "Landline")
+
+    def test_no_phone_section_gives_empty_list(self):
+        self.assertEqual(tps._parse_person_detail("<html><body></body></html>")["phones"], [])
+
+
+class SearchPageClassificationTests(unittest.TestCase):
+    """A failure must never pass for 'no such person' (Dallas Copley, 2026-09-21)."""
+
+    def test_cards_mean_results(self):
+        self.assertEqual(tps._classify_search_page("anything", 2), "results")
+
+    def test_explicit_zero_is_a_confirmed_zero(self):
+        self.assertEqual(tps._classify_search_page("No Records Found for X", 0), "zero")
+
+    def test_loading_or_redirect_page_is_unknown_not_zero(self):
+        self.assertEqual(tps._classify_search_page("Loading content, please wait...", 0), "unknown")
+
+    def test_empty_page_is_unknown_not_zero(self):
+        self.assertEqual(tps._classify_search_page("", 0), "unknown")
+
+    def test_failed_search_raises_instead_of_returning_empty(self):
+        self.assertTrue(issubclass(tps.PeopleSearchError, RuntimeError))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

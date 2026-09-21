@@ -94,6 +94,24 @@ def _search_url(first: str, last: str, city: str, state: str) -> str:
     return f"{BASE_URL}/results?name={name}&citystatezip={citystatezip}"
 
 
+class PeopleSearchError(RuntimeError):
+    """The site could not be read (captcha not cleared, unrecognized page).
+    Raised instead of returning [] so a FAILURE can never pass for a real
+    "no such person" - on 2026-09-21 a mid-redirect page was parsed as zero
+    results and Dallas Copley of Sapulpa, who exists, was reported missing."""
+
+
+def _classify_search_page(body_text: str, n_cards: int) -> str:
+    """'results' (cards present), 'zero' (page explicitly says none), or
+    'unknown' (anything else - never treated as a confirmed zero)."""
+    if n_cards > 0:
+        return "results"
+    b = (body_text or "").lower()
+    if "no records found" in b or "0 records found" in b or "no results found" in b:
+        return "zero"
+    return "unknown"
+
+
 def _clear_internal_captcha(page, api_key: str) -> bool:
     """If the page is TruePeopleSearch's own rate-limit captcha (title
     "Captcha", HTTP 200 - NOT Cloudflare's raw edge 403), solve its Turnstile
@@ -117,14 +135,22 @@ def _clear_internal_captcha(page, api_key: str) -> bool:
                       "TruePeopleSearch's challenge markup may have changed")
         return False
 
-    logger.info("people-search: solving TruePeopleSearch internal Turnstile "
-                "(~$0.0015)...")
-    solver = TwoCaptcha(api_key)
-    result = solver.turnstile(sitekey=sitekey, url=page.url)
-    token = result.get("code") if isinstance(result, dict) else str(result)
-    if not token:
-        logger.error("people-search: 2Captcha returned no token")
-        return False
+    for attempt in (1, 2):
+        logger.info("people-search: solving TruePeopleSearch internal Turnstile "
+                    "(~$0.0015, attempt %d)...", attempt)
+        solver = TwoCaptcha(api_key)
+        result = solver.turnstile(sitekey=sitekey, url=page.url)
+        token = result.get("code") if isinstance(result, dict) else str(result)
+        if not token:
+            logger.error("people-search: 2Captcha returned no token")
+            return False
+        if _submit_captcha_token(page, token):
+            return True
+        logger.warning("people-search: still on the captcha page after solving")
+    return False
+
+
+def _submit_captcha_token(page, token: str) -> bool:
 
     # The page submits via its own JS (fetch(), not a plain form POST) - call
     # that same function directly with the solved token, same idea as
@@ -140,10 +166,7 @@ def _clear_internal_captcha(page, api_key: str) -> bool:
         token,
     )
     page.wait_for_timeout(6000)
-    cleared = page.title() != "Captcha"
-    if not cleared:
-        logger.warning("people-search: still on the captcha page after solving")
-    return cleared
+    return page.title() != "Captcha"
 
 
 def _parse_search_results(html: str) -> list[dict]:
@@ -255,6 +278,46 @@ def _parse_aliases(soup: BeautifulSoup) -> list[str]:
     return [s.get_text(strip=True) for s in data_row.select("span") if s.get_text(strip=True)]
 
 
+def _parse_phones(soup: BeautifulSoup) -> list[dict]:
+    """The detail page's Phone Numbers section (verified live 2026-09-16/21):
+
+        <a data-link-to-more="phone" href="/find/phone/NNNNNNNNNN"><span>(806) 392-1417</span></a>
+        - <span class="smaller">Wireless</span>
+        <div class="mt-1 dt-ln">
+            <span class="dt-sb"><b>Possible Primary Phone</b></span><br>
+            <span class="dt-sb">Last reported Jul 2026</span><br>
+            <span class="dt-sb">T-Mobile</span>
+        </div>
+
+    Returns [{"number": "8063921417", "line_type": "Wireless", "is_primary":
+    bool, "last_reported": "Jul 2026", "carrier": "T-Mobile"}]. Only anchors
+    that link to /find/phone/ count, so relatives' numbers never leak in.
+    """
+    out, seen = [], set()
+    for a in soup.select('a[data-link-to-more="phone"]'):
+        href = a.get("href") or ""
+        digits = re.sub(r"\D", "", a.get_text(strip=True))
+        if not href.startswith("/find/phone/") or len(digits) != 10 or digits in seen:
+            continue
+        seen.add(digits)
+        line_type = ""
+        nxt = a.find_next_sibling("span", class_="smaller")
+        if nxt:
+            line_type = nxt.get_text(strip=True)
+        info = a.find_next_sibling("div", class_="mt-1")
+        texts = [t.get_text(strip=True) for t in info.select("span.dt-sb")] if info else []
+        out.append({
+            "number": digits,
+            "line_type": line_type,
+            "is_primary": any("primary" in t.lower() for t in texts),
+            "last_reported": next((t.replace("Last reported", "").strip()
+                                   for t in texts if t.startswith("Last reported")), ""),
+            "carrier": next((t for t in texts if t and "primary" not in t.lower()
+                             and not t.startswith("Last reported")), ""),
+        })
+    return out
+
+
 def _parse_person_detail(html: str) -> dict:
     soup = BeautifulSoup(html, "lxml")
 
@@ -272,6 +335,7 @@ def _parse_person_detail(html: str) -> dict:
         "previous_addresses": previous,
         "relatives": relatives,
         "also_seen_as": _parse_aliases(soup)[:5],
+        "phones": _parse_phones(soup),
     }
 
 
@@ -296,9 +360,22 @@ def search_person(
             page.goto(url, wait_until="domcontentloaded", timeout=30000)
             page.wait_for_timeout(3000)
             if not _clear_internal_captcha(page, api_key):
-                logger.error("people-search: could not clear captcha for %s %s", first, last)
-                return []
-            results = _parse_search_results(page.content())
+                raise PeopleSearchError(
+                    f"could not clear the captcha searching {first} {last}")
+            state_seen, results = "unknown", []
+            for _ in range(8):                 # up to ~16s for a slow/redirecting page
+                results = _parse_search_results(page.content())
+                state_seen = _classify_search_page(page.inner_text("body"), len(results))
+                if state_seen != "unknown":
+                    break
+                page.wait_for_timeout(2000)
+                if page.title() == "Captcha":
+                    if not _clear_internal_captcha(page, api_key):
+                        raise PeopleSearchError("captcha reappeared and could not be cleared")
+            if state_seen == "unknown":
+                raise PeopleSearchError(
+                    f"unrecognized page for {first} {last} (title {page.title()!r}) - "
+                    "NOT a confirmed zero")
             logger.info("people-search: %d candidate(s) for '%s %s' in %s, %s",
                         len(results), first, last, city, state)
             return results

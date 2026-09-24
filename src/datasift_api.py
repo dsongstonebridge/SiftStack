@@ -1330,6 +1330,114 @@ def get_owner(owner_uuid: str) -> dict:
     return _request("GET", f"{CORE_BASE}/api/internal/owner/{owner_uuid}/")
 
 
+def update_owner_name(owner_uuid: str, first_name: str, last_name: str, *,
+                       clear_company: bool = False, verify: bool = True) -> dict:
+    """Set the owner's PERSON name, leaving the company/entity alone by default.
+
+    Used after owner enrichment to put back the human the foreclosure petition
+    named. User's rule (2026-09-24): a real person's name beats the county's
+    trust/LLC owner of record, because a person is what actually skip traces --
+    and more generally, enrichment must "only ever make our records BETTER",
+    so the name we already had is never traded for a different one.
+
+    `clear_company=False` is deliberate and load-bearing: enrichment ADDS a
+    trust/LLC alongside the person (verified live: first/last survived while
+    `company` gained 'Witcher Theresa Louise Trust' and `type` became 'trust').
+    That is a gain -- it tells you who actually holds title and must sign --
+    so it is kept. Only pass clear_company=True to genuinely strip an entity.
+
+    NOTE: `company: ""` is REJECTED by the API
+    (`{"company":["This field may not be blank."]}`) -- clearing needs None.
+
+    Verified by read-back, not by the 2xx.
+    """
+    body: dict = {"first_name": first_name, "last_name": last_name}
+    if clear_company:
+        body["company"] = None          # "" is rejected; None works
+        body["type"] = "person"
+    _request("PATCH", f"{CORE_BASE}/api/internal/owner/{owner_uuid}/", json_body=body)
+
+    if not verify or _DRY_RUN:
+        return {"ok": None, "after": None}
+
+    after = get_owner(owner_uuid) or {}
+    ok = ((after.get("first_name") or "").strip().lower() == first_name.strip().lower()
+          and (after.get("last_name") or "").strip().lower() == last_name.strip().lower())
+    if not ok:
+        logger.warning("update_owner_name: did NOT land on %s - wanted %r %r, "
+                       "record reads %r %r (company=%r)", owner_uuid,
+                       first_name, last_name, after.get("first_name"),
+                       after.get("last_name"), after.get("company"))
+    return {"ok": ok, "after": after}
+
+
+def owner_is_entity(owner: dict) -> bool:
+    """True when the owner record is a business/trust rather than a person.
+
+    Entity owners carry a `company` and omit first/last (see
+    build_owner_payload); a trust can also arrive as a person-shaped row whose
+    name text is obviously an entity, so the name is checked too.
+    """
+    if not isinstance(owner, dict):
+        return False
+    if (owner.get("company") or "").strip():
+        return True
+    first = (owner.get("first_name") or "").strip()
+    last = (owner.get("last_name") or "").strip()
+    if not first and not last:
+        return True
+    blob = f"{first} {last}".upper()
+    return bool(re.search(r"\b(TRUST|TTEE|TRUSTEE|LLC|L L C|INC|CORP|COMPANY|"
+                          r"CO|LP|LLP|PLLC|FOUNDATION|ESTATE|MINISTRIES|CHURCH|"
+                          r"DIOCESE|ASSOCIATION|PARTNERS|HOLDINGS|PROPERTIES)\b", blob))
+
+
+def update_owner_address(owner_uuid: str, address: dict, *,
+                          verify: bool = True) -> dict:
+    """Set the owner's MAILING address — the address direct mail goes to.
+
+    This is not cosmetic. `build_api_payload()` fills `owner.address` with the
+    PROPERTY address for every non-probate record, because the petition
+    carries no mailing address (see datasift_formatter's mail_falls_back_to_
+    property). That fallback is often right for foreclosure and is simply a
+    guess: an absentee owner is indistinguishable from an owner-occupant until
+    a skip trace returns a real mailing address.
+
+    `address` takes the same shape as elsewhere: {"street", "city", "state",
+    "postal_code"}. Returns {"ok", "before", "after"}.
+
+    VERIFIED BY READ-BACK, not by the 2xx — this endpoint's PATCH shape was
+    not previously exercised anywhere in this client, and a write that returns
+    200 and changes nothing is a documented failure mode on this API
+    (set_phone_tags did exactly that). `verify=False` skips the re-read only
+    for callers that batch their own verification.
+    """
+    before = {}
+    try:
+        before = (get_owner(owner_uuid) or {}).get("address") or {}
+    except DataSiftAPIError as e:
+        logger.warning("update_owner_address: pre-read failed for %s: %s", owner_uuid, e)
+
+    _request("PATCH", f"{CORE_BASE}/api/internal/owner/{owner_uuid}/",
+             json_body={"address": address})
+
+    # On a dry run the PATCH above was intercepted and never sent, so a
+    # read-back would correctly find the old value and wrongly report "did not
+    # land". Nothing was written; there is nothing to verify.
+    if not verify or _DRY_RUN:
+        return {"ok": None, "before": before, "after": None}
+
+    after = (get_owner(owner_uuid) or {}).get("address") or {}
+    want = str(address.get("street") or "").strip().lower()
+    got = str(after.get("street") or "").strip().lower()
+    ok = bool(want) and want == got
+    if not ok:
+        logger.warning("update_owner_address: did NOT land on %s - wanted %r, "
+                       "record still reads %r", owner_uuid, address.get("street"),
+                       after.get("street"))
+    return {"ok": ok, "before": before, "after": after}
+
+
 def upsert_phones(owner_uuid: str, phones: list[dict]) -> dict:
     return _request("POST", f"{CORE_BASE}/api/internal/owner/{owner_uuid}/upsert-phones/",
                      json_body={"phones": phones})

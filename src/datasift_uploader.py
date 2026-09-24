@@ -28,6 +28,7 @@ import csv as _csv
 import json as _json
 import logging
 import os
+import re
 from pathlib import Path
 
 import config
@@ -126,6 +127,7 @@ async def upload_to_datasift(
     list_name: str | None = None,
     batch_tag: str = "Courthouse Data",
     skip_trace_csv_path: str | Path | None = None,
+    replace_owner: bool = True,
 ) -> dict:
     """Upload a DataSift-formatted CSV entirely over the REST API — no browser
     for creation. Same signature/return shape as the Playwright-only original
@@ -292,7 +294,15 @@ async def upload_to_datasift(
     # scoping contract was unknown. It is now captured and enforced; see
     # enrich_records() and datasift_api._enrich_body.
     if result["success"] and enrich:
-        result["enrich_result"] = await enrich_records(None, csv_path)
+        # replace_owner defaults ON: it is the ONLY toggle that writes a real
+        # mailing address (enrich_owner alone is a no-op -- proven on a
+        # throwaway record 2026-09-24). It is safe to leave on because
+        # enrich_records() gates it PER RECORD: probate, deceased owners and
+        # anything whose owner we deliberately overrode are excluded, and the
+        # petition's person name is restored afterwards, so the operation only
+        # ever ADDS (mailing address, trust/LLC, secondary owners).
+        result["enrich_result"] = await enrich_records(
+            None, csv_path, enrich_owner=replace_owner, replace_owner=replace_owner)
         logger.info("Enrich: %s", result["enrich_result"].get("message"))
 
     # Scoped over the REST API — no browser. `skip_trace` still defaults to
@@ -1700,6 +1710,147 @@ def _read_csv_absentee_flags(csv_paths: list[Path]) -> dict[str, bool]:
     return flags
 
 
+#: Wording in "Owner Status"/"Owner Deceased"/"Decedent Name" that means the
+#: person named as owner on OUR record is NOT the county's owner of record --
+#: because they are dead, or because we deliberately put someone else there.
+_OWNER_OVERRIDE_WORDS = re.compile(
+    r"\b(deceased|decedent|estate of|personal representative|\bPR\b|"
+    r"surviving|survivorship|heir|executor|administrat)", re.I)
+
+
+def owner_replace_eligible(row: dict) -> tuple[bool, str]:
+    """May DataSift's owner of record REPLACE the owner on this record?
+
+    `replace_owner=True` is what actually writes the correct owner name and
+    mailing address -- proven 2026-09-24 on a throwaway record at a property
+    with a known-different answer (owner -> Edward Slattery, mailing -> the
+    county's PO Box, both exact). `enrich_owner` alone is a no-op.
+
+    But it overwrites the owner NAME with the county's owner of record, and
+    that is exactly wrong wherever we deliberately put someone else there:
+
+      - Kim: county owner of record is `KIM, DAN-BY A` -- the DECEASED owner.
+        We set the contact to Ha-Yang Kim, the court-appointed PR. Replacing
+        would put a dead man back on the record, which is the recurring
+        DM-contact bug ([[feedback-dm-contact-pattern]]).
+      - Hopkins: owner died; we set the surviving joint tenant.
+      - Any probate record: the PR is the whole point.
+
+    So this gate is narrow ON PURPOSE. It reads only the row we already have
+    -- no per-record lookups, no extra API calls -- and the caller makes two
+    batched enrich calls instead of one.
+
+    Co-owners and trusts are deliberately NOT excluded: the throwaway test
+    showed enrichment sets a real PERSON as owner and pushes the other parties
+    into `secondary_owners` rather than mangling the name, which is an
+    improvement rather than a loss.
+
+    Returns (eligible, reason_if_not).
+    """
+    def val(*keys) -> str:
+        for k in keys:
+            v = row.get(k)
+            if v not in (None, ""):
+                return str(v).strip()
+        return ""
+
+    if val("Notice Type", "notice_type").lower() == "probate":
+        return False, "probate - the PR must never be replaced by the owner of record"
+
+    if val("Owner Deceased", "owner_deceased").lower() in {"yes", "y", "true", "1"}:
+        return False, "Owner Deceased=yes"
+
+    if val("Owner Alive", "owner_alive").lower() == "no":
+        return False, "Owner Alive=No"
+
+    if val("Decedent Name", "decedent_name"):
+        return False, "record names a decedent"
+
+    status = val("Owner Status", "owner_status")
+    if status and _OWNER_OVERRIDE_WORDS.search(status):
+        return False, f"Owner Status indicates an overridden/deceased owner: {status[:60]}"
+
+    if val("Owner Overridden", "owner_overridden").lower() in {"yes", "y", "true", "1"}:
+        return False, "explicitly flagged Owner Overridden"
+
+    return True, ""
+
+
+def _restore_people(uuids: list[str], person: dict, result: dict,
+                     *, settle_seconds: float = 90.0) -> None:
+    """Put the petition's HUMAN owner back wherever enrichment wrote an entity.
+
+    User's rule (2026-09-24): a real person's name off the foreclosure petition
+    beats the county's trust/LLC owner of record, because a person is what
+    actually skip traces. Enrichment is fire-and-forget -- there is no way to
+    preview what it will write -- so this reads back and undoes just that one
+    outcome, rather than paying for a per-record lookup BEFORE every enrich.
+
+    Only reverts person -> entity. An entity replaced by another entity is left
+    alone (we had no human name to prefer), and a person replaced by a
+    different person is left alone too: that is enrichment doing its job, and
+    the county's name is usually the better one.
+    """
+    if not uuids or _api.is_dry_run():
+        return
+    import time
+    time.sleep(settle_seconds)          # enrichment is async; let it land
+    for uuid in uuids:
+        first, last = person.get(uuid, ("", ""))
+        if not (first and last):
+            continue                      # no human name to protect
+        try:
+            rec = _api.get_property(uuid)
+        except _api.DataSiftAPIError as e:
+            logger.warning("restore check failed for %s: %s", uuid, e)
+            continue
+        owner = rec.get("owner") or {}
+        # KEEP THE PETITION'S PERSON, TAKE EVERYTHING ELSE.
+        #
+        # User's condition for enabling this at all (2026-09-24): it must
+        # "only ever make our records BETTER". `replace_owner=True` is one
+        # toggle that changes BOTH the owner name and the mailing address, and
+        # only the address half is unambiguously an improvement:
+        #
+        #   - mailing address: replaces a PLACEHOLDER we guessed (the property
+        #     address) with the county's real one -> strictly better.
+        #   - company / type / secondary_owners: pure additions -> better.
+        #     Enrichment adds a trust ALONGSIDE the person rather than
+        #     replacing them (verified live on a trust-owned parcel), and the
+        #     user called that out as a good thing. Never undone.
+        #   - owner NAME: NOT clearly better. The petition names the defendant
+        #     being foreclosed on -- the person we are trying to reach. The
+        #     county's owner of record may be a different co-owner entirely
+        #     (`BLEULER, SHERI & TIM ESTABROOK` vs our Timothy Estabrook).
+        #
+        # So the name is always restored to what the petition said, and every
+        # other enriched field is kept. That makes the operation monotonic:
+        # nothing we had can get worse, only added to.
+        cur_first = (owner.get("first_name") or "").strip()
+        cur_last = (owner.get("last_name") or "").strip()
+        if cur_first.lower() == first.lower() and cur_last.lower() == last.lower():
+            continue                      # name already ours - nothing to do
+        became = f"{cur_first} {cur_last}".strip() or (owner.get("company") or "(no name)")
+        owner_uuid = owner.get("uuid")
+        if not owner_uuid:
+            continue
+        logger.warning("enrichment changed the owner name to %r - restoring the "
+                       "petition's person %s %s (keeping the enriched mailing "
+                       "address and entity data)", became, first, last)
+        try:
+            chk = _api.update_owner_name(owner_uuid, first, last)
+        except _api.DataSiftAPIError as e:
+            logger.error("could not restore person on %s: %s", uuid, e)
+            result.setdefault("entity_restore_failed", []).append(
+                {"uuid": uuid, "entity": became, "error": str(e)})
+            continue
+        entry = {"uuid": uuid, "entity": became, "restored": f"{first} {last}",
+                 "verified": chk.get("ok")}
+        result.setdefault("entity_reverted", []).append(entry)
+        if chk.get("ok") is False:
+            result.setdefault("entity_restore_failed", []).append(entry)
+
+
 async def enrich_records(page, csv_path: str | Path | list[str | Path], *,
                          enrich_owner: bool = False,
                          replace_owner: bool = False) -> dict:
@@ -1733,6 +1884,8 @@ async def enrich_records(page, csv_path: str | Path | list[str | Path], *,
 
     uuid_map = _load_uuid_map()
     uuids, targets = [], []
+    replace_uuids, gated = [], []
+    person: dict[str, tuple[str, str]] = {}   # property uuid -> petition's (first, last)
     for row in rows:
         owner_last, street = _row_owner_street(row)
         prop_uuid = uuid_map.get(_uuid_map_key(owner_last, street))
@@ -1742,17 +1895,51 @@ async def enrich_records(page, csv_path: str | Path | list[str | Path], *,
             continue
         uuids.append(prop_uuid)
         targets.append({"owner": owner_last, "street": street})
+        if replace_owner:
+            ok, why = owner_replace_eligible(row)
+            (replace_uuids if ok else gated).append(prop_uuid)
+            if ok:
+                # Remember the PERSON the petition named, so an entity owner
+                # written by enrichment can be undone (see _restore_people).
+                person[prop_uuid] = (
+                    (row.get("Owner First Name") or row.get("First Name") or "").strip(),
+                    (row.get("Owner Last Name") or row.get("Last Name") or "").strip(),
+                )
+            else:
+                gated_note = {"owner": owner_last, "street": street, "reason": why}
+                result.setdefault("owner_replace_gated", []).append(gated_note)
+                logger.warning("owner replace SKIPPED for %s (%s): %s",
+                               owner_last, street, why)
 
     if not uuids:
         result["message"] = "No resolvable records - nothing to enrich"
         return result
 
     try:
-        resp = _api.enrich_properties(
-            uuids, enrich_property=True,
-            enrich_owner=enrich_owner, replace_owner=replace_owner,
-            max_records=len(uuids),
-        ) or {}
+        if replace_owner:
+            # TWO batched calls, never per-record: the gate is a filter over
+            # rows we already hold, so this costs no extra lookups. Records
+            # that failed the gate still get PROPERTY enrichment - they just
+            # keep the owner we deliberately put on them.
+            logger.info("enrich: %d record(s) with owner replacement, %d gated "
+                        "(property enrichment only)", len(replace_uuids), len(gated))
+            resp = {"count": 0}
+            for group, repl in ((replace_uuids, True), (gated, False)):
+                if not group:
+                    continue
+                part = _api.enrich_properties(
+                    group, enrich_property=True,
+                    enrich_owner=True, replace_owner=repl,
+                    max_records=len(group),
+                ) or {}
+                resp["count"] += int(part.get("count") or 0)
+            _restore_people(replace_uuids, person, result)
+        else:
+            resp = _api.enrich_properties(
+                uuids, enrich_property=True,
+                enrich_owner=enrich_owner, replace_owner=replace_owner,
+                max_records=len(uuids),
+            ) or {}
     except _api.DataSiftAPIError as e:
         result["message"] = f"Enrich refused/failed: {e}"
         logger.error("Enrich failed: %s", e)

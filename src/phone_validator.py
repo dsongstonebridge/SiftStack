@@ -529,6 +529,9 @@ def write_datasift_tags_csv(results: list[dict], output_dir: str | Path) -> Path
     """Write the DataSift-ready phone tags CSV (Phone Number + Phone Tag).
 
     This is the file uploaded to DataSift via "Update Data → Tag phones by phone number".
+    A litigator-flagged number gets "DO NOT CALL - Litigator Risk" INSTEAD OF
+    its dial-tier tag, never alongside it — a "Dial First" tag next to a
+    litigator flag would still let a tier-filtered call list pull the number.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -540,7 +543,8 @@ def write_datasift_tags_csv(results: list[dict], output_dir: str | Path) -> Path
         writer.writerow(["Phone Number", "Phone Tag"])
         for r in results:
             if r.get("is_valid") is not False:
-                writer.writerow([r["phone_number"], r["assigned_tag"]])
+                tag = "DO NOT CALL - Litigator Risk" if r.get("is_litigator_risk") else r["assigned_tag"]
+                writer.writerow([r["phone_number"], tag])
 
     logger.info("DataSift phone tags CSV: %s (%d phones)", filepath, len(results))
     return filepath

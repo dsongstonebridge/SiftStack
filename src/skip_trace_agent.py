@@ -80,6 +80,15 @@ SOURCE_PEOPLE_SEARCH = "true people search"   # the account's EXISTING phone tag
 TAG_TRACERFY_SKIPPED = "Tracerfy Skipped"
 TAG_TRESTLE_SCORED = "TrestleIQ Scored"
 
+#: Applied to a NUMBER (phone tag, not a property tag) when Trestle's
+#: litigator_checks add-on flags it. This REPLACES the normal dial-tier tag
+#: for that number rather than sitting alongside it (see writeback()) - a
+#: litigator-risk number must never carry a "Dial First/Second/..." tag that
+#: a call-list filter could pick up. It is always requested during scoring
+#: (see score_phones()) and always applied when true - never an opt-in flag
+#: a run can forget to pass. The whole point is to never call this number.
+PHONE_TAG_LITIGATOR_RISK = "DO NOT CALL - Litigator Risk"
+
 _PHONE_FIELDS = ["primary_phone", "mobile_1", "mobile_2", "mobile_3", "mobile_4",
                  "mobile_5", "landline_1", "landline_2", "landline_3"]
 _EMAIL_FIELDS = ["email_1", "email_2", "email_3", "email_4", "email_5"]
@@ -208,9 +217,23 @@ def resolve_subjects(rows: Iterable[dict]) -> tuple[list[dict], list[dict]]:
             "trace_state": trace_state,
             "trace_zip": trace_zip,
             "trace_address_source": trace_source,
+            # What the record ALREADY holds as the owner's mailing address.
+            # _write_mailing_address() compares this against the property
+            # address to tell a placeholder (safe to overwrite) from a real
+            # address that came from a better source, e.g. probate's
+            # court-filed PR address (never overwrite).
+            "current_mail_street": (owner_addr.get("street") or "").strip(),
             "existing_phones": _existing_phones(rec),
             "people": [],
             "has_results": False,
+            # A second named person at this same property - a co-borrower on
+            # the note, or a co-owner found on title - carried through from
+            # the row so run_pipeline() can trace them too without the
+            # caller needing to know property_uuid ahead of time.
+            **({"co_borrower": {"first": (row.get("co_borrower_first") or "").strip(),
+                                 "last": (row.get("co_borrower_last") or "").strip(),
+                                 "relationship": (row.get("co_borrower_relationship") or "").strip() or None}}
+               if row.get("co_borrower_first") and row.get("co_borrower_last") else {}),
             # Probate context for the Message Board's SIGNING CHAIN block.
             # Empty dict for foreclosure, which just omits the block.
             **_probate_context(rec, row),
@@ -298,6 +321,123 @@ def _existing_phones(rec: dict) -> list[dict]:
                         "type_raw": (p.get("type") or "") if isinstance(p, dict) else "",
                         "tier": None, "score": None})
     return out
+
+
+# ── Adapter: a second named person at the same property ────────────────
+
+def co_borrower_source(subjects: list[dict], co_borrowers: dict[str, dict],
+                        *, dry_run: bool = True) -> dict[str, list[dict]]:
+    """Trace a SECOND named individual at the same property - a co-borrower on
+    the note, or a co-owner discovered on title - and emit them as a
+    non-primary Person so writeback() tags their numbers with the given
+    relationship (an EXISTING account tag: Wife/Husband/Relative/etc, or None
+    to leave the numbers untagged when no relationship is actually asserted).
+
+    `co_borrowers`: {property_uuid: {"first", "last", "relationship"}}.
+    `relationship` must be one of the tags relationship_tag() can already
+    produce, or None - never invent a new tag here (phone tags are
+    append-only; see relationship_tag()'s own docstring).
+
+    Traced at the SAME address as the primary subject (trace_street/city/
+    state/zip) - they live at the same property, unlike a probate PR/heir who
+    usually doesn't. Billed identically to tracerfy_source: ~$0.02/record,
+    on misses too, deduped per unique person.
+    """
+    from tracerfy_skip_tracer import trace_contacts
+
+    by_uuid = {s["property_uuid"]: s for s in subjects}
+    contacts: list[dict] = []
+    index: dict[str, list[str]] = {}          # person_key -> [property_uuid, ...]
+    meta: dict[str, dict] = {}                 # property_uuid -> co_borrowers entry
+
+    for prop_uuid, co in co_borrowers.items():
+        subj = by_uuid.get(prop_uuid)
+        first, last = (co.get("first") or "").strip(), (co.get("last") or "").strip()
+        if not subj or not (first and last):
+            continue
+        meta[prop_uuid] = co
+        key = person_key(first, last)
+        if key in index:
+            index[key].append(prop_uuid)
+            logger.info("co_borrower: %s %s already queued (also on %s) - not billing twice",
+                        first, last, subj["property_address"])
+            continue
+        index[key] = [prop_uuid]
+        contacts.append({
+            "first_name": first, "last_name": last,
+            "address": subj.get("trace_street") or subj["property_address"],
+            "city": subj.get("trace_city") or subj["property_city"],
+            "state": subj.get("trace_state") or subj["property_state"],
+            "zip": subj.get("trace_zip") or subj["property_zip"],
+            "_key": key,
+        })
+
+    if not contacts:
+        return {}
+
+    dupes = sum(len(v) - 1 for v in index.values())
+    if dupes:
+        logger.warning("co_borrower: %d record(s) share a person with another - "
+                        "billing %d trace(s) instead of %d, saving $%.2f",
+                        dupes, len(contacts), len(contacts) + dupes, dupes * 0.02)
+
+    logger.warning("BILLED: submitting %d co-borrower/co-owner record(s) to "
+                    "Tracerfy (~$%.2f at $0.02/record)", len(contacts), len(contacts) * 0.02)
+    for c in contacts:
+        prop_uuid = index[c["_key"]][0]
+        subj = by_uuid[prop_uuid]
+        co = meta[prop_uuid]
+        logger.warning("  trace: %s %s @ %s, %s %s %s  [co-borrower/co-owner of %s, tag=%s]",
+                        c["first_name"], c["last_name"], c["address"], c["city"],
+                        c["state"], c["zip"], subj["name"], co.get("relationship") or "none")
+    for c in contacts:
+        c.pop("_key", None)
+
+    if dry_run:
+        logger.info("DRY RUN - not calling Tracerfy for co-borrowers/co-owners")
+        return {}
+
+    records = trace_contacts(contacts)
+    logger.info("co_borrower: %d record(s) returned", len(records))
+
+    people_by_subject: dict[str, list[dict]] = {}
+    for rec in records:
+        first = (rec.get("first_name") or "").strip()
+        last = (rec.get("last_name") or "").strip()
+        key = person_key(first, last)
+        prop_uuids = index.get(key) or []
+        if not prop_uuids:
+            logger.warning("co_borrower: result for %s %s matched no subject", first, last)
+            continue
+
+        phones = []
+        for field in _PHONE_FIELDS:
+            n = norm_phone(rec.get(field))
+            if n and not any(p["number"] == n for p in phones):
+                phones.append({"number": n, "sources": [SOURCE_TRACERFY],
+                               "type_raw": _phone_type_from_field(field),
+                               "tier": None, "score": None})
+        emails = [e for e in (rec.get(f) for f in _EMAIL_FIELDS) if e]
+
+        for prop_uuid in prop_uuids:
+            co = meta[prop_uuid]
+            people_by_subject.setdefault(prop_uuid, []).append({
+                "first": first, "last": last, "name": f"{first} {last}".strip(),
+                "key": key,
+                "relationship": co.get("relationship"),
+                "age": rec.get("age") or "",
+                "deceased": False,
+                "is_primary": False,
+                # `mail_address`, not `address` — see tracerfy_source().
+                "mailing_street": rec.get("mail_address") or rec.get("address") or "",
+                "mailing_city": rec.get("mail_city") or rec.get("city") or "",
+                "mailing_state": rec.get("mail_state") or rec.get("state") or "",
+                "mailing_zip": rec.get("mail_zip") or rec.get("zip") or "",
+                "sources": [SOURCE_TRACERFY],
+                "phones": [dict(p, sources=list(p["sources"])) for p in phones],
+                "emails": list(emails),
+            })
+    return people_by_subject
 
 
 # ── Adapter: Tracerfy -> the contract ─────────────────────────────────
@@ -411,9 +551,33 @@ def tracerfy_source(subjects: list[dict], *, dry_run: bool = True) -> dict[str, 
                 "age": rec.get("age") or "",
                 "deceased": False,
                 "is_primary": True,
-                "mailing_street": rec.get("address") or "",
-                "mailing_city": rec.get("city") or "",
-                "mailing_state": rec.get("state") or "",
+                # `mail_address` is preferred over `address` (which merely
+                # echoes the address we SUBMITTED), with a fallback to the
+                # echo.
+                #
+                # BUT BE CLEAR ABOUT WHAT TRACERFY ACTUALLY DOES, because this
+                # was got wrong once: **Tracerfy does not return a mailing
+                # address.** `mail_address` is an INPUT column on the upload
+                # CSV that we always send blank, and it comes back blank.
+                # Verified 2026-09-24 by re-downloading the raw result CSVs of
+                # 5 real jobs (Aug 13 - Sep 23, ~78 rows) straight from
+                # GET /v1/api/queues/: mail_address was empty in every row.
+                #
+                # A local file (output/foreclosure_records2_tracerfy_result
+                # .json) DOES show a populated, genuinely different
+                # mail_address (801 Elmwood Dr, Edmond vs property 2500 W Gary
+                # St). That file is NOT raw Tracerfy output -- the same job
+                # re-downloaded from Tracerfy shows both rows blank. It was
+                # augmented from some other source during an ad-hoc session.
+                # Do not cite it as evidence of vendor behaviour.
+                #
+                # So this preference is currently a no-op that costs nothing
+                # and is correct the day a provider does supply the field.
+                # `datasift_formatter` reads `mail_address` the same way.
+                "mailing_street": rec.get("mail_address") or rec.get("address") or "",
+                "mailing_city": rec.get("mail_city") or rec.get("city") or "",
+                "mailing_state": rec.get("mail_state") or rec.get("state") or "",
+                "mailing_zip": rec.get("mail_zip") or rec.get("zip") or "",
                 "sources": [SOURCE_TRACERFY],
                 "phones": [dict(p, sources=list(p["sources"])) for p in phones],
                 "emails": list(emails),
@@ -702,7 +866,10 @@ def score_phones(subjects: list[dict], *, dry_run: bool = True) -> dict[str, dic
     results: dict[str, dict] = {}
     for i, number in enumerate(sorted(unique), 1):
         try:
-            data = call_trestle(number, api_key) or {}
+            # add_litigator=True: the litigator/TCPA-plaintiff flag is a "do
+            # not call" signal, not an optional extra, so every scoring call
+            # requests it rather than leaving it behind an opt-in flag.
+            data = call_trestle(number, api_key, add_litigator=True) or {}
         except Exception as e:                    # noqa: BLE001 - never lose a batch to one number
             logger.warning("trestle: %s failed: %s", number, e)
             continue
@@ -710,11 +877,16 @@ def score_phones(subjects: list[dict], *, dry_run: bool = True) -> dict[str, dic
             logger.warning("trestle: %s -> %s", number, data["error"])
             continue
         score = data.get("activity_score")
+        litigator_risk = (data.get("add_ons", {}) or {}).get(
+            "litigator_checks", {}).get("phone.is_litigator_risk")
         results[number] = {
             "tier": assign_tier(score, DEFAULT_TIERS),
             "score": score,
             "type": (data.get("line_type") or "").title(),
+            "litigator_risk": bool(litigator_risk),
         }
+        if litigator_risk:
+            logger.warning("trestle: %s flagged as LITIGATOR RISK", number)
         if i % 25 == 0:
             logger.info("trestle: %d/%d", i, len(unique))
 
@@ -726,6 +898,7 @@ def score_phones(subjects: list[dict], *, dry_run: bool = True) -> dict[str, dic
                     ph["tier"] = r["tier"]
                     ph["score"] = r["score"]
                     ph["type_raw"] = ph["type_raw"] or r["type"]
+                    ph["litigator_risk"] = r["litigator_risk"]
     return results
 
 
@@ -1050,8 +1223,17 @@ def writeback(subjects: list[dict], *, sources: list[str],
 
                     tags = list(ph["sources"])
                     if ph.get("tier"):
-                        tags.append(ph["tier"])
                         scored_any = True
+                    if ph.get("litigator_risk"):
+                        # REPLACES the dial-tier tag, never sits beside it.
+                        # A "Dial First" tag next to "Litigator Risk" is still
+                        # a number a caller could pull off a Dial First list
+                        # by filtering on that tag alone — the whole point
+                        # here is that this number must never be called, so
+                        # it must never carry a callable-tier tag at all.
+                        tags.append(PHONE_TAG_LITIGATOR_RISK)
+                    elif ph.get("tier"):
+                        tags.append(ph["tier"])
                     if p.get("relationship") and not p["is_primary"]:
                         tags.append(p["relationship"])
                     elif (p["is_primary"] and rel_tag
@@ -1095,6 +1277,8 @@ def writeback(subjects: list[dict], *, sources: list[str],
                         result["skipped"].append({"street": s["property_address"],
                                                    "reason": f"phone tags: {e}"})
 
+            _write_mailing_address(s, result)
+
             tags = [TAG_TRACERFY_SKIPPED]
             if scored_any:
                 tags.append(TAG_TRESTLE_SCORED)
@@ -1117,11 +1301,86 @@ def writeback(subjects: list[dict], *, sources: list[str],
     return result
 
 
+def _write_mailing_address(subject: dict, result: dict) -> None:
+    """Persist the traced owner's real MAILING address to the CRM record.
+
+    Why this exists: records are created BEFORE they are traced (on purpose --
+    that is what routes every phone through the tagged path), so at creation
+    time no mailing address is known and `build_api_payload()` fills
+    `owner.address` with the PROPERTY address as a placeholder. The real
+    mailing address only becomes knowable once a skip trace returns, which is
+    here. Direct mail goes to this field, so leaving the placeholder means
+    mailing an absentee owner at a house they do not live in.
+
+    Tracerfy returns it as `mail_address` (NOT `address`, which merely echoes
+    what we submitted -- see tracerfy_source). Any future provider is expected
+    to supply the same thing; this reads the Person contract's
+    `mailing_street`, so a new source needs no change here.
+
+    TWO GUARDS, both deliberate:
+
+    1. Only ever overwrites the PLACEHOLDER. If the record's current mailing
+       address is anything other than the property address, it came from a
+       better source than a skip-trace vendor -- on probate that is the PR's
+       address off the court filing, i.e. the address the COURT itself mails
+       to. Never clobber that. This makes the function safe on probate without
+       needing to know the notice type.
+    2. Only the PRIMARY person's address. A co-borrower's mailing address
+       belongs to them, not to the record's owner.
+    """
+    owner_uuid = subject.get("owner_uuid")
+    primary = next((p for p in subject["people"] if p.get("is_primary")), None)
+    if not owner_uuid or not primary:
+        return
+
+    mail_street = (primary.get("mailing_street") or "").strip()
+    if not mail_street:
+        return
+
+    prop_street = (subject.get("property_address") or "").strip()
+    current = (subject.get("current_mail_street") or prop_street).strip()
+
+    # Guard 1: the record is not holding the placeholder -> a better source
+    # already filled it. Leave it alone.
+    if _api.address_key(current, "") != _api.address_key(prop_street, ""):
+        logger.info("mailing address: %s already has a non-placeholder mailing "
+                    "address (%r) - not overwriting with vendor data",
+                    subject.get("name"), current)
+        return
+
+    # Nothing to do when the vendor agrees with the placeholder.
+    if _api.address_key(mail_street, "") == _api.address_key(prop_street, ""):
+        return
+
+    addr = {
+        "street": mail_street,
+        "city": (primary.get("mailing_city") or "").strip(),
+        "state": (primary.get("mailing_state") or "").strip(),
+        "postal_code": (primary.get("mailing_zip") or "").strip(),
+    }
+    logger.warning("ABSENTEE: %s mails to %s, %s %s - not the property (%s)",
+                   subject.get("name"), addr["street"], addr["city"],
+                   addr["postal_code"], prop_street)
+    try:
+        res = _api.update_owner_address(owner_uuid, addr)
+    except _api.DataSiftAPIError as e:
+        logger.warning("mailing address write failed for %s: %s", owner_uuid, e)
+        result["skipped"].append({"street": prop_street,
+                                   "reason": f"mailing address: {e}"})
+        return
+    if res.get("ok") is False:
+        result["skipped"].append({"street": prop_street,
+                                   "reason": "mailing address did not land"})
+    else:
+        result["mailing_updated"] = result.get("mailing_updated", 0) + 1
+
+
 # ── The whole pipeline, in the order that was proven ──────────────────
 
 def run_pipeline(rows: list[dict], *, dry_run: bool = True,
                   use_tracerfy: bool = True, use_datasift: bool = True,
-                  score: bool = True) -> dict:
+                  score: bool = True,
+                  co_borrowers: dict[str, dict] | None = None) -> dict:
     """Resolve -> double skip trace -> score -> tag -> post. One call.
 
     This is the sequence verified end to end on a real foreclosure lead
@@ -1132,15 +1391,29 @@ def run_pipeline(rows: list[dict], *, dry_run: bool = True,
     `rows`: [{"street", "city", "first", "last"}]
 
     ORDER IS LOAD-BEARING:
-      1. resolve      - server-side address search, read-only
-      2. Tracerfy     - ~$0.02/record, billed on misses too
-      3. DataSift     - ~$0.12/owner, estimate-gated, async (up to ~2.5 min)
-      4. Trestle      - $0.015 per UNIQUE number, globally deduped
-      5. tags         - source + tier per phone, by TITLE
-      6. notes/board  - handled by the caller (petition text etc.)
+      1. resolve         - server-side address search, read-only
+      2. Tracerfy        - ~$0.02/record, billed on misses too
+      2b. co-borrowers   - a second named person at the SAME address (a
+                            co-borrower on the note, or a co-owner found on
+                            title), traced via Tracerfy the same way and
+                            merged in as a non-primary Person - see
+                            `co_borrowers` below. Optional; skipped entirely
+                            when not supplied.
+      3. DataSift        - ~$0.12/owner, estimate-gated, async (up to ~2.5 min)
+      4. Trestle         - $0.015 per UNIQUE number, globally deduped
+      5. tags            - source + tier (+ relationship, for non-primary
+                            people) per phone, by TITLE
+      6. notes/board     - handled by the caller (petition text etc.)
 
     Scoring must come AFTER both sources or the second source's numbers go
     untiered - or you pay Trestle twice.
+
+    `co_borrowers`: optional {property_uuid: {"first", "last", "relationship"}}
+    for a second named individual to trace at each listed property - e.g. a
+    spouse the petition names as a co-obligor, or a co-owner discovered on
+    title. `relationship` is an EXISTING account phone tag (Wife/Husband/
+    Relative/...) or None to leave their numbers untagged when nothing is
+    actually asserted. Never guessed here - the caller decides, per record.
 
     dry_run=True does everything free and bills nothing.
     """
@@ -1152,10 +1425,20 @@ def run_pipeline(rows: list[dict], *, dry_run: bool = True,
         logger.warning("run_pipeline: nothing resolved")
         return result
 
+    # co_borrowers not explicitly passed: pull it off each subject's own
+    # "co_borrower" field (set by resolve_subjects() from the row), so a
+    # caller only has to pass co-borrower columns through its rows.
+    if co_borrowers is None:
+        co_borrowers = {s["property_uuid"]: s["co_borrower"]
+                         for s in subjects if s.get("co_borrower")}
+
     by_source: dict[str, dict[str, list[dict]]] = {}
     if use_tracerfy:
         by_source[SOURCE_TRACERFY] = tracerfy_source(subjects, dry_run=dry_run)
         result["spend_estimate"] += len(subjects) * 0.02
+    if co_borrowers:
+        by_source["co_borrower"] = co_borrower_source(subjects, co_borrowers, dry_run=dry_run)
+        result["spend_estimate"] += len(co_borrowers) * 0.02
     subjects = merge_sources(subjects, by_source)
 
     if use_datasift:

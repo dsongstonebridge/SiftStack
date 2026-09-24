@@ -1044,7 +1044,7 @@ def _run_phone_validate(args) -> None:
         upload_tags=not getattr(args, "no_upload", False),
         api_key=config.TRESTLE_API_KEY or None,
         tiers=tiers,
-        add_litigator=getattr(args, "add_litigator", False),
+        add_litigator=getattr(args, "add_litigator", True),
         batch_size=getattr(args, "batch_size", 10),
         run_csv=run_csv,
     ))
@@ -1888,6 +1888,13 @@ def _trace_row(r: dict) -> dict | None:
         "last": (r.get("Owner Last Name") or r.get("Last Name")
                  or r.get("last") or "").strip(),
     }
+    co_first = (r.get("Co-Borrower First Name") or r.get("co_borrower_first") or "").strip()
+    co_last = (r.get("Co-Borrower Last Name") or r.get("co_borrower_last") or "").strip()
+    if co_first and co_last:
+        row["co_borrower_first"] = co_first
+        row["co_borrower_last"] = co_last
+        row["co_borrower_relationship"] = (r.get("Co-Borrower Relationship")
+                                            or r.get("co_borrower_relationship") or "").strip()
     for col in _PROBATE_TRACE_COLUMNS:
         v = r.get(col)
         if v is None:
@@ -3248,8 +3255,16 @@ def cli_main() -> None:
     )
     parser.add_argument(
         "--add-litigator",
+        dest="add_litigator",
         action="store_true",
-        help="Include litigator risk check in phone validation (phone-validate mode)",
+        default=True,
+        help="Include litigator risk check in phone validation (phone-validate mode, default: on)",
+    )
+    parser.add_argument(
+        "--no-litigator",
+        dest="add_litigator",
+        action="store_false",
+        help="Skip the litigator risk check (phone-validate mode)",
     )
     parser.add_argument(
         "--run-csv",

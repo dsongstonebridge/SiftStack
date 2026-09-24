@@ -260,6 +260,7 @@ run" below.
 | Buy box | `src/buy_box.py` | single-family at minimum; gates BEFORE creation |
 | Human check step | `src/batch_review.py` | BLOCK / WARN / EXCLUDE |
 | Assessor over plain HTTP | `tulsa_assessor.search_assessor()`, `get_parcel_situs()`, `get_parcel_improvements()` | no Playwright |
+| Assessor **owner mailing address** | Info page, regex `Owner Mailing Address</th>\s*<td...>` | spot-check tool, not a pipeline step |
 | Probate Notes / Message Board | `_PROBATE_SECTIONS`, `_NOTES_SECTION_SETS`, `_signing_chain_block()` | signing chain + mailing address |
 | Trace at the person's address | `resolve_subjects()` -> `trace_*` | probate never falls back to the property |
 | Repeat-PR dedupe | `tracerfy_source()` | billed once, credited to every record |
@@ -500,6 +501,25 @@ the rule against real ownership patterns, not guessed ones:
    PR/heir** — not just the decedent's own name. This is what makes Bitson
    pass.
 3. **New capability: sales-history lookup.**
+   **Owner mailing address (2026-09-24).** The county's mailing address — where
+   the tax bill physically goes, i.e. the authoritative absentee signal — is on
+   the **Info** page (`ASSESSOR_INFO_URL_HTTP`, already used for improvements
+   and sales history), matched by
+   `r'Owner Mailing Address\s*</th>\s*<td[^>]*>(.*?)</td>'` and split on `<br>`.
+   It is NOT on the search endpoint, whose `AccountMapDetails.OwnerAddress1`
+   etc. come back null and whose `Owners` array is empty — that dead end is
+   what made it look unavailable. **Match by PROPERTY ADDRESS, not owner name**:
+   that took coverage from 11/28 to 27/28 on a real batch. Fall back to
+   `"<Last>, <First>"` then `"<Last>"`, since the two strategies match
+   different subsets. **Comparison must drop directionals and ordinal
+   suffixes** or format variants read as false "different" (county
+   `9921 E 114 PL` vs our `9921 East 114th Place South` is the same parcel).
+   The endpoint 503s under load — retry with backoff, ~3s between records.
+   **Kept as a SPOT-CHECK tool, not a pipeline step** (too slow, rate-limited);
+   DataSift's owner enrichment supplies the mailing address in the pipeline.
+   Result on the 2026-09-22 batch: 26 of 27 genuinely owner-occupied, one real
+   absentee (Tipton -> `PO BOX 195`).
+
    `tulsa_assessor.get_parcel_sales_history()` parses the Assessor's real
    server-rendered "Sales/Documents" `<table>` (Grantor/Grantee/Sale
    Price/Deed Type/Document Number) — did not exist before this date. Scope to
@@ -812,6 +832,49 @@ carries the tag of the source that found it.
 between the two sources leaves the second source's numbers untiered, or pays
 Trestle twice.
 
+**TRACE THE CO-BORROWER TOO (build 2026-09-24).** A foreclosure petition
+routinely names a co-borrower spouse, and title sometimes carries a co-owner
+the filing does not. Only the first-named individual used to be traced, so the
+other decision maker — whose signature any voluntary sale needs — was never
+contacted. `skip_trace_agent.co_borrower_source()` traces a second named person
+at the SAME address through the same Tracerfy adapter and merges them in as a
+NON-primary Person, so `writeback()`'s existing relationship-tag path labels
+their numbers. Carried on rows as **`Co-Borrower First Name` / `Co-Borrower Last
+Name` / `Co-Borrower Relationship`**, read by `main._trace_row()`, so both
+`skip-trace` paths pick it up; `run_pipeline(co_borrowers=...)` also takes an
+explicit map. DataSift's own skip trace CANNOT reach them — it is scoped to the
+property's single registered owner — so a co-borrower's numbers only ever come
+from Tracerfy.
+
+Who qualifies (user's rule): **only where the filing clearly says spouse or
+co-borrower AND gives a name.** Gendered wording ("husband and wife") maps to
+the existing `Wife`/`Husband` phone tag; "married" or a bare co-obligor with no
+stated relationship gets **no relationship tag** rather than a guessed one —
+never invent a tag, they are append-only. Homestead-only defendants, ex-spouses
+and unrelated title-curative parties do NOT qualify. Ran live 2026-09-23: 11
+submitted, 5 returned, tags verified on the record. The county corroborated
+every co-owner identified (`ALEXANDER, RICHARD ALLAN & VIRGINIA`,
+`FRY, TYLER & BRITTANY`, `PEARSON, STEVEN WAYNE & GERALDINE`, ...).
+
+**TRACERFY DOES NOT RETURN A MAILING ADDRESS.** `mail_address` / `mail_city` /
+`mail_state` are INPUT columns on the upload CSV that we send blank and Tracerfy
+echoes back empty — confirmed by re-downloading five real jobs (Aug 13 – Sep 23,
+~78 rows), empty in every row. `tracerfy_source()` used to read `address` (the
+echo of what we SUBMITTED) into `mailing_street`; it now prefers `mail_address`,
+which is currently inert but correct if a provider ever supplies it. A local
+`output/*_tracerfy_result.json` showing a populated, genuinely different
+mail_address is NOT raw vendor output — the same job re-downloaded from Tracerfy
+is blank. **A file in `output/` is not evidence of vendor behaviour; check who
+wrote it before treating it as a measurement.**
+
+**Every past Tracerfy job is retrievable FREE, forever:**
+`GET https://tracerfy.com/v1/api/queues/` lists all jobs with `id`,
+`created_at`, `rows_uploaded`, `credits_deducted`, `trace_type` and a
+`download_url` to the full result CSV. `trace_contacts()` keeps no cache and
+throws its results away, but nothing is actually lost — never re-trace to
+recover a past run. Note `credits_deducted` < `rows_uploaded` is the real hit
+count (28 rows -> 24 credits).
+
 #### Capability status — do not assume beyond this table
 
 | Capability | State | Notes |
@@ -822,6 +885,7 @@ Trestle twice.
 | **DataSift skip trace** | **WORKS, SCOPED** | `properties` nested in `query.must` |
 | Skip-trace cost preview | **WORKS, FREE** | `estimate_skip_trace()` |
 | Trestle scoring + tiers | **WORKS** | 81/61/41/21; cached |
+| Litigator / TCPA risk | **WORKS, default ON** | `DO NOT CALL - Litigator Risk` **replaces** the dial tier |
 | Phone tags | **WORKS** | TITLES only; append-only, no removal endpoint |
 | Notes / Message Board | **WORKS** | notes must be a separate call from create |
 | Custom field values | **WORKS** | select/multiselect need OPTION uuids |
@@ -1086,7 +1150,7 @@ A second error compounded it: the follow-up A/B varied **two** things at once (b
 
 </details>
 
-- **An enrich endpoint DOES exist — and must not be called blind.** `POST /api/internal/property/enrich/` is real (corrects the earlier "no enrich endpoint exists" claim in this file). But its trigger contract is undocumented, and an empty POST reports a count of *every property in the account*. Guessing at it risks running **owner** enrichment account-wide, which would replace the personal representative on every probate record with the deceased owner of record and undo the entire point of the PR contact mapping. **SOLVED 2026-08-26 — enrichment is now API-scoped.** The contract was captured off DataSift's own web app with a Playwright route handler that ABORTED the request, the same technique that cracked the skip-trace payload. It is the identical shape: `{"query": {"must": {"property_type": "clean", "search": "<term>", "properties": ["<uuid>"]}, "ordering": ["-list_count"]}, "enrich_property": true, "enrich_owner": false, "replace_owner": false}` — ***`properties` nests inside `query.must`***, and an un-nested or empty list is what silently went account-wide. `datasift_api.enrich_properties()` refuses an empty list outright and pre-flights the same scoped query through the FREE skip-trace estimate, refusing if it matches more records than asked for. The endpoint echoes `{"count": N}`; `enrich_records()` treats a count that disagrees with the request as a failure. Verified live on 9 records: pre-flight said 9 (not the account's 962) and the response said `count: 9`. The three toggles are explicit booleans — `enrich_owner`/`replace_owner` default False and must stay False for probate. (Separately confirmed: DataSift does not auto-populate native valuation fields — `estimate_value`, `sqft`, `bedrooms` are `null` on create.)
+- **An enrich endpoint DOES exist — and must not be called blind.** `POST /api/internal/property/enrich/` is real (corrects the earlier "no enrich endpoint exists" claim in this file). But its trigger contract is undocumented, and an empty POST reports a count of *every property in the account*. Guessing at it risks running **owner** enrichment account-wide, which would replace the personal representative on every probate record with the deceased owner of record and undo the entire point of the PR contact mapping. **SOLVED 2026-08-26 — enrichment is now API-scoped.** The contract was captured off DataSift's own web app with a Playwright route handler that ABORTED the request, the same technique that cracked the skip-trace payload. It is the identical shape: `{"query": {"must": {"property_type": "clean", "search": "<term>", "properties": ["<uuid>"]}, "ordering": ["-list_count"]}, "enrich_property": true, "enrich_owner": false, "replace_owner": false}` — ***`properties` nests inside `query.must`***, and an un-nested or empty list is what silently went account-wide. `datasift_api.enrich_properties()` refuses an empty list outright and pre-flights the same scoped query through the FREE skip-trace estimate, refusing if it matches more records than asked for. The endpoint echoes `{"count": N}`; `enrich_records()` treats a count that disagrees with the request as a failure. Verified live on 9 records: pre-flight said 9 (not the account's 962) and the response said `count: 9`. The three toggles are explicit booleans. **Corrected 2026-09-24: `enrich_owner=True` on its own is a NO-OP; `replace_owner=True` is what actually writes** (the owner name AND the real mailing address). Both are now ON by default for non-probate, behind a per-record gate plus a name-restore pass — see "Enrich toggles" in the UI-automation section. They must still never run on probate, which the gate enforces. (Also corrected: DataSift DOES populate native valuation fields at create time — a freshly bulk-created throwaway carried `equity_percent` 100.00, `estimate_value` $293,000 and `mls` "Off Market" before any enrich call. The earlier "null on create" note was wrong. And the server drops a trailing directional on write: `2213 S Gary Ave E` → `2213 S Gary Ave`.)
 - **Select/multiselect custom fields need the OPTION's uuid, not its label** — 43 of this account's 80 custom fields. Sending a label 400s with `"... is not a valid UUID."`, and because the PATCH is a **batch**, one unresolvable value fails the whole request and costs that record *every other custom field with it*. `datasift_api.resolve_custom_field_value()` resolves label → option uuid and **skips + reports** unknown fields/options rather than guessing. Verification compares read-back values: the field uuid is nested at `item["custom_field"]["uuid"]` — **not** `field_uuid`, and not the row's own top-level `uuid`, either of which finds nothing and "verifies" a write that never landed.
 - **Custom fields are never auto-created.** `get_or_create_custom_field()` was removed from the upload path; it used to create ~46 fields defaulted to `field_type="text"` in a "SiftStack" group. The account's custom fields are deliberately curated, so nothing is created implicitly as a side effect of an upload. (The CRM itself is in scope as of 2026-08-21 — deliberate, explicit schema changes are fine; silent ones are not.) Unmatched labels now skip with a warning — the tradeoff being that columns without a matching field no longer land at all. Note that creating a `select` field requires its options **in the same POST**.
 - **No Sequence API** anywhere in the 323-path official spec or the endpoint index. `create_sold_sequence()` stays Playwright-only, permanently.
@@ -1125,7 +1189,7 @@ DataSift's niche sequential system uses filter presets to guide records through 
 
 After upload, the pipeline runs two DataSift actions, both ON by default when `--upload-datasift` is set:
 
-1. **Enrich Property Information** (REST API as of 2026-08-26, scoped — see the REST API section; `enrich_records_playwright()` kept as rollback): Adds SiftMap property data (beds, baths, Zestimate, sqft, sale history) to uploaded records. "Enrich Owners" and "Swap Owners" are OFF — protects our PR/DM contact mapping.
+1. **Enrich Property Information** (REST API as of 2026-08-26, scoped — see the REST API section; `enrich_records_playwright()` kept as rollback): Adds SiftMap property data (beds, baths, Zestimate, sqft, sale history) to uploaded records. **Owner enrichment is ON by default as of 2026-09-24, gated per record** — it is the only way to get a real mailing address, and the petition's person name is restored afterwards so nothing is lost. See "Enrich toggles" below.
 2. **Skip Trace** — see "THE WORKING PIPELINE" above. Scoped over the REST API; `properties` must be nested inside `query.must` or it goes account-wide. Always `estimate_skip_trace()` first. Runs asynchronously — verify via `has_phones`/`skiptraced` on a re-read or `datasift_api.get_skip_trace_stats()`, not the submit call's response alone.
 
    **THIS SPENDS REAL MONEY. Corrected 2026-08-21 — this file previously claimed an "unlimited plan ($97/mo)", which is wrong.** The account runs on **prepaid credits**, so every submitted record draws down a finite balance and an over-large or repeated submission is unrecoverable spend. Treat it as a billed action under the no-unapproved-spend rule: never submit speculatively, never submit test/throwaway records, and never re-submit a batch to "make sure" — check `skiptraced`/`has_phones` first. Note that `skip_trace` defaults to **True** in `upload_to_datasift()` and its variants, so an upload spends credits unless `--no-skip-trace` is passed. `submit_skip_trace()` logs the record count as billable before sending; there is no server-side balance check available, so the count in that log line is the only pre-flight signal.
@@ -1292,7 +1356,22 @@ See `_select_single_verified_record()`, `enrich_records()`, `skip_trace_records(
 
 **DataSift's search index lags behind a just-completed upload.** A record can read as "not found" immediately after upload and then show up correctly, address and all, after nothing more than a page reload. `verify_uploaded_records()` retries with a hard reload before treating a miss as a real mismatch — don't remove that retry to "simplify" the function; it's covering a real, confirmed CRM behavior, not defensive over-engineering.
 
-**Enrich toggles: Property Information ON, Enrich Owners OFF, Swap Owners OFF** (set 2026-08-21, matching Ty's `run_enrich_lists.py` exactly). Owner enrichment replaces our contact with DataSift's owner of record; on probate that is actively destructive, swapping the personal representative for the *deceased* owner and re-creating the recurring DM-contact bug. **This reverses the earlier ON/ON setting** from 2026-08-13/14, which came from trusting DataSift's ownership data over the pipeline's — sound for a living absentee owner, wrong for a deceased one. The absentee carve-out built for it (`_read_csv_absentee_flags()`) only ever protected the mailing address, never the PR mapping; it is now uncalled but deliberately kept, since it is the only structural absentee detector in the codebase. If owner enrichment is ever wanted again, scope it **per notice type** — ON for foreclosure/tax, never probate — not as a global default.
+**Enrich toggles — SUPERSEDED 2026-09-24. Owner enrichment is now ON by default, gated PER RECORD.** The 2026-08-21 setting was Property ON / Owners OFF / Swap OFF, on the reasoning that owner enrichment replaces our contact with DataSift's owner of record — actively destructive on probate, where it swaps the PR for the *deceased* owner. That reasoning still holds; what changed is that the destructive half is now prevented structurally instead of by leaving the whole feature off.
+
+What was established (throwaway records at properties whose true owner and mailing address were known in advance; both deleted afterwards, each with a 210-record control diff showing zero collateral change):
+
+- **`enrich_owner=True` alone is a NO-OP.** It changed nothing even on a record with a fake owner name and a placeholder mailing address. Two earlier "owner enrichment does nothing" conclusions came from this plus testing on owner-occupied records where the correct result was also "no change" — a worthless test.
+- **`replace_owner=True` is the toggle that actually writes**, and it wrote the county's exact owner (`Edward Slattery`) and exact mailing address (`Po Box 690240`).
+- **On trust-held title it is ADDITIVE, not destructive**: first/last survived while `company` gained the trust name and `type` became `trust`. That is a gain — it names who must actually sign — and is never undone.
+
+`upload_to_datasift(replace_owner=True)` is the default and is passed through to `enrich_records()`. Two protections make it monotonic ("only ever makes records BETTER" — the user's condition for enabling it):
+
+1. **`datasift_uploader.owner_replace_eligible(row)`** excludes probate, `Owner Deceased=yes`, `Owner Alive=No`, a named decedent, deceased/PR/survivorship wording in `Owner Status`, and an explicit `Owner Overridden` flag. Read off the row already in hand — **no per-record lookups** — and `enrich_records()` makes two batched calls instead of one. Gated records still get property enrichment. Gates exactly 2 of 28 on the 2026-09-22 batch (Kim, Hopkins).
+2. **`_restore_people()`** puts the petition's person back whenever the owner name changed at all, keeping the enriched mailing address, company and secondary owners. The petition names the *defendant being foreclosed on* — the person to reach — while the county may name a different co-owner (`BLEULER, SHERI & TIM ESTABROOK` vs our Timothy Estabrook). `update_owner_name(..., clear_company=False)` by default, so restoring the person does NOT strip the trust/LLC that enrichment added.
+
+**Net effect: mailing address, trust/LLC, secondary owners and property data are gained; the owner name never changes.** Caveat worth keeping honest: DataSift's mailing address is proven right on ONE record and looked stale on one (SiftMap showed the property address for Tipton where the county says `PO BOX 195`). Better than the placeholder either way, but "accurate" is a one-sample claim.
+
+`_read_csv_absentee_flags()` remains uncalled but is deliberately kept — still the only structural absentee detector in the codebase.
 
 ## REI Skill Library (13 Skills)
 
@@ -1320,6 +1399,7 @@ Distribution-ready Claude Co-Work skill files at `Skills for REI/improved/`. Eac
 
 These values are identical across all skills that reference them:
 - **Phone tiers:** 81-100 (Dial First), 61-80 (Dial Second), 41-60 (Dial Third), 21-40 (Dial Fourth), 0-20 (Drop)
+- **Litigator risk:** Trestle's `litigator_checks` add-on is requested on every scoring call (default ON, `--no-litigator` disables). A flagged number gets `DO NOT CALL - Litigator Risk` **INSTEAD OF** its dial-tier tag, never beside it — a "Dial First" tag next to a litigator flag would still let a tier-filtered call list pull the number, which defeats the point. Applied in both `skip_trace_agent.writeback()` and `phone_validator.write_datasift_tags_csv()`.
 - **Preset folders:** "00 Niche Sequential Marketing" (12 presets), "01. Bulk Sequential Marketing" (9 presets)
 - **Sequence count:** 26 TCA templates across 5 folders (Lead Management 6, Acquisitions 6, Transactions 6, Deep Prospecting 4, Default 4)
 - **Comp adjustments:** Bedroom $5,000, Bathroom $7,500, $/sqft $85, Age $500/yr (from `comp_analyzer.py`)

@@ -298,7 +298,7 @@ Rejections are reported, never silently dropped.
 
 **Second gate, after enrichment (`src/post_enrich_gate.py`, 2026-09-25).** The
 user does not buy a property that is **MLS-listed, under 15% equity, or sold
-within the last 3 years**. Those facts come from DataSift itself
+within the last 2 years** (3 until 2026-09-25). Those facts come from DataSift itself
 (`mls`, `equity_percent`, `last_sold` — populated at create time), so this runs
 in `_create_records_for_batch()` after `upload_to_datasift()` and before any
 trace: failures are DELETED from the CRM, dropped from the uuid map, never
@@ -742,14 +742,16 @@ rows out of that CSV yourself, or they get traced anyway.
 **The post-enrichment gate (2026-09-25) runs inside `--create`, so it
 applies to the dry run too.** Right after create + enrich it reads each record's
 `mls`, `equity_percent` and `last_sold`, and **deletes** any that is MLS-listed,
-under 15% equity, or sold within 3 years (see "Second gate, after enrichment"
+under 15% equity, or sold within 2 years (see "Second gate, after enrichment"
 in the probate buy-box section for the full rules). The run log's `FAILS THE
 BUY RULES AFTER ENRICHMENT` banner lists them. Those rows stay in the
 `datasift_ready_*.csv`, but the trace-only second step cannot bill them:
 `resolve_subjects()` finds no record and lists them as unresolved. On the
-2026-09-22 batch 6 of 28 would have been caught. Five of them (Quick, Vivas,
-Fry, Alexander, Watkins) are still in the CRM, pending the user's OK to delete.
-Dana Miller no longer fails: a re-enrich moved her equity from 14.81% to 36.35%.
+2026-09-22 batch 6 of 28 would have been caught at the time. Four of them
+still fail (Quick, Vivas, Fry, Alexander) and are still in the CRM, pending the
+user's OK to delete. Dana Miller no longer fails: a re-enrich moved her equity
+from 14.81% to 36.35%. Watkins no longer fails either: she sold 2024-09-20, just
+outside the 2-year window, and has 25.18% equity.
 
 Each record ends up in the CRM, API-enriched, with grouped petition detail in
 Notes *and* Message Board, double skip traced, every number scored with a dial
@@ -823,7 +825,7 @@ petition PDF (scanned)
   -> wait_for_properties()           poll until indexed; retry ONLY the missing
   -> add_notes + post_message_board  full petition detail, both surfaces
   -> add_tags                        Courthouse Data, foreclosure, FTM
-  -> enrich + post_enrich_gate       DELETE MLS-listed / equity<15% / sold<3yr
+  -> enrich + post_enrich_gate       DELETE MLS-listed / equity<15% / sold<2yr
   -> tracerfy_skip_tracer            source 1   ~$0.02/record
   -> datasift submit_skip_trace      source 2   ~$0.12/owner, estimate-gated
   -> phone_validator.call_trestle    score ALL numbers  $0.015 each

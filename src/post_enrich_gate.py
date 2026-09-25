@@ -4,7 +4,7 @@ The user's rules (2026-09-23): he does NOT buy a property that is
 
   1. **listed on the MLS**,
   2. carrying **less than 15% equity**, or
-  3. **sold within the last 3 years**.
+  3. **sold within the last 2 years** (was 3 until 2026-09-25; user widened the net).
 
 Such a record is deleted from the CRM and never skip traced.
 
@@ -59,7 +59,7 @@ from datetime import date, datetime
 logger = logging.getLogger(__name__)
 
 MIN_EQUITY_PERCENT = 15.0
-RECENT_SALE_YEARS = 3
+RECENT_SALE_YEARS = 2
 
 #: `mls` values that mean on the market. Only "listed" has been SEEN live
 #: (2026-09-25); the rest are the standard MLS statuses, excluded on the same

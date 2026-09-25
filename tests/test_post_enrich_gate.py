@@ -36,7 +36,8 @@ LIVE = {
 class CheckProperty(unittest.TestCase):
     def test_live_batch(self):
         fails = {k for k, p in LIVE.items() if check_property(p, today=TODAY)}
-        self.assertEqual(fails, {"Quick", "Vivas", "Fry", "Alexander", "Watkins"})
+        # Watkins (sold 2024-09-20) is just outside the 2-year window: passes on 25.18% equity
+        self.assertEqual(fails, {"Quick", "Vivas", "Fry", "Alexander"})
 
     def test_mls_positive_control(self):
         r = check_property(prop("n", "88.50", None, mls="Listed"), today=TODAY)
@@ -52,9 +53,9 @@ class CheckProperty(unittest.TestCase):
     def test_boundaries(self):
         self.assertEqual(check_property(prop("x", "15.00"), today=TODAY), [])
         self.assertTrue(check_property(prop("x", "14.99"), today=TODAY))
-        # exactly 3 years ago is outside the window; one day later is inside
-        self.assertEqual(check_property(prop("x", "50", "2023-09-25"), today=TODAY), [])
-        self.assertTrue(check_property(prop("x", "50", "2023-09-26"), today=TODAY))
+        # exactly 2 years ago is outside the window; one day later is inside
+        self.assertEqual(check_property(prop("x", "50", "2024-09-25"), today=TODAY), [])
+        self.assertTrue(check_property(prop("x", "50", "2024-09-26"), today=TODAY))
 
 
 class ApplyGate(unittest.TestCase):
@@ -83,8 +84,8 @@ class ApplyGate(unittest.TestCase):
 
     def test_deletes_failures_and_forgets_them(self):
         kept, excluded, deleted, forgotten = self.run_gate(LIVE)
-        self.assertEqual([r["Last Name"] for r in kept], ["Miller"])
-        self.assertEqual(sorted(deleted), ["a", "f", "q", "v", "w"])
+        self.assertEqual([r["Last Name"] for r in kept], ["Miller", "Watkins"])
+        self.assertEqual(sorted(deleted), ["a", "f", "q", "v"])
         self.assertEqual(sorted(forgotten), sorted(deleted))
         self.assertTrue(all(e["_gate_action"] == "deleted" for e in excluded))
 

@@ -748,8 +748,9 @@ BUY RULES AFTER ENRICHMENT` banner lists them. Those rows stay in the
 `datasift_ready_*.csv`, but the trace-only second step cannot bill them:
 `resolve_subjects()` finds no record and lists them as unresolved. On the
 2026-09-22 batch 6 of 28 would have been caught at the time. Four of them
-still fail (Quick, Vivas, Fry, Alexander) and are still in the CRM, pending the
-user's OK to delete. Dana Miller no longer fails: a re-enrich moved her equity
+still fail (Quick, Vivas, Fry, Alexander). **The user decided to KEEP them in
+the CRM (2026-09-25). Do not propose deleting them.** The gate is for new
+batches, not a cleanup tool for records already traced. Dana Miller no longer fails: a re-enrich moved her equity
 from 14.81% to 36.35%. Watkins no longer fails either: she sold 2024-09-20, just
 outside the 2-year window, and has 25.18% equity.
 

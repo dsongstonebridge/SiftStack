@@ -63,7 +63,9 @@ class PerRowGateTests(unittest.TestCase):
              mock.patch("batch_review.print_review", return_value=False), \
              mock.patch("datasift_formatter.build_datasift_csv_from_template",
                         side_effect=fake_build_csv), \
-             mock.patch("datasift_uploader.upload_to_datasift", side_effect=fake_upload):
+             mock.patch("datasift_uploader.upload_to_datasift", side_effect=fake_upload), \
+             mock.patch("post_enrich_gate.apply_post_enrich_gate",
+                        side_effect=lambda rows, **kw: (rows, [])):
             return main._create_records_for_batch(_args(), Path("fake_input.csv"))
 
     def test_no_blocks_creates_every_row(self):

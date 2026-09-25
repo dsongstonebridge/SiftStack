@@ -116,6 +116,18 @@ def _save_uuid_map_entries(entries: dict[str, str]) -> None:
     path.write_text(_json.dumps(current, indent=2), encoding="utf-8")
 
 
+def forget_uuid_map_entries(uuids: list[str]) -> None:
+    """Drop every map entry pointing at one of `uuids` (records deleted from
+    the CRM), so no later call resolves a key to a dead record."""
+    dead = set(uuids or [])
+    if not dead:
+        return
+    current = _load_uuid_map()
+    kept = {k: v for k, v in current.items() if v not in dead}
+    if len(kept) != len(current):
+        _uuid_map_path().write_text(_json.dumps(kept, indent=2), encoding="utf-8")
+
+
 async def upload_to_datasift(
     csv_path: Path,
     email: str | None = None,

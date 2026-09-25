@@ -2087,7 +2087,41 @@ def _create_records_for_batch(args, csv_path: Path) -> list[dict] | None:
             recorded = processed_cases.record_row(r, uuid=uuid)
             logging.info("ledger: recorded %s", ", ".join(recorded) or "(no case number)")
 
+    # ── POST-ENRICHMENT GATE: MLS-listed / equity < 15% / sold < 3 years ──
+    # Runs after create + enrich (the data comes from DataSift) and before any
+    # billed trace. Failures are deleted from the CRM and never traced. After
+    # the ledger on purpose: an excluded probate case must still count as
+    # processed, or tomorrow's run creates it again.
+    from datasift_api import delete_property, find_property_by_address, get_property
+    from datasift_uploader import forget_uuid_map_entries
+    from post_enrich_gate import apply_post_enrich_gate, describe as describe_gate
+
+    template_rows, gated = apply_post_enrich_gate(
+        template_rows, find_property=find_property_by_address,
+        get_property=get_property, delete_property=delete_property,
+        forget_uuids=forget_uuid_map_entries)
+    _report_post_enrich_exclusions(gated, describe_gate())
+    alive = [r for r in alive if r in template_rows]
+
     return [row for row in (_trace_row(r) for r in alive) if row]
+
+
+def _report_post_enrich_exclusions(gated: list[dict], criteria: str) -> None:
+    """Say loudly which records the post-enrichment gate took out, and what
+    happened to each. A removal that vanishes silently is indistinguishable
+    from one never seen."""
+    if not gated:
+        return
+    logging.warning("")
+    logging.warning("=== FAILS THE BUY RULES AFTER ENRICHMENT - NOT TRACED (%d) ===",
+                    len(gated))
+    for r in gated:
+        logging.warning("  %s %s | %s | %s",
+                        r.get("First Name") or "", r.get("Last Name") or "",
+                        r.get("Property Street") or "?", "; ".join(r["_gate_reasons"]))
+        logging.warning("      %s (%s)", r["_gate_action"], r.get("_gate_uuid") or "no uuid")
+    logging.warning("  %s", criteria)
+    logging.warning("")
 
 
 def _run_skip_trace(args) -> None:

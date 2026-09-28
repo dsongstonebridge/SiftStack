@@ -5,3 +5,4 @@
 *session*.json
 # Recordings, transcripts, reports: contain seller personal info
 output/
+__pycache__/

@@ -1,0 +1,8 @@
+{
+ "_note": "One entry per team member who dials. 'datasift_name' is the name DataSift shows on their calls. The rubric a call gets is decided by what is said on it, never by this list. Names only: this repo is public, so no emails or phone numbers here. Add a new hire by adding a line; move someone who leaves into 'exclude' to stop grading their calls.",
+ "callers": [
+  {"name": "Diego", "datasift_name": "Diego Hoemann", "usual_work": "cold calls + lead management"},
+  {"name": "Jeff", "datasift_name": "Jeff Hoemann", "usual_work": "closer"}
+ ],
+ "exclude": []
+}

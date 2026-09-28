@@ -150,6 +150,15 @@ def _is_entity_name(name: str) -> bool:
     return bool(_ENTITY_SUFFIXES.search(name))
 
 
+# Tokens that begin a multi-word surname. When one of these appears between the
+# first and last token, it and everything after it belong to the last name.
+_SURNAME_PARTICLES = {
+    "van", "von", "de", "del", "dela", "della", "di", "da", "das", "dos", "du",
+    "la", "le", "las", "los", "der", "den", "ter", "ten", "af", "av",
+    "mac", "mc", "st", "saint", "santa", "san", "bin", "ibn", "al", "el", "abu",
+}
+
+
 def _clean_and_split_name(full_name: str) -> tuple[str, str]:
     """Clean a full name for DataSift upload and split into (first, last).
 
@@ -202,6 +211,20 @@ def _clean_and_split_name(full_name: str) -> tuple[str, str]:
             # "John & Jane" with no last name → just use first person
             name = first_person
 
+    # Drop a trailing legal status word. The notice parser already does this,
+    # but records that arrive by CSV or photo import never pass through it, and
+    # "JOHN SMITH, DECEASED" splits to last name "Deceased" without it.
+    _status = {
+        "deceased", "decedent", "married", "unmarried", "single", "widow",
+        "widowed", "widower", "divorced", "person", "individually",
+        "et", "al", "etal", "etux", "ux",
+        "jr", "sr", "ii", "iii", "iv", "vi", "vii", "viii", "ix",
+    }
+    _parts = name.split()
+    while len(_parts) > 1 and _parts[-1].strip(",.").lower() in _status:
+        _parts.pop()
+    name = " ".join(_parts)
+
     # Strip remaining special characters that cause incomplete status
     name = re.sub(r"[&@#%]", "", name)
     # Collapse multiple spaces
@@ -216,10 +239,26 @@ def _clean_and_split_name(full_name: str) -> tuple[str, str]:
     if len(parts) >= 3:
         # Strip middle initials (single letter + optional period) from between
         # first and last name parts. "Eric J. Yopp" → "Eric Yopp"
-        # Keeps multi-char prefixes like "St." in "Richard C. St. Leger"
         middle = parts[1:-1]
         middle = [p for p in middle if not re.match(r"^[A-Za-z]\.?$", p)]
         parts = [parts[0]] + middle + [parts[-1]]
+
+    # Anything still between the first and last token is a SPELLED-OUT MIDDLE
+    # name, not part of the surname. "Eric Lee Sharp" was landing in DataSift as
+    # first="Eric", last="Lee Sharp", which breaks record matching, mail merge
+    # and every skip trace keyed on the surname.
+    #
+    # The exception is a surname particle: "Ann Van Buren" and "Maria De La Cruz"
+    # really do have multi-token surnames, so the particle and everything after
+    # it stays with the last name.
+    if len(parts) >= 3:
+        surname_start = len(parts) - 1
+        for i in range(1, len(parts) - 1):
+            if parts[i].lower().rstrip(".") in _SURNAME_PARTICLES:
+                surname_start = i
+                break
+        return (parts[0], " ".join(parts[surname_start:]))
+
     return (parts[0], " ".join(parts[1:]))
 
 
@@ -253,7 +292,11 @@ def _build_tags(notice: NoticeData) -> str:
     - DM confidence level (for deceased records)
     - has_auction if auction date is upcoming
     """
-    tags = ["Courthouse Data"]
+    # "Courthouse Data" signals first-to-market county data. "FTM" (First-to-Market /
+    # Tier 1) is the tag the ty+2 marketing template routes on: direct-from-county notice
+    # data is the FTM upload stream and must carry `FTM` to land in the FTM-CALL/FTM-MAIL
+    # folders (SiftMap/aggregated data is `Tier 2` instead). See the data-tier model.
+    tags = ["Courthouse Data", "FTM"]
 
     # Detect pre-probate obituary sources once — used in two places below.
     # These records are ahead of the court filing; they need different tags from
@@ -873,7 +916,11 @@ def _build_row(notice: NoticeData, notes_override: str | None = None) -> dict:
         "Notes": notes,
         # ── Built-in fields ──
         "Estimated Value": notice.estimated_value,
-        "MSL Status": notice.mls_status,
+        # BLANKED (bug 2026-06): the upload wizard auto-maps "MSL Status" to the reisift
+        # lead STATUS field, so a Zillow "sold"/"listed" AUCTION listing here wrongly stamped
+        # active foreclosures as sold and suppressed them from the cadence. MLS status is not
+        # needed for FTM cold outreach. Leave blank so the lead status is never set on import.
+        "MSL Status": "",
         "Last Sale Date": _format_date(notice.mls_last_sold_date),
         "Last Sale Price": notice.mls_last_sold_price,
         "Equity Percentage": notice.equity_percent,

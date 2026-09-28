@@ -108,19 +108,25 @@ def main() -> None:
     ap.add_argument("--months", type=int, default=12, help="Keyword search look-back window (months)")
     ap.add_argument("--force", action="store_true",
                     help="Re-capture even targets already on disk (e.g. to apply a new screenshot style)")
+    ap.add_argument("--no-scrape", action="store_true",
+                    help="Host already-captured PNGs only; skip scraping missing notices (no TNPN/captcha/proxy).")
     args = ap.parse_args()
 
-    if not config.CAPTCHA_API_KEY:
-        logger.error("CAPTCHA_API_KEY not set; needed to solve the notice gate.")
-        sys.exit(1)
-    if not (config.TNPN_EMAIL and config.TNPN_PASSWORD):
-        logger.error("TNPN_EMAIL / TNPN_PASSWORD not set.")
-        sys.exit(1)
-    proxy = _apify_proxy_url()
-    if not proxy:
-        logger.error("No residential proxy. Set APIFY_TOKEN or APIFY_PROXY_PASSWORD in .env.")
-        sys.exit(1)
-    logger.info("Residential proxy: proxy.apify.com:8000 (RESIDENTIAL, US)")
+    proxy = None
+    if not args.no_scrape:
+        if not config.CAPTCHA_API_KEY:
+            logger.error("CAPTCHA_API_KEY not set; needed to solve the notice gate.")
+            sys.exit(1)
+        if not (config.TNPN_EMAIL and config.TNPN_PASSWORD):
+            logger.error("TNPN_EMAIL / TNPN_PASSWORD not set.")
+            sys.exit(1)
+        proxy = _apify_proxy_url()
+        if not proxy:
+            logger.error("No residential proxy. Set APIFY_TOKEN or APIFY_PROXY_PASSWORD in .env.")
+            sys.exit(1)
+        logger.info("Residential proxy: proxy.apify.com:8000 (RESIDENTIAL, US)")
+    else:
+        logger.info("--no-scrape: hosting already-captured PNGs only (no TNPN/captcha/proxy).")
 
     csv_path = Path(args.csv) if args.csv else (Path(_newest_master()) if _newest_master() else None)
     if not csv_path or not csv_path.exists():
@@ -151,7 +157,7 @@ def main() -> None:
     # where a prior run left off (a long run through a residential proxy may not
     # finish every target in one pass).
     already = set() if args.force else {nid for nid in target_ids if _png_path(nid).exists()}
-    to_fetch = target_ids - already
+    to_fetch = set() if args.no_scrape else (target_ids - already)
     logger.info("Targets: %d total | %d already captured | %d to fetch",
                 len(target_ids), len(already), len(to_fetch))
 
@@ -227,18 +233,41 @@ def main() -> None:
     def _row_path(r: dict) -> str | None:
         return path_by_id.get(id_of[id(r)]) or path_by_kw.get(_akw(r.get("address", "")))
 
-    # Host on Drive if configured; otherwise the local path is the link.
-    folder, key = config.GOOGLE_DRIVE_FOLDER_ID, config.GOOGLE_SERVICE_ACCOUNT_KEY
-    drive_url: dict[str, str] = {}  # local path -> Drive link
+    # Host the proof image so the link travels with the lead. Prefer DROPBOX
+    # (permanent public share link -> direct-render URL, MMS-ready); fall back to
+    # Google Drive (private link), else the local path is the "link".
+    host_url: dict[str, str] = {}  # local path -> permanent public URL
     hosted = 0
-    if folder and key:
+    use_dropbox = bool(config.DROPBOX_REFRESH_TOKEN or os.getenv("DROPBOX_ACCESS_TOKEN"))
+    if use_dropbox:
+        from dropbox_uploader import upload_and_share, direct_url
+        try:
+            from dropbox_uploader import _get_client
+            dbx = _get_client()
+        except Exception:
+            logger.exception("Dropbox client init failed; screenshots will fall back to local paths")
+            dbx = None
+        if dbx is not None:
+            for r in rows:
+                p = _row_path(r)
+                if p and p not in host_url and Path(p).exists():
+                    link = upload_and_share(Path(p), f"/FTM Auction Notices/{Path(p).name}", dbx=dbx)
+                    if link:
+                        host_url[p] = direct_url(link)
+                        hosted += 1
+            try:
+                dbx.close()
+            except Exception:
+                pass
+    elif config.GOOGLE_DRIVE_FOLDER_ID and config.GOOGLE_SERVICE_ACCOUNT_KEY:
         from drive_uploader import upload_file
         for r in rows:
             p = _row_path(r)
-            if p and p not in drive_url and Path(p).exists():
-                link = upload_file(Path(p), folder, key, mimetype="image/png")
+            if p and p not in host_url and Path(p).exists():
+                link = upload_file(Path(p), config.GOOGLE_DRIVE_FOLDER_ID,
+                                   config.GOOGLE_SERVICE_ACCOUNT_KEY, mimetype="image/png")
                 if link:
-                    drive_url[p] = link
+                    host_url[p] = link
                     hosted += 1
 
     cols = list(rows[0].keys())
@@ -250,7 +279,10 @@ def main() -> None:
         p = _row_path(r)
         if p:
             r["notice_screenshot_path"] = p
-            r["notice_screenshot_url"] = drive_url.get(p, p)
+            # Only a real hosted http(s) URL belongs in the URL column; never push a
+            # local filesystem path to DataSift (it's meaningless there / not MMS-able).
+            u = host_url.get(p, "")
+            r["notice_screenshot_url"] = u if u.startswith("http") else ""
             got += 1
         else:
             r.setdefault("notice_screenshot_path", "")
@@ -264,8 +296,9 @@ def main() -> None:
 
     missed = [r.get("address", "?") for r in rows if not _row_path(r)]
     logger.info("")
-    logger.info("Backfill: %d/%d targets have screenshots (%d hosted on Drive).",
-                got, len(rows), hosted)
+    host_label = "Dropbox" if use_dropbox else ("Drive" if (config.GOOGLE_DRIVE_FOLDER_ID and config.GOOGLE_SERVICE_ACCOUNT_KEY) else "local")
+    logger.info("Backfill: %d/%d targets have screenshots (%d hosted on %s).",
+                got, len(rows), hosted, host_label)
     if missed:
         logger.warning("Still missing %d: %s", len(missed), ", ".join(missed))
     logger.info("Updated CSV: %s", out_path)

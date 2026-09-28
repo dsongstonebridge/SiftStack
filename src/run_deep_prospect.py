@@ -38,6 +38,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import config as cfg
 import enformion_heir as enf
+import scrapfly_browser as sbrowser
 from phone_validator import call_trestle, assign_tier, clean_phone, DEFAULT_TIERS
 from run_brice_st_skiptrace import tracerfy_lookup, parse_person
 
@@ -74,6 +75,36 @@ def _enformion_addresses(person: dict) -> list[str]:
     return out
 
 
+def _run_scrapfly_fallback(fallback_urls: str) -> None:
+    """L3 fallback: pull Cloudflare/JS-gated county + genealogy pages via Scrapfly ASP.
+
+    The Primary Path (Enformion) resolves most heirs, but title vesting, obituaries,
+    and court records live behind anti-bot walls that plain fetches and sandboxed
+    agent WebFetch fail on. Pass --fallback-urls to retrieve them in the same run.
+
+    Sweet spot: assessor/deed portals, FindAGrave/Legacy, court info pages. Hardened
+    people-search aggregators (TruePeopleSearch/FastPeopleSearch) often ban ASP, so
+    prefer Enformion for heirs and reach relatives through a known contact.
+    """
+    urls = [u.strip() for u in (fallback_urls or "").split(",") if u.strip()]
+    if not urls:
+        return
+    if not sbrowser.is_configured():
+        print("\n### Scrapfly fallback requested but SCRAPFLY_KEY not set - skipping")
+        return
+    print("\n" + BAR)
+    print(f"L3 FALLBACK - Scrapfly ASP fetch of {len(urls)} county/genealogy page(s)")
+    print(BAR)
+    client = sbrowser.ScrapflyBrowserClient()
+    for url in urls:
+        res = client.fetch(url)
+        if res.ok:
+            print(f"\n[OK] {url}\n  upstream={res.upstream_status} bytes={len(res.content)}")
+            print("  " + res.text[:1200])
+        else:
+            print(f"\n[FAIL] {url}\n  {res.blocked_reason or res.error} (upstream={res.upstream_status})")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Deep prospecting heir waterfall (one record)")
     ap.add_argument("--first", required=True, help="Deceased owner first name")
@@ -86,6 +117,9 @@ def main():
     ap.add_argument("--mail-city", default="")
     ap.add_argument("--mail-zip", default="")
     ap.add_argument("--max-signers", type=int, default=8, help="Cap paid per-signer searches")
+    ap.add_argument("--fallback-urls", default="",
+                    help="Comma-separated county/genealogy URLs to fetch via Scrapfly ASP "
+                         "(deed, obituary, court record) when the API path leaves gaps")
     args = ap.parse_args()
 
     if not enf.is_configured():
@@ -214,6 +248,9 @@ def main():
         print(f"  {c['name']} (dob {c['dob']}) — {c['address'] or 'address not found'}")
         if c["emails"]:
             print(f"     emails: {sorted(set(c['emails']))}")
+
+    # ── L3 fallback: Scrapfly ASP fetch of county / genealogy pages ────
+    _run_scrapfly_fallback(args.fallback_urls)
 
     n_calls = 1 + len(signers[:args.max_signers])
     print("\n" + BAR)

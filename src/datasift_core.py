@@ -180,19 +180,17 @@ async def login(page, email: str = None, password: str = None) -> bool:
         logger.error("Sign In click failed: %s", e)
         await screenshot(page, "login_signin_failed")
         return False
+    await page.wait_for_timeout(4000)  # allow auth to complete
 
-    # Wait for app to load (sidebar or dashboard content)
-    await page.wait_for_timeout(10000)
+    # The post-login default redirect can 404 (lands on /login rendering a 404 shell even
+    # though auth succeeded). Navigate to a known authenticated route and verify the
+    # session by whether we get bounced back to login.
+    await page.goto(DATASIFT_RECORDS_URL, wait_until="domcontentloaded")
+    await page.wait_for_timeout(4000)
     await screenshot(page, "login_after_signin")
-
-    # Check if we're still on the login page
-    current = page.url
-    if "/login" in current or "next=" in current:
-        # Check page content — sometimes URL stays /login but SPA loads dashboard
-        has_sidebar = await page.locator('text="Dashboard"').count()
-        if has_sidebar == 0:
-            logger.error("DataSift login failed — still on login page (url=%s)", current)
-            return False
+    if "/login" in page.url:
+        logger.error("DataSift login failed — still on login page (url=%s)", page.url)
+        return False
 
     await save_cookies(page)
     logger.info("DataSift login successful")

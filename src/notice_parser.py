@@ -16,6 +16,10 @@ instrument number by mistake.
 """
 
 import logging
+
+import html as _html_mod
+
+import config
 import re
 from dataclasses import dataclass
 from datetime import datetime
@@ -438,19 +442,75 @@ OWNER_PATTERNS = [
     re.compile(r"against\s+([A-Z][A-Za-z\s.]+?)(?:\s*,|\s+for\b|\s+at\b)", re.IGNORECASE),
 ]
 
-# Probate — personal representative / executor / administrator
-PROBATE_NAME_RE = re.compile(
-    r"(?:Personal\s+Representative(?:\(S\))?|Executor|Executrix|Administrator|Administratrix)"
-    r"[:\s]+([A-Z][A-Za-z\s.]+?)(?:\s*,|\s*\(|\s+of\b|\s+for\b|\s+\d|\s*$)",
-    re.IGNORECASE | re.MULTILINE,
-)
+# Probate, personal representative / executor / administrator.
+#
+# TRIED IN ORDER, and the order is the whole point. Knox "Notice to Creditors"
+# filings mention the role in PROSE first ("...were issued to the referenced
+# Personal Representative by the Chancery Court...") and only name the human
+# further down under a standalone heading:
+#
+#     PERSONAL REPRESENTATIVE(S)
+#     ERIC LEE SHARP
+#     806 SUNNYDALE ROAD
+#
+# A single same-line pattern matches the prose first and yields "By The Chancery
+# Court" as the owner, which is what shipped before this. The block form is
+# therefore checked first and the loose form is the fallback for the layouts
+# that really do put the name inline ("BY: LEE ROY MCMAHAN, Personal
+# Representative"). Every candidate still has to clear _is_valid_name.
+PROBATE_NAME_PATTERNS = [
+    # Heading on its own line, human name on the NEXT line.
+    re.compile(
+        r"^[ \t]*(?:Personal\s+Representative(?:\(S\))?|Executor|Executrix|"
+        r"Administrator|Administratrix)[ \t]*:?[ \t]*$\s*\n"
+        r"[ \t]*([A-Z][A-Za-z.'\-]+(?:\s+[A-Z][A-Za-z.'\-]+){1,3})[ \t]*$",
+        re.IGNORECASE | re.MULTILINE,
+    ),
+    # Name BEFORE the role: "BY: LEE ROY MCMAHAN, Personal Representative"
+    # and "IN RE: BRENT BAXLEY, Personal Representative".
+    re.compile(
+        r"([A-Z][A-Za-z.'\-]+(?:\s+[A-Z][A-Za-z.'\-]+){1,3})\s*,\s*"
+        r"(?:Personal\s+Representative|Executor|Executrix|Administrator|Administratrix)",
+        re.IGNORECASE,
+    ),
+    # Role then name on the same line, with an explicit separator.
+    re.compile(
+        r"(?:Personal\s+Representative(?:\(S\))?|Executor|Executrix|Administrator|Administratrix)"
+        r"\s*[:\-]\s*([A-Z][A-Za-z\s.'\-]+?)(?:\s*,|\s*\(|\s+of\b|\s+for\b|\s+\d|\s*$)",
+        re.IGNORECASE | re.MULTILINE,
+    ),
+]
 
-# Probate — decedent name from "Estate of [NAME], Deceased"
-DECEDENT_NAME_RE = re.compile(
-    r"Estate\s+of\s+([A-Z][A-Za-z\s.,'\-]+?)"
-    r"(?:\s*,?\s*(?:Deceased|Dec['\u2019.]?\s*d|who\s+died))",
-    re.IGNORECASE,
-)
+# Kept for callers/tests that import the old single-pattern name.
+PROBATE_NAME_RE = PROBATE_NAME_PATTERNS[-1]
+
+# Probate: decedent name. Tried in order.
+DECEDENT_NAME_PATTERNS = [
+    # "Estate of DORIS O. YOUNG, Deceased" / "...who died on April 13, 2026"
+    re.compile(
+        r"Estate\s+of\s+([A-Z][A-Za-z\s.,'\-]+?)"
+        r"(?:\s*,?\s*(?:Deceased|Dec['’.]?\s*d|who\s+died))",
+        re.IGNORECASE,
+    ),
+    # "ANY UNKNOWN HEIRS of LUCY ANN GLENN (deceased)". Service-by-publication
+    # notices never say "Estate of", so the anchor above misses them entirely
+    # and the decedent name fell through to the paid LLM pass.
+    re.compile(
+        r"([A-Z][A-Za-z.'\-]+(?:\s+[A-Z][A-Za-z.'\-]+){1,3})\s*[,(]\s*deceased\s*\)?",
+        re.IGNORECASE,
+    ),
+    # "IN RE: THE ESTATE OF JACK EUGENE MCMAHAN" with no trailing marker.
+    # ESATE is not a typo on our side: the county publishes that transposition
+    # often enough that anchoring only on the correct spelling drops notices.
+    re.compile(
+        r"(?:THE\s+)?ES[AT]{2}TE\s+OF\s+"
+        r"([A-Z][A-Za-z.'\-]+(?:\s+[A-Z][A-Za-z.'\-]+){1,3})",
+        re.IGNORECASE,
+    ),
+]
+
+# Kept for callers/tests importing the original single-pattern name.
+DECEDENT_NAME_RE = DECEDENT_NAME_PATTERNS[0]
 
 # Probate — PR mailing address (street + city + TN + zip after the PR title)
 # Anchors from the PR title keyword, skips over name/title (non-digit chars),
@@ -481,6 +541,21 @@ _INVALID_NAMES = {
     "all persons", "unknown heirs", "you in the", "you and",
     "the cause", "the following", "the undersigned",
     "executed a deed", "executed a d", "default having",
+    # Probate prose that reads like a name when a role keyword is matched
+    # mid-sentence ("issued to the referenced Personal Representative by the
+    # Chancery Court"). These shipped into DataSift as owner names.
+    "by the", "the chancery", "chancery court", "the clerk", "clerk and master",
+    "the referenced", "referenced personal", "the honorable", "honorable",
+    "the probate", "probate division", "the petitioner", "petitioner",
+    "the estate of", "said estate", "the decedent",
+    # Role words that survive trailing-status stripping as the WHOLE name
+    # ("GRANTEE, TRUSTEE" cleans to "Grantee"). Rejecting them here makes the
+    # capture fall through to the next pattern instead of shipping a role as
+    # a person: a staged month uploaded 7 owners named "Grantee Trustee".
+    "grantee", "grantees", "grantor", "grantors", "trustee", "trustees",
+    "borrower", "borrowers", "mortgagor", "mortgagors", "mortgagee",
+    "debtor", "debtors", "deceased", "decedent", "purchaser", "lender",
+    "beneficiary", "successor", "substitute trustee", "successor trustee",
 }
 
 
@@ -493,6 +568,14 @@ def _is_valid_name(name: str) -> bool:
         if lower.startswith(bad):
             return False
     if len(name) > 80 or len(name) < 3:
+        return False
+    # Nothing but filler and role words is not a name. Stripping the status word
+    # off "the borrower" leaves "The", which is long enough to pass every check
+    # above and short enough to look like a first name.
+    tokens = [t.strip(",.;:").lower() for t in lower.split() if t.strip(",.;:")]
+    if tokens and all(
+        t in _NAME_LEAD_STOPWORDS or t in _NAME_TRAIL_STOPWORDS for t in tokens
+    ):
         return False
     return True
 
@@ -737,18 +820,77 @@ async def parse_notice_html(
     notice_type: str,
     source_url: str,
     llm_api_key: str | None = None,
+    pdf_fetcher=None,
 ) -> NoticeData:
     """Parse a NoticeData from a rendered HTML string (Scrapfly backend).
 
     Mirrors parse_notice_page but sources the page text from an HTML string
-    instead of a live Playwright page. There is no embedded-PDF fallback (the
-    rendered HTML is what we have); the full-page screenshot still captures the
-    notice for the record.
+    instead of a live Playwright page.
+
+    The site caps the web display at 1,000 characters and puts the real notice in
+    an embedded PDF. Without recovering that PDF every record arrives as nothing
+    but the "Web display limited to..." disclaimer, the LLM extracts empty
+    fields, and foreclosure_filter drops the record as "no trustee sale
+    language" — a silent total loss. So this path gets the same PDF fallback the
+    Playwright path has, sourced from the HTML string.
     """
     notice = NoticeData(county=county, notice_type=notice_type, source_url=source_url)
     full_text = _html_to_text(html)
     notice_content = _extract_notice_content(full_text)
+
+    if notice_content and "Web display limited to" in notice_content:
+        pdf_text = _extract_pdf_text_from_html(html, source_url, pdf_fetcher)
+        if pdf_text:
+            notice_content = pdf_text
+
     return await _populate_notice(notice, full_text, notice_content, notice_type, llm_api_key)
+
+
+_PDF_SRC_RE = re.compile(
+    r'(?:iframe|embed|object|a)\b[^>]*?(?:src|data|href)\s*=\s*["\']([^"\']*\.pdf[^"\']*)["\']',
+    re.IGNORECASE,
+)
+
+
+def _extract_pdf_text_from_html(html: str, source_url: str, fetcher=None) -> str:
+    """Pull the embedded notice PDF referenced in `html` and return its text."""
+    m = _PDF_SRC_RE.search(html or "")
+    if not m:
+        return ""
+    pdf_url = _html_mod.unescape(m.group(1))   # href arrives with &amp;
+    if pdf_url.startswith("//"):
+        pdf_url = "https:" + pdf_url
+    elif pdf_url.startswith("/"):
+        from urllib.parse import urljoin
+        pdf_url = urljoin(source_url or config.BASE_URL, pdf_url)
+    elif not pdf_url.lower().startswith("http"):
+        from urllib.parse import urljoin
+        pdf_url = urljoin(source_url or config.BASE_URL, pdf_url)
+
+    logger.info("Found embedded notice PDF: %s", pdf_url[:120])
+    try:
+        if fetcher is not None:
+            content = fetcher(pdf_url)
+            if not content:
+                logger.warning("session PDF fetch returned nothing")
+                return ""
+        else:
+            import requests
+            resp = requests.get(pdf_url, timeout=45,
+                                headers={"User-Agent": "Mozilla/5.0"})
+            if resp.status_code != 200 or not resp.content:
+                logger.warning("PDF download failed: HTTP %s", resp.status_code)
+                return ""
+            content = resp.content
+        from io import BytesIO
+        from pdfminer.high_level import extract_text as pdfminer_extract
+        text = pdfminer_extract(BytesIO(content))
+        if text and len(text.strip()) > 100:
+            logger.info("PDF text extracted: %d chars", len(text))
+            return text.strip()
+    except Exception as e:
+        logger.warning("Embedded PDF extraction failed: %s", e)
+    return ""
 
 
 def _html_to_text(html: str) -> str:
@@ -919,6 +1061,17 @@ def _parse_address(notice: NoticeData) -> None:
          → secondary, used for tax sales (validated against blacklist)
       4. Give up — leave fields empty (better than grabbing wrong address)
     """
+    # A probate notice NEVER states the decedent's property address. The only
+    # street addresses in the body belong to the court, the attorney, or the
+    # PR's own mailing address, so any match here is guaranteed wrong: a live
+    # Knox notice yielded "400 W. Main Street", the Knox County courthouse,
+    # which would have uploaded the courthouse as the subject property. The
+    # property is resolved afterwards by property_lookup (Knox Tax API by
+    # decedent name -> executor family search -> people search), and the PR's
+    # mailing address is captured separately by _parse_pr_address.
+    if notice.notice_type == "probate":
+        return
+
     text = notice.raw_text.replace("\xa0", " ")
 
     # ── Strategy 1: Full context — indicator + address + city + TN + zip ──
@@ -1098,19 +1251,28 @@ def _parse_name(notice: NoticeData) -> None:
     text = notice.raw_text.replace("\xa0", " ")
 
     if notice.notice_type == "probate":
-        # Extract decedent name from "Estate of [NAME], Deceased"
-        dec_match = DECEDENT_NAME_RE.search(text)
-        if dec_match:
-            dec_name = _clean_name(dec_match.group(1))
-            if _is_valid_name(dec_name):
-                notice.decedent_name = dec_name
+        # Extract decedent name, first pattern that yields a real name wins.
+        for pattern in DECEDENT_NAME_PATTERNS:
+            matched = False
+            for m in pattern.finditer(text):
+                dec_name = _clean_name(m.group(1))
+                if _is_valid_name(dec_name):
+                    notice.decedent_name = dec_name
+                    matched = True
+                    break
+            if matched:
+                break
 
-        # Extract PR/Executor name
-        match = PROBATE_NAME_RE.search(text)
-        if match:
-            name = _clean_name(match.group(1))
-            if _is_valid_name(name):
-                notice.owner_name = name
+        # Extract PR/Executor name, first pattern that yields a real name wins.
+        # A pattern can match junk ("by the Chancery Court"), so a rejected
+        # candidate must fall through to the next pattern rather than end the
+        # search, which is what left owner_name set to a court's name.
+        for pattern in PROBATE_NAME_PATTERNS:
+            for m in pattern.finditer(text):
+                name = _clean_name(m.group(1))
+                if _is_valid_name(name) and name.lower() != (notice.decedent_name or "").lower():
+                    notice.owner_name = name
+                    return
         return
 
     # Foreclosure / tax sale / tax lien — "executed by" is the most common
@@ -1158,13 +1320,57 @@ def _parse_pr_address(notice: NoticeData) -> None:
         )
 
 
+# Words a name pattern can swallow when the notice runs a sentence straight into
+# the name: "...filed BY: From Felicia F. Coalson, Personal Representative..."
+# uploaded a PR literally called "From Felicia F. Coalson". Capitalized in the
+# source, so a capital-letter pattern cannot tell them from a first name.
+# Legal status words that follow a name rather than being part of it.
+# Suffixes (jr/sr/iii) are dropped too: DataSift matches on surname, and
+# "Lee Jr." as a last name fails every lookup keyed on "Lee".
+_NAME_TRAIL_STOPWORDS = {
+    "deceased", "decedent", "married", "unmarried", "single", "widow",
+    "widowed", "widower", "divorced", "person", "individual", "individually",
+    "trustee", "trustees", "grantor", "grantors", "grantee", "grantees",
+    "borrower", "borrowers", "mortgagor", "mortgagors", "debtor", "debtors",
+    "et", "al", "etal", "etux", "etvir", "ux", "vir",
+    "jr", "sr", "ii", "iii", "iv", "v", "vi", "vii", "viii", "ix", "x",
+    "and", "or", "his", "her", "their", "wife", "husband", "spouse",
+}
+
+_NAME_LEAD_STOPWORDS = {
+    "from", "to", "by", "in", "re", "and", "the", "vs", "v", "of", "for",
+    "with", "against", "petitioner", "respondent", "defendant", "plaintiff",
+    "estate", "notice", "that", "said", "undersigned", "referenced",
+}
+
+
 def _clean_name(raw: str) -> str:
-    """Normalize a name: trim, title-case, remove trailing conjunctions."""
+    """Normalize a name: trim, title-case, remove leading/trailing filler."""
     name = re.sub(r"\s+", " ", raw).strip()
-    # Remove trailing "And" / "and" (word-level — don't strip from "Bolland" etc.)
+    # Remove trailing "And" / "and" (word-level, don't strip from "Bolland" etc.)
     name = re.sub(r"\s+,?\s*(?:AND|and)\s*$", "", name)
     # Remove trailing commas, periods
     name = name.rstrip(",. ")
+
+    # Strip TRAILING status words. Deed and notice prose tacks a legal status
+    # onto the name ("JOHN SMITH, DECEASED", "PATRICIA JONES, MARRIED",
+    # "ROBERT LEE JR."), and the name patterns capture it. A live staged month
+    # shipped "John Deceased", "Patricia Married" and "Grantee Trustee" as
+    # owner names, which is what a mail merge would have greeted them as.
+    parts = name.split()
+    while len(parts) > 1 and parts[-1].lower().strip(",.") in _NAME_TRAIL_STOPWORDS:
+        parts.pop()
+    name = " ".join(parts).rstrip(",. ")
+
+    # Strip leading sentence words. Only ever removes a LEADING token and never
+    # the last one, so a real surname is untouchable even if it collides with a
+    # stopword ("Sarah In", "The Vs" are not names, but "Estate" as a surname
+    # would survive as the final token).
+    parts = name.split()
+    while len(parts) > 1 and parts[0].lower().strip(",.:;") in _NAME_LEAD_STOPWORDS:
+        parts.pop(0)
+    name = " ".join(parts)
+
     # Title-case
     name = name.title()
     return name

@@ -68,6 +68,11 @@ def _preflight_check(mode: str, searches: list[SavedSearch] | None = None) -> li
     enrichment_modes = scrape_modes | {"pdf-import", "photo-import", "dropbox-watch", "csv-import"}
     datasift_modes = {"manage-presets", "manage-sold", "phone-validate"}
 
+    # list-searches logs in to tnpublicnotice but never opens a notice, so it needs
+    # the site credentials without the CAPTCHA balance.
+    if mode == "list-searches":
+        if not config.TNPN_EMAIL or not config.TNPN_PASSWORD:
+            failures.append("TNPN_EMAIL / TNPN_PASSWORD not set (required for list-searches)")
     if mode in scrape_modes:
         # Only require TNPN creds when tnpn-source searches are in scope.
         # OK searches (OSCN, TinStar) are public and need no credentials.
@@ -375,7 +380,35 @@ async def actor_main() -> None:
             notices = run_enrichment_pipeline(notices, opts)
 
             if not notices:
-                Actor.log.warning("No notices found")
+                # A zero-notice run is a FAILURE, not a quiet success. This
+                # branch used to `return` before the Slack block below, so 13
+                # consecutive dead runs (2026-07-13 onward) reported nothing at
+                # all while Apify marked each one SUCCEEDED. Alert loudly and
+                # exit non-zero so the scheduler surfaces it.
+                Actor.log.error(
+                    "STALE RUN: 0 notices scraped. The upstream source is "
+                    "unreachable or its gate changed. Not a normal empty day."
+                )
+                if do_notify_slack and config.SLACK_WEBHOOK_URL:
+                    try:
+                        from slack_notifier import _send_webhook
+                        # Text first, URL second. These were reversed until
+                        # 2026-08-28, which bound the URL to `text` and posted the
+                        # message to a non-URL: requests raised, _send_webhook's
+                        # bare except swallowed it, and this alert had never once
+                        # fired. Exactly the class of silent failure it warns about.
+                        _send_webhook(
+                            ":rotating_light: *SiftStack scrape produced ZERO notices*\n"
+                            "Searches ran and completed, but nothing was captured. "
+                            "This is how the scrape sat broken for 19 days in July 2026 "
+                            "(reCAPTCHA -> Cloudflare Turnstile migration).\n"
+                            "Check: notice gate/CAPTCHA type, residential proxy, "
+                            "and whether detail pages return a logged-out shell.",
+                            config.SLACK_WEBHOOK_URL,
+                        )
+                    except Exception as exc:
+                        Actor.log.warning("Slack stale-run alert failed: %s", exc)
+                await Actor.fail(status_message="Zero notices scraped (stale run)")
                 return
 
             total = len(notices)
@@ -491,6 +524,19 @@ async def actor_main() -> None:
             try:
                 shots = [n for n in notices if getattr(n, "notice_screenshot_path", "")]
                 if shots:
+                    # Prefer DROPBOX (a PERMANENT public ?raw=1 link) so the auction
+                    # image travels with the lead forever; fall back to the Apify KVS
+                    # (ephemeral, ~7 days) per-image if Dropbox is unavailable.
+                    import config as _cfg
+                    use_dropbox = bool(_cfg.DROPBOX_REFRESH_TOKEN or os.environ.get("DROPBOX_ACCESS_TOKEN"))
+                    dbx = None
+                    if use_dropbox:
+                        try:
+                            from dropbox_uploader import upload_and_share, direct_url, _get_client
+                            dbx = _get_client()
+                        except Exception as e:
+                            Actor.log.warning("Dropbox init failed (%s); falling back to KVS screenshots", e)
+                            use_dropbox = False
                     if not kvs:
                         kvs = await Actor.open_key_value_store()
                     kvs_id = getattr(kvs, 'id', None) or getattr(kvs, '_id', '')
@@ -499,19 +545,47 @@ async def actor_main() -> None:
                         p = Path(n.notice_screenshot_path)
                         if not p.exists():
                             continue
-                        with open(p, "rb") as f:
-                            await kvs.set_value(p.name, f.read(), content_type="image/png")
-                        # Only publish a URL when we have a real store id; a blank
-                        # id would yield a 404 image. Degrade to local path (no
-                        # inline image) rather than a broken Slack image block.
-                        if kvs_id:
-                            n.notice_screenshot_url = (
-                                f"https://api.apify.com/v2/key-value-stores/{kvs_id}/records/{p.name}"
-                            )
-                        hosted += 1
-                    Actor.log.info("Hosted %d notice screenshots in KVS", hosted)
+                        url = ""
+                        if use_dropbox and dbx is not None:
+                            try:
+                                link = upload_and_share(p, f"/FTM Auction Notices/{p.name}", dbx=dbx)
+                                if link:
+                                    url = direct_url(link)
+                            except Exception as e:
+                                Actor.log.warning("Dropbox upload failed for %s: %s", p.name, e)
+                        if not url:  # KVS fallback (ephemeral ~7d)
+                            with open(p, "rb") as f:
+                                await kvs.set_value(p.name, f.read(), content_type="image/png")
+                            if kvs_id:
+                                url = f"https://api.apify.com/v2/key-value-stores/{kvs_id}/records/{p.name}"
+                        if url:
+                            n.notice_screenshot_url = url
+                            hosted += 1
+                    if dbx is not None:
+                        try:
+                            dbx.close()
+                        except Exception:
+                            pass
+                    Actor.log.info("Hosted %d notice screenshots (%s)", hosted,
+                                   "Dropbox" if use_dropbox else "KVS")
             except Exception as e:
                 Actor.log.warning("Notice screenshot hosting failed: %s, continuing", e)
+
+            # ── Re-write output.csv with screenshot URLs ───────────────
+            # write_csv ran BEFORE hosting, so the first output.csv lacked
+            # notice_screenshot_url. Re-write it now (the column is in SIFT_COLUMNS)
+            # so the permanent Dropbox URL flows: output.csv -> consolidate -> master
+            # -> filter -> upload -> reisift Notice Screenshot field + Notes.
+            try:
+                if any(getattr(n, "notice_screenshot_url", "") for n in notices):
+                    csv_path = write_csv(notices)
+                    if not kvs:
+                        kvs = await Actor.open_key_value_store()
+                    with open(csv_path, "rb") as f:
+                        await kvs.set_value("output.csv", f.read(), content_type="text/csv")
+                    Actor.log.info("Re-wrote output.csv with notice_screenshot_url populated")
+            except Exception as e:
+                Actor.log.warning("output.csv re-write failed: %s, continuing", e)
 
             # ── DataSift CSVs → KVS (manual upload) ─────────────────
             # Generate DataSift-formatted CSVs and save to Apify KVS
@@ -2877,7 +2951,7 @@ def cli_main() -> None:
     parser.add_argument(
         "mode",
         choices=[
-            "daily", "historical", "pdf-import", "photo-import", "dropbox-watch",
+            "daily", "historical", "list-searches", "pdf-import", "photo-import", "dropbox-watch",
             "csv-import", "phone-validate", "manage-sold", "manage-presets", "manage-list",
             "daily-obits", "skip-trace",
             # New analysis & workflow modes
@@ -2886,8 +2960,8 @@ def cli_main() -> None:
             "playbook",
         ],
         help=(
-            "daily/historical = scrape notices; daily-obits = pre-probate obituary leads; "
-            "pdf-import/photo-import = import from files; "
+            "daily/historical = scrape notices; list-searches = dump the live saved-search "
+            "dropdown labels; pdf-import/photo-import = import from files; "
             "dropbox-watch = poll Dropbox; csv-import = re-enrich CSV; "
             "phone-validate = Trestle scoring; manage-sold/manage-presets = DataSift ops; "
             "skip-trace = THE DataSift pipeline (dry run unless --commit): "
@@ -2938,6 +3012,14 @@ def cli_main() -> None:
         type=int,
         default=0,
         help="Stop after scraping this many notices (0 = no limit)",
+    )
+    parser.add_argument(
+        "--no-proxy",
+        action="store_true",
+        help=(
+            "Scrape from this machine's own IP. Only works from an IP the site "
+            "allows; most get 'not permitted to view public notices'."
+        ),
     )
     parser.add_argument(
         "--verbose", "-v",
@@ -3494,6 +3576,32 @@ def cli_main() -> None:
         sys.exit(1)
     logging.info("Preflight checks passed")
 
+    # ── Saved-search discovery ────────────────────────────────────────
+    # SAVED_SEARCHES labels must match the site's dropdown exactly; a typo
+    # scrapes zero notices and looks like an empty day. Verify, never guess.
+    if args.mode == "list-searches":
+        from proxy_resolver import describe as describe_proxy, resolve_proxy_url
+        from scraper import list_saved_searches
+        proxy_url = None if args.no_proxy else resolve_proxy_url()
+        logging.info("Egress: %s", "DIRECT (--no-proxy)" if args.no_proxy else describe_proxy())
+        labels = asyncio.run(list_saved_searches(proxy_url=proxy_url))
+        if not labels:
+            print("No saved searches found (login failed or dropdown missing).")
+            sys.exit(1)
+        configured = {s.saved_search_name for s in config.SAVED_SEARCHES}
+        print(f"\n{len(labels)} saved search(es) on tnpublicnotice.com:\n")
+        for label in labels:
+            mark = "[configured]" if label in configured else "[ not used  ]"
+            print(f"  {mark}  {label}")
+        missing = sorted(configured - set(labels))
+        if missing:
+            print("\nCONFIGURED BUT NOT ON THE SITE (these scrape nothing):")
+            for name in missing:
+                print(f"  !!  {name}")
+            sys.exit(1)
+        print()
+        return
+
     # ── New analysis & workflow modes ─────────────────────────────────
 
     if args.mode == "comp":
@@ -3596,7 +3704,6 @@ def cli_main() -> None:
         if not csv_path:
             print("ERROR: --csv-path required or place CSVs in output/")
             return
-        import asyncio
         from deep_prospector import run_deep_prospecting
         result = asyncio.run(run_deep_prospecting(
             csv_path=csv_path, depth=args.depth,
@@ -3791,8 +3898,14 @@ def _run_scrape_pipeline(args, searches) -> None:
             "Scraping %d TN saved search(es) via tnpublicnotice.com",
             len(tnpn_searches),
         )
+        # Egress first: the site refuses notice pages to unapproved IPs (upstream fix).
+        from proxy_resolver import describe as describe_proxy, resolve_proxy_url
+        proxy_url = None if getattr(args, "no_proxy", False) else resolve_proxy_url()
+        logging.info("Egress: %s", "DIRECT (--no-proxy)" if getattr(args, "no_proxy", False)
+                     else describe_proxy())
         tn_notices = asyncio.run(scrape_all(
             mode=args.mode, searches=tnpn_searches,
+            proxy_url=proxy_url,
             llm_api_key=config.ANTHROPIC_API_KEY or None,
             since_date_override=since_date,
             max_notices=args.max_notices,
@@ -4037,28 +4150,7 @@ def _run_scrape_pipeline(args, searches) -> None:
             # Trestle scoring deferred to phone-validate post-DataSift step
             # (see feedback-pipeline-order in memory)
 
-    # Host notice screenshots (proof-of-source) so the link travels with the
-    # record into DataSift (Notes + "Notice Screenshot" field). Uses Google
-    # Drive when configured, otherwise references the local PNG path.
-    try:
-        from notice_screenshot import (
-            host_screenshots_via_drive,
-            set_local_screenshot_urls,
-        )
-        captured = sum(1 for n in notices if n.notice_screenshot_path)
-        if captured:
-            hosted = host_screenshots_via_drive(
-                notices,
-                config.GOOGLE_DRIVE_FOLDER_ID,
-                config.GOOGLE_SERVICE_ACCOUNT_KEY,
-            )
-            local_only = set_local_screenshot_urls(notices)
-            logging.info(
-                "Notice screenshots: %d captured, %d hosted on Drive, %d local-only",
-                captured, hosted, local_only,
-            )
-    except Exception:
-        logging.exception("Notice screenshot hosting failed, continuing")
+    # Notice screenshots retired 2026-08-14 (see archive/notice_screenshots/).
 
     # Write output
     if args.split:
@@ -4168,9 +4260,12 @@ def _run_scrape_pipeline(args, searches) -> None:
 
 
 if __name__ == "__main__":
-    if os.environ.get("APIFY_IS_AT_HOME") or os.environ.get("APIFY_TOKEN"):
-        # Running inside Apify platform or with apify run
+    # APIFY_IS_AT_HOME is set only by the Apify platform itself. The old check
+    # also fired on APIFY_TOKEN, which lives in .env for consolidate_foreclosures
+    # to read past run artifacts, so every local `python src/main.py <mode>`
+    # silently ran the Actor instead of the CLI and died on "tn_username and
+    # tn_password are required". Set SIFTSTACK_FORCE_ACTOR=1 for `apify run`.
+    if os.environ.get("APIFY_IS_AT_HOME") or os.environ.get("SIFTSTACK_FORCE_ACTOR"):
         asyncio.run(actor_main())
     else:
-        # Standalone CLI
         cli_main()

@@ -1,5 +1,10 @@
 # Call Coaching (Tulsa Homebuyers)
 
+> **Status: built, PAUSED 2026-09-28.** Revisit when a caller is hired. Nothing
+> here spends money until `transcribe.py --commit`. To restart: add the
+> OpenRouter key to `.env`, add the new caller to `callers.json`, then run the
+> steps below.
+
 Scores the team's recorded smrtPhone calls against three rubrics and turns them
 into coaching: one report per call, one scorecard per caller, one Excel
 workbook. Built per person, so a new hire is one line in `callers.json`.

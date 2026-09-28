@@ -20,6 +20,9 @@ import urllib.request
 from cc_common import CALLS_JSON, REC_DIR, env, is_excluded, load_json, log, save_json
 
 SMRT_URL = "https://phone.smrt.studio/api/getRecordingUrl?call_sid={sid}"
+# Cloudflare in front of smrtPhone refuses Python's default user agent with
+# "Error 1010: Access denied" before the token is even checked (seen 2026-09-28).
+UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 
 
 def smrtphone_recording_url(sid: str) -> str | None:
@@ -27,17 +30,22 @@ def smrtphone_recording_url(sid: str) -> str | None:
     if not token:
         return None
     req = urllib.request.Request(SMRT_URL.format(sid=sid), method="POST",
-                                 headers={"X-Auth-smrtPhone": token, "accept": "application/json"})
+                                 headers={"X-Auth-smrtPhone": token, "accept": "application/json",
+                                          "user-agent": UA})
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
             raw = r.read().decode(errors="replace")
     except urllib.error.HTTPError as e:
         log(f"  smrtPhone lookup for {sid} failed: HTTP {e.code}")
         return None
+    # Verified responses: {"recordingUrl": "https://rec.smrtphone.io/RE....mp3"} on a hit,
+    # the bare string "Recording does not exist." (still HTTP 200) on a miss.
     try:
         data = json.loads(raw)
     except json.JSONDecodeError:
         data = raw
+    if isinstance(data, dict) and data.get("recordingUrl"):
+        return data["recordingUrl"]
     m = re.search(r"https?://[^\"'\s]+\.(?:mp3|wav)[^\"'\s]*", json.dumps(data) if not isinstance(data, str) else data)
     return m.group(0).replace("\\/", "/") if m else None
 

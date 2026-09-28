@@ -135,7 +135,7 @@ ANSWER_WHO = _env("SMS_AGENT_ANSWER_WHO", "1") not in ("0", "false", "no")
 # Daily campaign window, Eastern (Ty, 2026-08-11). The recipient-local quiet
 # hours above still apply on top: this is when WE work, that is when THEY may
 # be texted, and a send needs both.
-CAMPAIGN_TZ = _env("SMS_AGENT_CAMPAIGN_TZ", "America/New_York")
+CAMPAIGN_TZ = _env("SMS_AGENT_CAMPAIGN_TZ", "America/Chicago")  # Tulsa fork
 CAMPAIGN_START_HOUR = int(_env("SMS_AGENT_CAMPAIGN_START", "9"))
 CAMPAIGN_END_HOUR = int(_env("SMS_AGENT_CAMPAIGN_END", "18"))
 CAMPAIGN_ENABLED = _env("SMS_AGENT_CAMPAIGN", "0") not in ("0", "false", "no")

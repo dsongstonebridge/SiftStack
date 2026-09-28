@@ -17,7 +17,7 @@ load_dotenv()
 # timezone, not the server clock. The Apify cloud container runs in UTC, so a
 # naive datetime.now() stamps tomorrow's date on any evening run. Knox and
 # Blount County, TN operate on US Eastern.
-BUSINESS_TIMEZONE = os.getenv("BUSINESS_TIMEZONE", "America/New_York")
+BUSINESS_TIMEZONE = os.getenv("BUSINESS_TIMEZONE", "America/Chicago")  # Tulsa fork (upstream: America/New_York)
 
 
 def run_date() -> str:

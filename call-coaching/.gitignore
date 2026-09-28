@@ -1,0 +1,7 @@
+# Secrets
+.env
+# Browser login sessions (smrtPhone / Playwright storage state)
+*_state.json
+*session*.json
+# Recordings, transcripts, reports: contain seller personal info
+output/

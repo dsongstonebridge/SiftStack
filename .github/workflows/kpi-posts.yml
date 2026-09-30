@@ -61,7 +61,15 @@ jobs:
           SA_JSON: ${{ secrets.KPI_SERVICE_ACCOUNT_JSON }}
           SHEET_ID: ${{ secrets.KPI_SPREADSHEET_ID }}
         run: |
-          printf '%s' "$SA_JSON" > kpi-bot/service_account.json
+          missing=""
+          [ -z "$DATASIFT_API_KEY" ] && missing="$missing DATASIFT_API_KEY"
+          [ -z "$KPI_SLACK_WEBHOOK_URL" ] && missing="$missing KPI_SLACK_WEBHOOK_URL"
+          [ -z "$SHEET_ID" ] && missing="$missing KPI_SPREADSHEET_ID"
+          [ -z "$SA_JSON" ] && missing="$missing KPI_SERVICE_ACCOUNT_JSON"
+          if [ -n "$missing" ]; then echo "::warning::These repo secrets are empty or misnamed:$missing"; fi
+          # strip a Windows byte-order mark / stray whitespace, then check it is real JSON
+          printf '%s' "$SA_JSON" | python -c "import sys,json; t=sys.stdin.read().lstrip('\ufeff').strip(); json.loads(t) if t else None; open('kpi-bot/service_account.json','w').write(t)" \
+            || echo "::warning::KPI_SERVICE_ACCOUNT_JSON is not valid JSON - paste the whole service_account.json file, including the { } braces"
           printf 'KPI_SPREADSHEET_ID=%s\nKPI_SLACK_WEBHOOK_URL=%s\nKPI_SERVICE_ACCOUNT_FILE=service_account.json\nKPI_COMPANY_NAME=Tulsa Homebuyers\n' \
             "$SHEET_ID" "$KPI_SLACK_WEBHOOK_URL" > kpi-bot/.env
 

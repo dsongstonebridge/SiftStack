@@ -1574,7 +1574,7 @@ def verify_phone_tags(owner_uuid: str, number_to_tags: dict[str, list[str]]) -> 
 
 
 def apply_phone_tags_verified(owner_uuid: str, number_to_tags: dict[str, list[str]], *,
-                              retry_pause: float = 3.0) -> dict:
+                              retry_pause: float = 15.0) -> dict:
     """set_phone_tags() + verify_phone_tags(), with ONE automatic re-send for
     numbers that came back carrying NO tags at all.
 
@@ -1610,10 +1610,30 @@ def apply_phone_tags_verified(owner_uuid: str, number_to_tags: dict[str, list[st
         check["partial"] = partial
         return check
 
-    logger.warning("phone tags: %d number(s) came back with NO tags - re-sending once",
-                    len(empty))
+    # REFRESH FIRST (user, 2026-09-25: "when I'm doing it manually, it seems to
+    # be as simple as refreshing the page"). A brand-new number's tags can land
+    # a little after the first read (Copley, 2026-09-21). Wait, re-read, and
+    # re-send ONLY what is still genuinely empty - an unneeded re-send is
+    # harmless for an empty list, but the re-read usually makes it unneeded.
+    logger.warning("phone tags: %d number(s) read back with NO tags - re-reading in %.0fs",
+                    len(empty), retry_pause)
     time.sleep(retry_pause)
+    refreshed = verify_phone_tags(owner_uuid, number_to_tags)
+    if refreshed["ok"]:
+        refreshed.update(retried=[], partial=partial)
+        logger.info("phone tags: landed on re-read - all %d number(s) verified",
+                     len(number_to_tags))
+        return refreshed
+    on_record = refreshed.get("on_record") or {}
+    empty = {n: number_to_tags[n] for n in refreshed["missing"] if not on_record.get(n)}
+    if not empty:
+        refreshed.update(retried=[], partial={**partial, **refreshed["missing"]})
+        return refreshed
+
+    logger.warning("phone tags: %d number(s) still have NO tags - re-sending once",
+                    len(empty))
     set_phone_tags(empty)
+    time.sleep(retry_pause)
     again = verify_phone_tags(owner_uuid, number_to_tags)
     again.update(retried=sorted(empty), partial=partial)
     if again["ok"]:

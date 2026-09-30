@@ -118,6 +118,31 @@ def _phone_type_from_field(field: str) -> str:
 
 # ── Stage 3: resolve CRM records ──────────────────────────────────────
 
+def already_traced(rec: dict) -> list[str]:
+    """Evidence that this CRM record has ALREADY been through a billed trace.
+
+    The billed step is always the trace-only command, and nothing used to stop
+    it tracing the same record twice: a repeat pays Tracerfy + DataSift again
+    AND stamps `Pre-existing` beside every number's true source tag, which is
+    permanent (phone tags cannot be removed).
+
+    Only TRACE markers count - never phones alone. A number the user found by
+    hand (people search) can sit on the owner before any trace has run
+    (Copley, 2026-09-21), and that record still needs tracing.
+
+    Returns the markers found; empty means never traced.
+    """
+    found = []
+    titles = {(t.get("title") if isinstance(t, dict) else str(t)).strip().lower()
+              for t in (rec.get("tags") or []) if t}
+    if TAG_TRACERFY_SKIPPED.lower() in titles:
+        found.append(f"tag '{TAG_TRACERFY_SKIPPED}'")
+    owner = rec.get("owner") or {}
+    if owner.get("skiptraced") or int(owner.get("skiptrace_attempts") or 0) > 0:
+        found.append(f"DataSift skiptraced (attempts={owner.get('skiptrace_attempts') or 0})")
+    return found
+
+
 def resolve_subjects(rows: Iterable[dict]) -> tuple[list[dict], list[dict]]:
     """Map each input row to its CRM record and build the Subject shell.
 
@@ -224,6 +249,7 @@ def resolve_subjects(rows: Iterable[dict]) -> tuple[list[dict], list[dict]]:
             # court-filed PR address (never overwrite).
             "current_mail_street": (owner_addr.get("street") or "").strip(),
             "existing_phones": _existing_phones(rec),
+            "already_traced": already_traced(rec),
             "people": [],
             "has_results": False,
             # A second named person at this same property - a co-borrower on
@@ -1380,7 +1406,8 @@ def _write_mailing_address(subject: dict, result: dict) -> None:
 def run_pipeline(rows: list[dict], *, dry_run: bool = True,
                   use_tracerfy: bool = True, use_datasift: bool = True,
                   score: bool = True,
-                  co_borrowers: dict[str, dict] | None = None) -> dict:
+                  co_borrowers: dict[str, dict] | None = None,
+                  allow_retrace: bool = False) -> dict:
     """Resolve -> double skip trace -> score -> tag -> post. One call.
 
     This is the sequence verified end to end on a real foreclosure lead
@@ -1419,10 +1446,32 @@ def run_pipeline(rows: list[dict], *, dry_run: bool = True,
     """
     result: dict = {"subjects": [], "unresolved": [], "spend_estimate": 0.0}
 
+    import run_timer
+    _t = run_timer.start("trace: resolve records")
     subjects, unresolved = resolve_subjects(rows)
+    run_timer.stop(_t)
     result["unresolved"] = unresolved
+
+    # REPEAT GUARD: a record that has already been traced is never billed
+    # again unless the caller explicitly asks (allow_retrace). Checked here,
+    # after resolve, so BOTH the --create path and the trace-only path get it.
+    result["already_traced"] = []
+    if not allow_retrace:
+        fresh = []
+        for s in subjects:
+            if s.get("already_traced"):
+                result["already_traced"].append(
+                    {"name": s["name"], "street": s["property_address"],
+                     "uuid": s["property_uuid"], "evidence": s["already_traced"]})
+                logger.warning("ALREADY TRACED - skipped, nothing billed: %s at %s (%s)",
+                               s["name"], s["property_address"],
+                               "; ".join(s["already_traced"]))
+            else:
+                fresh.append(s)
+        subjects = fresh
     if not subjects:
-        logger.warning("run_pipeline: nothing resolved")
+        logger.warning("run_pipeline: nothing to trace (%d unresolved, %d already traced)",
+                       len(unresolved), len(result["already_traced"]))
         return result
 
     # co_borrowers not explicitly passed: pull it off each subject's own
@@ -1434,7 +1483,9 @@ def run_pipeline(rows: list[dict], *, dry_run: bool = True,
 
     by_source: dict[str, dict[str, list[dict]]] = {}
     if use_tracerfy:
+        _t = run_timer.start("trace: Tracerfy")
         by_source[SOURCE_TRACERFY] = tracerfy_source(subjects, dry_run=dry_run)
+        run_timer.stop(_t)
         result["spend_estimate"] += len(subjects) * 0.02
     if co_borrowers:
         by_source["co_borrower"] = co_borrower_source(subjects, co_borrowers, dry_run=dry_run)
@@ -1442,20 +1493,26 @@ def run_pipeline(rows: list[dict], *, dry_run: bool = True,
     subjects = merge_sources(subjects, by_source)
 
     if use_datasift:
+        _t = run_timer.start("trace: DataSift (incl. job wait)")
         ds = datasift_source(subjects, dry_run=dry_run)
+        run_timer.stop(_t)
         if ds:
             subjects = merge_sources(subjects, {SOURCE_DATASIFT: ds})
         result["spend_estimate"] += len(subjects) * 0.12
 
     if score:
+        _t = run_timer.start("score: Trestle")
         tiers = score_phones(subjects, dry_run=dry_run)
+        run_timer.stop(_t)
         result["tiers"] = tiers
         uniq = {ph["number"] for s in subjects for p in s["people"] for ph in p["phones"]}
         result["spend_estimate"] += len(uniq) * 0.015
 
     sources = [s for s in (SOURCE_TRACERFY if use_tracerfy else None,
                             SOURCE_DATASIFT if use_datasift else None) if s]
+    _t = run_timer.start("writeback: phones + tags + board")
     result["writeback"] = writeback(subjects, sources=sources, dry_run=dry_run)
+    run_timer.stop(_t)
     result["subjects"] = subjects
     logger.info("run_pipeline: %d subject(s), est. spend $%.3f%s",
                  len(subjects), result["spend_estimate"],

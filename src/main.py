@@ -2040,6 +2040,7 @@ def _create_records_for_batch(args, csv_path: Path) -> list[dict] | None:
     # ── ALREADY PROCESSED? (user, 2026-09-21) ────────────────────────────
     # Days will come when the Probates folder is not cleared. Catch a repeat
     # here, before any lookup, from the ledger of cases already created.
+    import run_timer
     if notice_type == "probate":
         import processed_cases
         template_rows, repeats = processed_cases.check_rows(template_rows)
@@ -2054,14 +2055,18 @@ def _create_records_for_batch(args, csv_path: Path) -> list[dict] | None:
     # the record exists and the user has the junk they asked us to prevent.
     if notice_type == "probate":
         logging.info("Probate: resolving property from the county assessor...")
+        _t = run_timer.start("lookups: Assessor/Treasurer/LOCCAT")
         template_rows = _enrich_probate_rows(template_rows)
+        run_timer.stop(_t)
         # Second net, now that addresses are known: a CRM record at the address
         # whose Notes carry the case number (covers cases created before the
         # ledger existed).
         import processed_cases
         from datasift_api import find_property_by_address, get_property
+        _t = run_timer.start("already-processed CRM check")
         template_rows, repeats = processed_cases.crm_check_rows(
             template_rows, find_property_by_address, get_property)
+        run_timer.stop(_t)
         _report_already_processed(repeats)
         if not template_rows:
             logging.error("Every row was already in the CRM - nothing to create.")
@@ -2140,6 +2145,10 @@ def _create_records_for_batch(args, csv_path: Path) -> list[dict] | None:
     upload_result = _asyncio.run(upload_to_datasift(
         csv_path=datasift_csv, enrich=True, skip_trace=False,
         mode="add", list_name=list_name, batch_tag="FTM",
+        # Owner replacement is for FORECLOSURE only. On probate it would swap
+        # the PR/heir we found for the deceased owner of record. This is the
+        # batch-level lock; owner_replace_eligible() is the per-row one.
+        replace_owner=(notice_type != "probate"),
     ))
     logging.info("DataSift upload: %s", upload_result.get("message", ""))
     if not upload_result.get("success"):
@@ -2170,10 +2179,12 @@ def _create_records_for_batch(args, csv_path: Path) -> list[dict] | None:
     from datasift_uploader import forget_uuid_map_entries
     from post_enrich_gate import apply_post_enrich_gate, describe as describe_gate
 
+    _t = run_timer.start("post-enrichment gate")
     template_rows, gated = apply_post_enrich_gate(
         template_rows, find_property=find_property_by_address,
         get_property=get_property, delete_property=delete_property,
         forget_uuids=forget_uuid_map_entries)
+    run_timer.stop(_t)
     _report_post_enrich_exclusions(gated, describe_gate())
     alive = [r for r in alive if r in template_rows]
 
@@ -2224,6 +2235,8 @@ def _run_skip_trace(args) -> None:
 
     from skip_trace_agent import run_pipeline
 
+    import run_timer
+    run_timer.reset()
     rows: list[dict] = []
     if getattr(args, "create", False):
         csv_path = getattr(args, "csv_path", None)
@@ -2262,12 +2275,20 @@ def _run_skip_trace(args) -> None:
     dry = not getattr(args, "commit", False)
     logger.info("skip-trace: %d record(s), %s", len(rows),
                 "DRY RUN (nothing billed)" if dry else "COMMIT - THIS SPENDS MONEY")
-    res = run_pipeline(rows, dry_run=dry)
+    res = run_pipeline(rows, dry_run=dry,
+                       allow_retrace=getattr(args, "allow_retrace", False))
 
     logger.info("resolved %d, unresolved %d, est. spend $%.3f",
                 len(res["subjects"]), len(res["unresolved"]), res["spend_estimate"])
     for u in res["unresolved"]:
         logger.warning("  unresolved: %s", _json.dumps(u)[:160])
+    if res.get("already_traced"):
+        logger.warning("ALREADY TRACED - %d record(s) skipped, nothing billed for them "
+                       "(pass --allow-retrace only if a second trace is really wanted):",
+                       len(res["already_traced"]))
+        for a in res["already_traced"]:
+            logger.warning("  %s at %s - %s", a["name"], a["street"], "; ".join(a["evidence"]))
+    run_timer.report()
     if dry:
         logger.info("Nothing was billed. Re-run with --commit to execute.")
 
@@ -3130,6 +3151,13 @@ def cli_main() -> None:
         help=("skip-trace: actually run it. WITHOUT this the run is a DRY RUN and "
               "bills nothing. Spends real money: Tracerfy ~$0.02/record, DataSift "
               "~$0.12/owner, Trestle ~$0.015/number."),
+    )
+    parser.add_argument(
+        "--allow-retrace", action="store_true",
+        help=("skip-trace: trace a record even though it has ALREADY been traced "
+              "(tag 'Tracerfy Skipped' or DataSift skiptraced). Off by default: a "
+              "repeat bills twice and stamps 'Pre-existing' beside every number's "
+              "true source tag, permanently."),
     )
     parser.add_argument(
         "--create", action="store_true",

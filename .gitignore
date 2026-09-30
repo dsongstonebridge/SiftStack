@@ -197,3 +197,14 @@ pb.html
 *.mp4
 # Windows artifact from a stray shell redirect.
 NUL
+
+# DataSift KPI bot secrets and logs
+kpi-bot/.env
+kpi-bot/service_account.json
+kpi-bot/run_log.txt
+
+# KPI engine reports (contain names/addresses) and logs
+kpi-engine/reports/
+kpi-engine/engine_log.txt
+kpi-engine/reisift_token.txt
+push_to_github.bat

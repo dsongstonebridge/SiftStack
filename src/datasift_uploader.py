@@ -211,14 +211,18 @@ async def upload_to_datasift(
         for rec in create_records:
             rec["tags"] = sorted(set(rec.get("tags", [])) | {batch_tag})
 
+    import run_timer
+    _t = run_timer.start("create: bulk-create submit")
     try:
         jobs = _api.bulk_create_properties(create_records)
     except _api.DataSiftAPIError as e:
+        run_timer.stop(_t)
         result["message"] = f"bulk-create failed: {e}"
         result["errors"] = len(rows)
         logger.error(result["message"])
         return result
 
+    run_timer.stop(_t)
     submitted = sum(j.get("total") or 0 for j in jobs)
     accepted = sum(j.get("accepted") or 0 for j in jobs)
     logger.info("bulk-create: %d job(s), submitted=%d accepted=%d",
@@ -227,7 +231,9 @@ async def upload_to_datasift(
     # ── 2. Wait for them to land, then 3. retry ONLY what is missing. ──
     wanted = [(p["address"].get("street"), p["address"].get("city"))
               for p in payload_by_key.values()]
+    _t = run_timer.start("create: wait for indexing")
     found = _api.wait_for_properties(wanted)
+    run_timer.stop(_t)
 
     missing = [p for p in payload_by_key.values() if _addr_key(p) not in found]
     if missing:
@@ -240,15 +246,18 @@ async def upload_to_datasift(
         if batch_tag:
             for rec in retry_records:
                 rec["tags"] = sorted(set(rec.get("tags", [])) | {batch_tag})
+        _t = run_timer.start("create: retry + wait (missing only)")
         try:
             _api.bulk_create_properties(retry_records)
             found.update(_api.wait_for_properties(
                 [(p["address"].get("street"), p["address"].get("city")) for p in missing]))
         except _api.DataSiftAPIError as e:
             logger.warning("retry bulk-create failed: %s", e)
+        run_timer.stop(_t)
 
     # ── 4. Per-record follow-up writes, keyed by resolved uuid. ──
     new_uuid_entries: dict[str, str] = {}
+    _t = run_timer.start("create: notes + board + custom fields")
     for row in rows:
         owner_last, street = _row_owner_street(row)
         key = _uuid_map_key(owner_last, street)
@@ -292,6 +301,7 @@ async def upload_to_datasift(
             result["skipped"].append({"owner": owner_last, "street": street,
                                        "reason": f"created ({prop_uuid}) but notes/custom-fields incomplete: {e}"})
 
+    run_timer.stop(_t)
     _save_uuid_map_entries(new_uuid_entries)
 
     result["success"] = result["records_uploaded"] > 0
@@ -313,8 +323,10 @@ async def upload_to_datasift(
         # anything whose owner we deliberately overrode are excluded, and the
         # petition's person name is restored afterwards, so the operation only
         # ever ADDS (mailing address, trust/LLC, secondary owners).
+        _t = run_timer.start("enrich (DataSift API)")
         result["enrich_result"] = await enrich_records(
             None, csv_path, enrich_owner=replace_owner, replace_owner=replace_owner)
+        run_timer.stop(_t)
         logger.info("Enrich: %s", result["enrich_result"].get("message"))
 
     # Scoped over the REST API — no browser. `skip_trace` still defaults to
@@ -1939,9 +1951,13 @@ async def enrich_records(page, csv_path: str | Path | list[str | Path], *,
             for group, repl in ((replace_uuids, True), (gated, False)):
                 if not group:
                     continue
+                # Gated records (probate, deceased owner, ...) get NO owner
+                # enrichment at all - not even enrich_owner alone, whose
+                # "no-op" behaviour was only ever tested on foreclosure-style
+                # records. Property data only.
                 part = _api.enrich_properties(
                     group, enrich_property=True,
-                    enrich_owner=True, replace_owner=repl,
+                    enrich_owner=repl, replace_owner=repl,
                     max_records=len(group),
                 ) or {}
                 resp["count"] += int(part.get("count") or 0)

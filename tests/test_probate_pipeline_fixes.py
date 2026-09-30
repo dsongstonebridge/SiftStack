@@ -148,6 +148,7 @@ class ApplyPhoneTagsVerifiedTests(_Offline):
     def test_resends_empty_numbers_once_and_verifies(self):
         want = {"111": ["Tracerfy", "Dial First"], "222": ["Tracerfy", "Drop"]}
         owners = [self._owner({"111": [], "222": []}),                  # first verify
+                  self._owner({"111": [], "222": []}),                  # re-read ("refresh")
                   self._owner({"111": want["111"], "222": want["222"]})]  # after re-send
         with mock.patch.object(api, "set_phone_tags") as st, \
              mock.patch.object(api, "get_owner", side_effect=owners), \
@@ -161,6 +162,7 @@ class ApplyPhoneTagsVerifiedTests(_Offline):
     def test_partially_tagged_number_is_never_resent(self):
         want = {"111": ["Tracerfy", "Dial First"], "222": ["Tracerfy", "Drop"]}
         owners = [self._owner({"111": ["Tracerfy"], "222": []}),
+                  self._owner({"111": ["Tracerfy"], "222": []}),
                   self._owner({"111": ["Tracerfy"], "222": want["222"]})]
         with mock.patch.object(api, "set_phone_tags") as st, \
              mock.patch.object(api, "get_owner", side_effect=owners), \
@@ -169,6 +171,18 @@ class ApplyPhoneTagsVerifiedTests(_Offline):
         self.assertEqual(st.call_args_list[1].args[0], {"222": want["222"]})
         self.assertEqual(res["partial"], {"111": ["Dial First"]})
         self.assertFalse(res["ok"])
+
+    def test_tags_that_land_late_are_found_by_reread_not_resent(self):
+        # The user's "just refresh the page": the first read is too early, the
+        # re-read 15s later shows every tag, so nothing is sent twice.
+        want = {"111": ["Tracerfy", "Dial First"]}
+        owners = [self._owner({"111": []}), self._owner({"111": want["111"]})]
+        with mock.patch.object(api, "set_phone_tags") as st,              mock.patch.object(api, "get_owner", side_effect=owners),              mock.patch.object(api.time, "sleep") as sl:
+            res = api.apply_phone_tags_verified("o1", want)
+        self.assertTrue(res["ok"])
+        self.assertEqual(st.call_count, 1)
+        self.assertEqual(res["retried"], [])
+        sl.assert_called_once_with(15.0)
 
     def test_clean_first_pass_sends_once(self):
         want = {"111": ["Tracerfy"]}

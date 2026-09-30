@@ -311,7 +311,11 @@ def pull(token: str, day_from: str, day_to: str, tz, bench: dict) -> dict:
                             bench["meaningful_conversation_min_seconds"],
                             bench["voicemail_max_seconds"])
     to_excl = (datetime.date.fromisoformat(day_to) + datetime.timedelta(days=1)).isoformat()
-    cand = search_updated(token, day_from, to_excl)
+    # Search from day_from through TODAY (not just the window): a record worked on the
+    # window's days but touched again since has a later "updated" stamp and would
+    # otherwise be missed. Events are still filtered to the window below.
+    today_excl = (datetime.datetime.now(tz).date() + datetime.timedelta(days=1)).isoformat()
+    cand = search_updated(token, day_from, max(to_excl, today_excl))
     log(f"{len(cand)} candidate records updated in window; fetching activity logs...")
 
     rec_events, rec_meta, rec_all = {}, {}, {}

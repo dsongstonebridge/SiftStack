@@ -1,0 +1,82 @@
+# Daily KPI Engine post + sheet fill (weekdays 6:30 PM Tulsa time) and the weekly
+# sheet-bot post (Fridays). Runs in GitHub's cloud, so the PC can be off.
+# Secrets (Settings > Secrets and variables > Actions):
+#   DATASIFT_API_KEY, KPI_SLACK_WEBHOOK_URL, KPI_SPREADSHEET_ID, KPI_SERVICE_ACCOUNT_JSON
+name: KPI posts
+
+on:
+  schedule:
+    - cron: "30 23 * * 1-5"   # 6:30 PM Central during daylight time (CDT)
+    - cron: "30 0 * * 2-6"    # 6:30 PM Central during standard time (CST, next UTC day)
+  workflow_dispatch:
+    inputs:
+      what:
+        description: "What to run"
+        type: choice
+        options: [daily, weekly-sheet-post, both]
+        default: daily
+
+concurrency: kpi-posts
+
+jobs:
+  kpi:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PYTHONIOENCODING: utf-8
+      DATASIFT_API_KEY: ${{ secrets.DATASIFT_API_KEY }}
+      KPI_SLACK_WEBHOOK_URL: ${{ secrets.KPI_SLACK_WEBHOOK_URL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Decide what runs (only at 6:30 PM Tulsa time for scheduled runs)
+        id: gate
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import datetime, os
+          from zoneinfo import ZoneInfo
+          now = datetime.datetime.now(ZoneInfo("America/Chicago"))
+          manual = os.environ["GITHUB_EVENT_NAME"] == "workflow_dispatch"
+          what = os.environ.get("WHAT", "daily")
+          on_time = (now.hour == 18) or (now.hour == 19 and now.minute < 30)
+          weekday = now.weekday() < 5
+          daily = (manual and what in ("daily", "both")) or (not manual and on_time and weekday)
+          weekly = (manual and what in ("weekly-sheet-post", "both")) or (not manual and on_time and now.weekday() == 4)
+          print(f"daily={'true' if daily else 'false'}")
+          print(f"weekly={'true' if weekly else 'false'}")
+          PY
+        env:
+          WHAT: ${{ github.event.inputs.what }}
+
+      - name: Install
+        if: steps.gate.outputs.daily == 'true' || steps.gate.outputs.weekly == 'true'
+        run: pip install gspread google-auth requests tzdata
+
+      - name: Write sheet credentials (from encrypted secrets; never committed)
+        if: steps.gate.outputs.daily == 'true' || steps.gate.outputs.weekly == 'true'
+        env:
+          SA_JSON: ${{ secrets.KPI_SERVICE_ACCOUNT_JSON }}
+          SHEET_ID: ${{ secrets.KPI_SPREADSHEET_ID }}
+        run: |
+          printf '%s' "$SA_JSON" > kpi-bot/service_account.json
+          printf 'KPI_SPREADSHEET_ID=%s\nKPI_SLACK_WEBHOOK_URL=%s\nKPI_SERVICE_ACCOUNT_FILE=service_account.json\nKPI_COMPANY_NAME=Tulsa Homebuyers\n' \
+            "$SHEET_ID" "$KPI_SLACK_WEBHOOK_URL" > kpi-bot/.env
+
+      - name: Fill the KPI sheet from DataSift
+        if: steps.gate.outputs.daily == 'true'
+        working-directory: kpi-engine
+        run: python fill_sheet.py
+        continue-on-error: true
+
+      - name: Post the daily KPI Engine summary
+        if: steps.gate.outputs.daily == 'true'
+        working-directory: kpi-engine
+        run: python pull_kpis.py --days 1 --slack auto
+
+      - name: Post the weekly sheet summary (Fridays)
+        if: steps.gate.outputs.weekly == 'true'
+        working-directory: kpi-bot
+        run: python kpi_slack_bot.py

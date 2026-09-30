@@ -208,3 +208,4 @@ kpi-engine/reports/
 kpi-engine/engine_log.txt
 kpi-engine/reisift_token.txt
 push_to_github.bat
+kpi-engine/manual_calls.csv

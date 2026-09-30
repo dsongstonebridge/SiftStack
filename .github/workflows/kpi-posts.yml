@@ -26,6 +26,7 @@ jobs:
       PYTHONIOENCODING: utf-8
       DATASIFT_API_KEY: ${{ secrets.DATASIFT_API_KEY }}
       KPI_SLACK_WEBHOOK_URL: ${{ secrets.KPI_SLACK_WEBHOOK_URL }}
+      SMRTPHONE_STATE: ${{ secrets.SMRTPHONE_STATE }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

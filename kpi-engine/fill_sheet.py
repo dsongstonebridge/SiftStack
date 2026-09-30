@@ -394,8 +394,28 @@ def main():
             k.log(f"{name} | {d} | {n} | " + ", ".join(f"{c}={int(x) if float(x).is_integer() else x}" for c, x in sorted(v.items()) if x))
     k.log(f"Leads Summary: {len(leads)} lead record(s)")
     sh = open_sheet(readonly=a.dry_run)
+    # smrtPhone (optional): SmrtDialer tab, true inbound counts, and real session hours
+    sd = {}
+    try:
+        import smrtphone_calls as sp
+        calls = sp.calls_since(days[0])
+        k.log(f"smrtPhone: {len(calls)} call(s) since {days[0]}")
+        sd = sp.smrtdialer_rows(calls, days)
+        for (user, day), row in sd.items():          # session hours beat first-to-last guesses
+            for tab in (f, l):
+                if (user, day) in tab:
+                    tab[(user, day)]["Hours"] = row["Session Duriation (hours)"]
+        inbound = {}
+        for c in calls:
+            if c["direction"] == "inbound" and c["day"] in days and c["duration"] > 0:
+                inbound[c["day"]] = inbound.get(c["day"], 0) + 1
+        for day, n in inbound.items():               # smrtPhone sees every inbound call
+            row = l.setdefault(("Inbound", day), {c: 0 for c in LM_COLS})
+            row["Inbound calls"] = max(row.get("Inbound calls", 0), n)
+    except Exception as ex:
+        k.log(f"smrtPhone skipped: {ex}")
     for tab, data, keys in (("First to Market", f, ["Ninja Name ", "Date"]), ("Lead Management", l, ["Name", "Date"]),
-                            ("Acquisition", q, ["Name", "Date"])):
+                            ("Acquisition", q, ["Name", "Date"]), ("SmrtDialer", sd, ["Caller", "Date"])):
         ws = sh.worksheet(tab)
         upsert(ws, data, keys, a.dry_run)
         delete_empty_rows(ws, keys, a.dry_run)

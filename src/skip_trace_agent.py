@@ -18,7 +18,7 @@ is currently a no-op. Leave both alone.
 
 To add a source later: write an adapter emitting `Subject`/`Person` as below,
 pass it in the `by_source` dict, and the merge, scoring and writeback need no
-changes. `skills/skip-trace-agent/scripts/directskip_trace.py` is kept in the
+changes. `drafts/skip-trace-agent/scripts/directskip_trace.py` is kept in the
 tree unmodified for exactly that purpose and is never called today.
 
 CONTRACT (matches his parse_smartskip.py output so his scripts stay drop-in)

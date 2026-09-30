@@ -79,7 +79,9 @@ jobs:
           fi
 
       - name: Tell Slack when the pull is not healthy
-        if: steps.probe.outputs.status != 'ok'
+        # Tulsa: no Fly FTM box is set up here (no FLY_API_TOKEN), so an
+        # unconfigured probe is expected and should not turn the run red daily.
+        if: steps.probe.outputs.status != 'ok' && steps.probe.outputs.status != 'unconfigured'
         env:
           SLACK_WEBHOOK: ${{ secrets.FTM_HEALTH_WEBHOOK }}
         run: |

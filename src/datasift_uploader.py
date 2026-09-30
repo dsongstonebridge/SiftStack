@@ -257,6 +257,7 @@ async def upload_to_datasift(
 
     # ── 4. Per-record follow-up writes, keyed by resolved uuid. ──
     new_uuid_entries: dict[str, str] = {}
+    board_posts: dict[str, str] = {}      # property uuid -> text posted to its board
     _t = run_timer.start("create: notes + board + custom fields")
     for row in rows:
         owner_last, street = _row_owner_street(row)
@@ -280,6 +281,7 @@ async def upload_to_datasift(
                 owner_uuid = (record.get("owner") or {}).get("uuid")
                 if owner_uuid:
                     _api.post_message_board(owner_uuid, payload["notes"])
+                    board_posts[prop_uuid] = payload["notes"]
 
             if payload["custom_fields"]:
                 _api.update_custom_field_values(prop_uuid, payload["custom_fields"])
@@ -328,6 +330,9 @@ async def upload_to_datasift(
             None, csv_path, enrich_owner=replace_owner, replace_owner=replace_owner)
         run_timer.stop(_t)
         logger.info("Enrich: %s", result["enrich_result"].get("message"))
+        _t = run_timer.start("enrich: re-check message boards")
+        _ensure_boards_after_enrich(board_posts, result)
+        run_timer.stop(_t)
 
     # Scoped over the REST API — no browser. `skip_trace` still defaults to
     # False because it is BILLED (prepaid credits, ~$0.12/owner) and the user's
@@ -338,6 +343,50 @@ async def upload_to_datasift(
         logger.info("Skip trace: %s", result["skip_trace_result"].get("message"))
 
     return result
+
+
+def _ensure_boards_after_enrich(board_posts: dict[str, str], result: dict) -> None:
+    """Re-read each record's Message Board after enrichment; re-post the SAME
+    text only where it is missing.
+
+    Found 2026-09-30: 3 of 20 foreclosure records ended with no petition
+    post on their board. The board is posted BEFORE
+    enrichment, and on exactly the records where replace_owner swapped the
+    owner's name or mailing address the post was gone afterwards -- most
+    likely left on the replaced owner. Property Notes were unaffected.
+
+    The post itself is unchanged: identical text, posted the same way. The
+    only visible difference on a repaired record is ordering (the petition
+    lands after anything posted in between). A post already present is never
+    duplicated -- the match ignores whitespace so a server-side reflow cannot
+    trigger a second copy.
+    """
+    if not board_posts or _api.is_dry_run():
+        return
+
+    def _norm(s: str) -> str:
+        return " ".join((s or "").split())
+
+    for prop_uuid, notes in board_posts.items():
+        want = _norm(notes)
+        try:
+            owner_uuid = ((_api.get_property(prop_uuid) or {}).get("owner") or {}).get("uuid")
+            if not owner_uuid:
+                continue
+            if any(_norm(m.get("message")) == want for m in _api.get_message_board(owner_uuid)):
+                continue
+            logger.warning("message board: petition post MISSING after enrichment on %s "
+                           "- re-posting the same text", prop_uuid)
+            _api.post_message_board(owner_uuid, notes)
+            ok = any(_norm(m.get("message")) == want
+                     for m in _api.get_message_board(owner_uuid))
+            result.setdefault("board_reposted", []).append({"uuid": prop_uuid, "verified": ok})
+            if not ok:
+                logger.error("message board: re-post on %s did NOT read back", prop_uuid)
+        except _api.DataSiftAPIError as e:
+            logger.error("message board re-check failed for %s: %s", prop_uuid, e)
+            result.setdefault("board_repost_failed", []).append(
+                {"uuid": prop_uuid, "error": str(e)})
 
 
 async def upload_datasift_split(

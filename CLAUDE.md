@@ -1693,7 +1693,56 @@ self-contained request — don't ask which folder or which command:
    trace-only from the `datasift_ready_*.csv` it wrote (and mind the Owner
    Alive gap below).
 4. Verify by reading records back: tags by TITLE, tiers against Trestle's own
-   `assigned_tag`.
+   `assigned_tag`, **and every Message Board** (see below). Say exactly what
+   was checked; a run is not "verified" until the boards are read.
+
+**Two methods, one-command rollback (2026-09-30).** The run above is the
+**9:29 method**, the proven one. The **9:30 method** only changes steps 1-2.
+Details, status and rollback are in `methods/README.md`.
+- **9:30 step 1:** `python src/batch_ocr.py` OCRs every page on 8 cores, caches
+  the text to `output/petition_ocr/` and flags cases already processed. Adopted.
+- **9:30 step 2:** the `petition-extractor` agent. PINNED: it failed its test,
+  so Claude still reads each petition itself from the cached text.
+- `python src/merge_petition_rows.py` turns hand-read JSON rows into the batch
+  sheet. It checks types, checks evidence quotes against the OCR, and catches
+  repeat cases. `--compare` diffs the Message Board text against a reference
+  sheet.
+
+**"Go back to the 9:29 method"** means: run `python methods/restore_0929.py`
+(puts the 9:29 skill back), then run it the old way. Do not argue for 9:30.
+The 9:29 code is also in git under the tag **`method-0929`** (commit 2a886e0).
+`git diff method-0929` shows everything changed since; only roll code back if
+the user asks. The new tools are separate files, and nothing in 9:30 touches
+the CRM.
+
+**Trace-only CSV gaps (both needed on 2026-09-30):**
+- `datasift_ready_*.csv` has no `Co-Borrower First/Last Name/Relationship`
+  columns, so add them back from the petition sheet or co-borrowers are never
+  traced.
+- The trace-only path ignores `Owner Alive` (see below), so drop those rows by
+  hand.
+
+**MESSAGE BOARDS: read every one back (2026-09-30).** On the 2026-09-30
+batch, 3 of 20 records had **no petition post** on
+their board. I had already reported the run as verified, having checked only
+phone tags. Property Notes were intact.
+- **Likely cause:** the board is posted *before* enrichment, and those were
+  exactly the records where `replace_owner` swapped the owner's name or
+  mailing address. The post most likely stayed on the replaced owner. This is
+  not proven, because owners carry no created time.
+- **Fix:** `upload_to_datasift()` now runs `_ensure_boards_after_enrich()`. It
+  re-reads each board through `datasift_api.get_message_board()` and re-posts
+  the same text only where it is missing. It never duplicates, and the layout
+  does not change. Offline tests: `tests/test_board_recheck.py`.
+- **Check after every run anyway:**
+  - Each record has exactly one petition post, equal to
+    `_format_petition_notes(row)`. A deceased-owner post starts with the
+    "OWNER DECEASED" note, and the petition text comes after it.
+  - Each traced record has exactly one phone summary, listing the numbers on
+    the record. A spouse's address line contains digits that are not phone
+    numbers.
+  - An untraced record has no summary.
+- **Read endpoint:** `GET /api/internal/owner/{uuid}/message/`.
 
 **The `Owner Alive` column is a real spend gate — confirmed live 2026-09-04**
 (it had been built 2026-08-18 and never exercised until then). A petition whose

@@ -875,6 +875,13 @@ def post_message_board(owner_uuid: str, message: str) -> dict:
                      json_body={"message": message})
 
 
+def get_message_board(owner_uuid: str) -> list[dict]:
+    """Every post on an owner's Message Board, newest first. Read-only.
+    Each item carries `message`, `created`, `author`, `uuid`."""
+    body = _request("GET", f"{CORE_BASE}/api/internal/owner/{owner_uuid}/message/?limit=100") or {}
+    return _page_items(body)
+
+
 # ── Custom fields ─────────────────────────────────────────────────────
 
 _custom_field_cache: dict[str, dict] = {}

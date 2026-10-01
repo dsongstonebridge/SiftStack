@@ -62,9 +62,11 @@ DEFAULT_BENCHMARKS = {
     "leads_per_caller_day": [2, 3],
     "leads_per_contract": [15, 20],
     "appointment_take_rate": 0.25,
-    # Jeff's rule: a lead counts only when it is QUALIFIED (Cold, Warm or Hot), same
-    # as the sheet's "New Leads Qualified". New Lead statuses are not counted.
-    "lead_statuses": ["Cold Lead", "Warm Lead", "Hot Lead"],
+    # Leads = any lead status, New Lead included (same set as the sheet's "New Leads").
+    # Qualified = Cold, Warm or Hot only (same as the sheet's "New Leads Qualified").
+    "lead_statuses": ["Cold Lead", "Warm Lead", "Hot Lead", "new_lead", "New Lead",
+                      "No Contact New Lead", "Nurture New Lead", "lead"],
+    "qualified_statuses": ["Cold Lead", "Warm Lead", "Hot Lead"],
     "excluded_callers": [],
 }
 
@@ -300,13 +302,14 @@ def blank():
     return {"dials": 0, "answered": 0, "noanswer": 0, "talk_seconds": 0, "sms_sent": 0,
             "sms_received": 0, "conversations": 0, "meaningful_conversations": 0,
             "band_vm": 0, "band_brief": 0, "voicemails": 0, "inbound_calls": 0, "correct_numbers": 0, "wrong_numbers": 0,
-            "dead_numbers": 0, "dnc_numbers": 0, "leads": 0, "not_interested": 0,
+            "dead_numbers": 0, "dnc_numbers": 0, "leads": 0, "qualified": 0, "not_interested": 0,
             "follow_ups": 0, "appointments": 0, "records": set(), "days": set(),
             "first_call": None, "last_call": None}
 
 
 def pull(token: str, day_from: str, day_to: str, tz, bench: dict) -> dict:
     lead_set = {s.lower() for s in bench["lead_statuses"]}  # case-insensitive: reisift mixes casings (Ty fix)
+    qual_set = {s.lower() for s in bench.get("qualified_statuses", ["Cold Lead", "Warm Lead", "Hot Lead"])}
     excluded = {e.lower() for e in bench["excluded_callers"]}
     conv_s, mean_s, vm_s = (bench["conversation_min_seconds"],
                             bench["meaningful_conversation_min_seconds"],
@@ -504,9 +507,11 @@ def pull(token: str, day_from: str, day_to: str, tz, bench: dict) -> dict:
     for uuid, (dt, ns, email) in prop_final.items():
         day = dt.date().isoformat()
         started = str((prop_first.get(uuid) or (None, ""))[1] or "").lower()
-        if ns.lower() in lead_set and started not in lead_set:   # newly qualified
+        if ns.lower() in lead_set and started not in lead_set:   # newly became a lead
             bump(email, day, "leads")
-        elif ns == "not_interested":
+        if ns.lower() in qual_set and started not in qual_set:   # newly Cold/Warm/Hot
+            bump(email, day, "qualified")
+        if ns == "not_interested":
             bump(email, day, "not_interested")
 
     # Manual additions: real calls DataSift never saw (e.g. an owner calling from a number
@@ -598,7 +603,7 @@ def render_md(res: dict, bench: dict) -> str:
            f"Meaningful 120s+: {a['meaningful_conversations']}",
            f"- Correct numbers: {a['correct_numbers']} ({pct(a['correct_numbers'], dials)} right-party)"
            f"  |  Wrong {a['wrong_numbers']}  Dead {a['dead_numbers']}  DNC {a['dnc_numbers']}",
-           f"- Leads (Cold/Warm/Hot): {a['leads']}  |  Not interested: {a['not_interested']}  |  "
+           f"- Leads: {a['leads']} (qualified Cold/Warm/Hot: {a['qualified']})  |  Not interested: {a['not_interested']}  |  "
            f"Follow-up tasks: {a['follow_ups']}  |  Appointments logged: {a['appointments']}",
            f"- Talk time: {fmt_hms(a['talk_seconds'])}  |  Texts: {a['sms_sent']} out / {a['sms_received']} in",
            "", "## By caller", "",
@@ -689,7 +694,7 @@ def post_slack(res: dict, webhook: str, bench: dict, note: str = "") -> None:
         f"• Conversations 60s+: *{a['conversations']}* ({pct(a['conversations'], dials)})  |  120s+: {a['meaningful_conversations']}",
         f"• Correct numbers: *{a['correct_numbers']}* ({pct(a['correct_numbers'], dials)})  |  Dials per correct: {dpc}",
         f"• Wrong {a['wrong_numbers']}  |  Dead {a['dead_numbers']}  |  DNC {a['dnc_numbers']}",
-        f"• Leads (Cold/Warm/Hot): *{a['leads']}*  |  Not interested: {a['not_interested']}  |  Follow-up tasks: {a['follow_ups']}",
+        f"• Leads: *{a['leads']}*  |  Qualified (Cold/Warm/Hot): *{a['qualified']}*  |  Not interested: {a['not_interested']}  |  Follow-up tasks: {a['follow_ups']}",
         f"• Talk time: {fmt_hms(a['talk_seconds'])}  |  Texts: {a['sms_sent']} out / {a['sms_received']} in",
     ]
     callers = [(e, c) for e, c in sorted(res["callers"].items(), key=lambda kv: -kv[1]["dials"])
@@ -700,7 +705,7 @@ def post_slack(res: dict, webhook: str, bench: dict, note: str = "") -> None:
             floor = bench["dials_floor_per_caller"] * len(c["days"])
             lines.append(f"• {res['names'].get(email, email)}: {c['dials']} dials, "
                          f"{c['conversations']} convos, {c['correct_numbers']} correct, "
-                         f"{c['leads']} leads — dial floor {'MET' if c['dials'] >= floor and floor else 'BELOW'}")
+                         f"{c['leads']} leads ({c['qualified']} qualified) — dial floor {'MET' if c['dials'] >= floor and floor else 'BELOW'}")
     r = urllib.request.Request(webhook, data=json.dumps({"text": "\n".join(lines)}).encode(),
                                headers={"content-type": "application/json"}, method="POST")
     with urllib.request.urlopen(r, timeout=15):

@@ -62,8 +62,9 @@ DEFAULT_BENCHMARKS = {
     "leads_per_caller_day": [2, 3],
     "leads_per_contract": [15, 20],
     "appointment_take_rate": 0.25,
-    "lead_statuses": ["Cold Lead", "Warm Lead", "Hot Lead", "new_lead", "New Lead",
-                      "No Contact New Lead", "Nurture New Lead"],
+    # Jeff's rule: a lead counts only when it is QUALIFIED (Cold, Warm or Hot), same
+    # as the sheet's "New Leads Qualified". New Lead statuses are not counted.
+    "lead_statuses": ["Cold Lead", "Warm Lead", "Hot Lead"],
     "excluded_callers": [],
 }
 
@@ -399,6 +400,8 @@ def pull(token: str, day_from: str, day_to: str, tz, bench: dict) -> dict:
 
     acct, per, daily = blank(), defaultdict(blank), defaultdict(blank)
     names, phone_final, prop_final, seen = {}, {}, {}, set()
+    prop_first = {}   # uuid -> (dt, status before the day's first change)
+    task_seen = set()
 
     def bump(email, day, field, amt=1):
         acct[field] += amt
@@ -472,6 +475,17 @@ def pull(token: str, day_from: str, day_to: str, tz, bench: dict) -> dict:
                     prev = prop_final.get(uuid)
                     if prev is None or dt >= prev[0]:
                         prop_final[uuid] = (dt, ns, author_of(ev)[0])
+                    first = prop_first.get(uuid)
+                    if first is None or dt < first[0]:
+                        prop_first[uuid] = (dt, new_status(ev, "property", 1 - s_idx))
+            elif et == "task.created":
+                # Jeff has no "follow up" status; follow-up work shows up as tasks
+                # (cold/warm/hot follow-up, hung up follow up, offer follow-up, ...)
+                task = (ev.get("payload") or {}).get("task") or {}
+                tk = task.get("uuid") or (uuid, task.get("title"), str(dt))
+                if "follow" in str(task.get("title") or "").lower() and tk not in task_seen:
+                    task_seen.add(tk)
+                    bump(author_of(ev)[0], day, "follow_ups")
             elif et == "task.completed":
                 title = (((ev.get("payload") or {}).get("task") or {}).get("title") or "").lower()
                 if any(k in title for k in ("appoint", "appt", "meeting", "consult")):
@@ -489,12 +503,11 @@ def pull(token: str, day_from: str, day_to: str, tz, bench: dict) -> dict:
             bump(email, day, "dnc_numbers")
     for uuid, (dt, ns, email) in prop_final.items():
         day = dt.date().isoformat()
-        if ns.lower() in lead_set:
+        started = str((prop_first.get(uuid) or (None, ""))[1] or "").lower()
+        if ns.lower() in lead_set and started not in lead_set:   # newly qualified
             bump(email, day, "leads")
         elif ns == "not_interested":
             bump(email, day, "not_interested")
-        elif ns == "follow_up":
-            bump(email, day, "follow_ups")
 
     # Manual additions: real calls DataSift never saw (e.g. an owner calling from a number
     # that wasn't on any record yet). One row per call in manual_calls.csv:
@@ -585,8 +598,8 @@ def render_md(res: dict, bench: dict) -> str:
            f"Meaningful 120s+: {a['meaningful_conversations']}",
            f"- Correct numbers: {a['correct_numbers']} ({pct(a['correct_numbers'], dials)} right-party)"
            f"  |  Wrong {a['wrong_numbers']}  Dead {a['dead_numbers']}  DNC {a['dnc_numbers']}",
-           f"- Leads: {a['leads']}  |  Not interested: {a['not_interested']}  |  "
-           f"Follow-ups: {a['follow_ups']}  |  Appointments logged: {a['appointments']}",
+           f"- Leads (Cold/Warm/Hot): {a['leads']}  |  Not interested: {a['not_interested']}  |  "
+           f"Follow-up tasks: {a['follow_ups']}  |  Appointments logged: {a['appointments']}",
            f"- Talk time: {fmt_hms(a['talk_seconds'])}  |  Texts: {a['sms_sent']} out / {a['sms_received']} in",
            "", "## By caller", "",
            "| Caller | Days | Dials | Dials/day | Live% | Convos | Correct | NI | Leads | Floor |",
@@ -676,7 +689,7 @@ def post_slack(res: dict, webhook: str, bench: dict, note: str = "") -> None:
         f"• Conversations 60s+: *{a['conversations']}* ({pct(a['conversations'], dials)})  |  120s+: {a['meaningful_conversations']}",
         f"• Correct numbers: *{a['correct_numbers']}* ({pct(a['correct_numbers'], dials)})  |  Dials per correct: {dpc}",
         f"• Wrong {a['wrong_numbers']}  |  Dead {a['dead_numbers']}  |  DNC {a['dnc_numbers']}",
-        f"• Leads: *{a['leads']}*  |  Not interested: {a['not_interested']}  |  Follow-ups: {a['follow_ups']}",
+        f"• Leads (Cold/Warm/Hot): *{a['leads']}*  |  Not interested: {a['not_interested']}  |  Follow-up tasks: {a['follow_ups']}",
         f"• Talk time: {fmt_hms(a['talk_seconds'])}  |  Texts: {a['sms_sent']} out / {a['sms_received']} in",
     ]
     callers = [(e, c) for e, c in sorted(res["callers"].items(), key=lambda kv: -kv[1]["dials"])

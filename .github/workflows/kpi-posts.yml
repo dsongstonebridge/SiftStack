@@ -116,7 +116,14 @@ jobs:
       - name: Fill the KPI sheet from DataSift
         if: steps.gate.outputs.daily == 'true'
         working-directory: kpi-engine
-        run: python fill_sheet.py
+        run: |
+          set -o pipefail
+          rc=0
+          python fill_sheet.py 2>&1 | tee fill_sheet.log || rc=$?
+          # Show the smrtPhone result as a public note on the run summary (no sign-in needed to read)
+          line=$(grep -m1 -o 'smrtPhone.*' fill_sheet.log | tr -d '\r' | cut -c1-200 || true)
+          echo "::notice title=smrtPhone::${line:-smrtPhone line not found}"
+          exit $rc
         continue-on-error: true
 
       - name: Post the daily KPI Engine summary

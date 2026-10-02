@@ -114,10 +114,13 @@ jobs:
       - name: Fill the KPI sheet from DataSift
         if: steps.gate.outputs.daily == 'true'
         working-directory: kpi-engine
+        env:
+          DAY: ${{ github.event.inputs.date }}
         run: |
           set -o pipefail
           rc=0
-          python fill_sheet.py 2>&1 | tee fill_sheet.log || rc=$?
+          # A date in the Run workflow box refills the sheet from that day onward too
+          python fill_sheet.py ${DAY:+--since "$DAY"} 2>&1 | tee fill_sheet.log || rc=$?
           # Show the smrtPhone result as a public note on the run summary (no sign-in needed to read)
           line=$(grep -m1 -o 'smrtPhone.*' fill_sheet.log | tr -d '\r' | cut -c1-200 || true)
           echo "::notice title=smrtPhone::${line:-smrtPhone line not found}"

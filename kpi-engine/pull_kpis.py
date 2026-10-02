@@ -718,6 +718,21 @@ def _sp_is_talk(c: dict, marked_correct: set, marked_wrong: set,
     return "owner"                                       # Correct, Not interested, Lead, Callback...
 
 
+def _sp_miss_reason(c: dict, kind) -> str:
+    """Why a smrtPhone call was left out of 'reached' (Jeff, 2026-10-02: audit line)."""
+    d = str(c["disposition"]).lower()
+    if str(c["status"]).lower() not in ("completed", "answered", ""):
+        return f"call status {c['status']}"
+    if kind == "vm":
+        return "same-day VM/no answer note on the record"
+    for w in ("no answer", "dead", "busy"):
+        if w in d:
+            return f"dispositioned {c['disposition']}"
+    if d in ("", "no disposition"):
+        return "no disposition and number not marked Correct/Wrong in DataSift"
+    return "not counted"
+
+
 def add_smrtphone(res: dict, day_from: str, day_to: str, bench: dict) -> None:
     res["call_source"] = "DataSift only"
     try:
@@ -735,11 +750,15 @@ def add_smrtphone(res: dict, day_from: str, day_to: str, bench: dict) -> None:
     conv_s, mean_s, vm_s = (bench["conversation_min_seconds"],
                             bench["meaningful_conversation_min_seconds"], bench["voicemail_max_seconds"])
     out_dials = 0
+    missed = []                                          # 2 min+ calls left out of "reached"
     for c in calls:
         if c["direction"] == "outbound":
             out_dials += 1
         kind = _sp_is_talk(c, res.get("marked_correct", set()), res.get("marked_wrong", set()),
                            res.get("vm_note_days", set()), res.get("num_recs", {}))
+        if c["duration"] >= mean_s and kind in (None, "vm"):
+            missed.append({"when": c["when"], "duration": c["duration"], "direction": c["direction"],
+                           "number": _digits10(c["number"]), "reason": _sp_miss_reason(c, kind)})
         if kind == "vm" or (c["direction"] == "outbound" and "no answer" in str(c["disposition"]).lower()):
             for sc in [acct, daily.setdefault(c["day"], blank())]:
                 sc["voicemails"] += 1
@@ -785,6 +804,7 @@ def add_smrtphone(res: dict, day_from: str, day_to: str, bench: dict) -> None:
                 sc["band_vm"] += 1
     res["call_source"] = "smrtPhone call log + DataSift"
     res["sp_outbound"] = out_dials
+    res["sp_missed"] = missed
     log(f"smrtPhone: {len(calls)} call(s) in window; conversations/talk time taken from smrtPhone")
 
 
@@ -797,6 +817,15 @@ def fmt_hms(sec):
 
 def pct(n, d):
     return f"{n / d * 100:.1f}%" if d else "0.0%"
+
+
+def missed_line(res: dict) -> str:
+    """'smrtPhone calls over 2 min not counted: time + reason' - so misses surface the same night."""
+    if "sp_missed" not in res:                           # smrtPhone not used this run
+        return ""
+    items = [f"{m['when'].strftime('%I:%M %p').lstrip('0')} {m['direction']} {fmt_hms(m['duration'])} "
+             f"(...{m['number'][-4:]}) - {m['reason']}" for m in res["sp_missed"]]
+    return "smrtPhone calls over 2 min not counted: " + ("; ".join(items) if items else "none")
 
 
 def render_md(res: dict, bench: dict) -> str:
@@ -815,8 +844,10 @@ def render_md(res: dict, bench: dict) -> str:
            f"  |  Wrong {a['wrong_numbers']}  Dead {a['dead_numbers']}  DNC {a['dnc_numbers']}",
            f"- Leads: {a['leads']} (qualified Cold/Warm/Hot: {a['qualified']})  |  Not interested: {a['not_interested']}  |  "
            f"Follow-up tasks: {a['follow_ups']}  |  Appointments logged: {a['appointments']}",
-           f"- Talk time: {fmt_hms(a['talk_seconds'])}  |  Texts: {a['sms_sent']} out / {a['sms_received']} in",
-           "", "## By caller", "",
+           f"- Talk time: {fmt_hms(a['talk_seconds'])}  |  Texts: {a['sms_sent']} out / {a['sms_received']} in"]
+    if missed_line(res):
+        out.append(f"- {missed_line(res)}")
+    out += ["", "## By caller", "",
            "| Caller | Days | Dials | Dials/day | Live% | Convos | Correct | NI | Leads | Floor |",
            "|---|---|---|---|---|---|---|---|---|---|"]
     for email, c in sorted(res["callers"].items(), key=lambda kv: -kv[1]["dials"]):
@@ -914,6 +945,8 @@ def post_slack(res: dict, webhook: str, bench: dict, note: str = "") -> None:
     sp_out = res.get("sp_outbound")
     if sp_out is not None and dials and abs(sp_out - dials) > max(5, 0.05 * dials):
         lines.append(f"• ⚠️ Check: smrtPhone shows {sp_out} outbound calls vs {dials} dials logged in DataSift")
+    if missed_line(res):
+        lines.append(f"• {'⚠️ ' if res['sp_missed'] else ''}{missed_line(res)}")
     lines.append(f"_Calls & talk time: {res.get('call_source', 'DataSift only')}. Correct numbers: as marked in DataSift._")
     callers = [(e, c) for e, c in sorted(res["callers"].items(), key=lambda kv: -kv[1]["dials"])
                if any(c[k] for k in ("dials", "correct_numbers", "leads", "not_interested"))]

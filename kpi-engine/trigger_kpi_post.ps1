@@ -36,7 +36,12 @@ foreach ($day in $due) {
     $ok = $false
     # right after waking, the network may not be up yet: retry for up to ~15 minutes
     for ($try = 1; $try -le 15 -and -not $ok; $try++) {
-        & $gh workflow run kpi-posts.yml --repo $repo -f what=$what -f date=$date 2>&1 | Out-Null
+        # on time: leave date blank (same as pressing the button; sheet refills from yesterday)
+        if ($day.Date -eq (Get-Date).Date) {
+            & $gh workflow run kpi-posts.yml --repo $repo -f what=$what 2>&1 | Out-Null
+        } else {
+            & $gh workflow run kpi-posts.yml --repo $repo -f what=$what -f date=$date 2>&1 | Out-Null
+        }
         if ($LASTEXITCODE -eq 0) { $ok = $true } else { Start-Sleep -Seconds 60 }
     }
     if (-not $ok) { Log "FAILED to start $what for $date after 15 tries"; exit 1 }

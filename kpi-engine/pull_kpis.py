@@ -27,6 +27,7 @@ Read-only against DataSift. Standard library only.
 from __future__ import annotations
 
 import argparse
+import re
 import csv
 import datetime
 import json
@@ -303,6 +304,9 @@ _VM_NOTE = _re.compile(
 # A note that clearly describes a real conversation wins over a stray "vm" mention.
 _TALK_NOTE = _re.compile(r"\b(talked|spoke|spoken|convo|conversation|said|says|wants|asking|told me|motivated|interested|offer|appointment|appt|reached|hung up|picked up|when i said)\b", _re.I)
 
+_STRONG_TALK = _re.compile(r"\b(talked|spoke|spoken|convo|conversation|told me|picked up|hung up|"
+                           r"answered|got a ?hold|reached (him|her|them|owner))\b", _re.I)
+
 
 def _is_vm_note(text: str) -> bool:
     # The skip-trace pipeline posts long structured notes (CASE / PROPERTY / SIGNING
@@ -310,7 +314,10 @@ def _is_vm_note(text: str) -> bool:
     # call notes are read.
     if len(text) > 280 or _re.search(r"SIGNING CHAIN|CASE:|PROPERTY:|OWNER:|PETITION", text):
         return False
-    return bool(_VM_NOTE.search(text)) and not _TALK_NOTE.search(text)
+    # A voicemail note is only overruled by words that mean a person was actually on the
+    # line. Soft words ("said", "wants") are not enough: "VM greeting said his name" is a
+    # voicemail (Jeff, 2026-10-02).
+    return bool(_VM_NOTE.search(text)) and not _STRONG_TALK.search(text)
 
 
 def _message_text(ev) -> str:
@@ -435,7 +442,21 @@ def pull(token: str, day_from: str, day_to: str, tz, bench: dict) -> dict:
                 elif _TALK_NOTE.search(txt):
                     talk_note_days.add(key)
     vm_note_days -= talk_note_days
+    # Jeff, 2026-10-02: a short call is still a conversation when the record shows it was one:
+    # a talk note that day, or a status he set that day (Not interested, a lead, ...).
+    outcome_days = set(talk_note_days)
+    for uuid, evs in rec_events.items():
+        for dt, e in evs:
+            if e.get("event_type") == "property.status.updated" and author_of(e)[0] != "system":
+                outcome_days.add((uuid, dt.date().isoformat()))
 
+    num_recs = defaultdict(set)       # number -> DataSift records it was called on
+    for uuid, evs in rec_events.items():
+        for _, e in evs:
+            if e.get("event_type") in CALL_EVENTS:
+                n = call_number((e.get("payload") or {}).get("call") or {})
+                if n:
+                    num_recs[n].add(uuid)
     acct, per, daily = blank(), defaultdict(blank), defaultdict(blank)
     names, phone_final, prop_final, seen = {}, {}, {}, set()
     prop_first = {}   # uuid -> (dt, status before the day's first change)
@@ -502,8 +523,7 @@ def pull(token: str, day_from: str, day_to: str, tz, bench: dict) -> dict:
                     bump(email, day, "talk_seconds", dur)
                     if dur >= mean_s:
                         bump(email, day, "meaningful_conversations")
-                        bump(email, day, "conversations")
-                    elif dur >= conv_s:
+                    if dur >= conv_s or (uuid, day) in outcome_days:
                         bump(email, day, "conversations")
                     elif dur >= vm_s:
                         bump(email, day, "band_brief")
@@ -626,6 +646,7 @@ def pull(token: str, day_from: str, day_to: str, tz, bench: dict) -> dict:
     details.sort(key=lambda d: (-d["is_lead"], -d["dials"]))
     return {"from": day_from, "to": day_to, "account_totals": acct,
             "callers": dict(per), "daily": dict(daily), "names": names,
+            "vm_note_days": vm_note_days, "num_recs": dict(num_recs), "outcome_days": outcome_days,
             "marked_correct": set().union(*correct_by_rec.values()) if correct_by_rec else set(),
             "marked_wrong": set().union(*wrong_by_rec.values()) if wrong_by_rec else set(),
             "records_detail": details}
@@ -641,7 +662,8 @@ CALL_FIELDS = ("talk_seconds", "conversations", "meaningful_conversations", "inb
                "reached", "inbound_owner_talks")
 
 
-def _sp_is_talk(c: dict, marked_correct: set, marked_wrong: set):
+def _sp_is_talk(c: dict, marked_correct: set, marked_wrong: set,
+                vm_note_days: set = frozenset(), num_recs: dict | None = None):
     """'owner' / 'other' / None for one smrtPhone call."""
     if c["duration"] <= 0 or str(c["status"]).lower() not in ("completed", "answered", ""):
         return None
@@ -651,6 +673,16 @@ def _sp_is_talk(c: dict, marked_correct: set, marked_wrong: set):
         return "other" if "wrong" in d else "owner"     # they called us: always a real call
     if "no answer" in d or "dead" in d or "busy" in d:
         return None                                      # voicemail / never reached anyone
+    # Jeff, 2026-10-02: a number gets marked Correct (or Wrong) just because the VOICEMAIL
+    # greeting said a name. The message board decides: a same-day "no answer / VM" note on
+    # the record means this was a voicemail, whatever the disposition says.
+    recs = (num_recs or {}).get(num, set())
+    import re as _r
+    m = _r.search(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", str(c.get("crm_link") or ""))
+    if m:
+        recs = set(recs) | {m.group(0)}
+    if any((u, c["day"]) in vm_note_days for u in recs):
+        return "vm"
     if "wrong" in d:
         return "other"
     if d in ("", "no disposition"):                      # not dispositioned: ask DataSift
@@ -682,14 +714,22 @@ def add_smrtphone(res: dict, day_from: str, day_to: str, bench: dict) -> None:
     for c in calls:
         if c["direction"] == "outbound":
             out_dials += 1
-        kind = _sp_is_talk(c, res.get("marked_correct", set()), res.get("marked_wrong", set()))
-        if c["direction"] == "outbound" and "no answer" in str(c["disposition"]).lower():
+        kind = _sp_is_talk(c, res.get("marked_correct", set()), res.get("marked_wrong", set()),
+                           res.get("vm_note_days", set()), res.get("num_recs", {}))
+        if kind == "vm" or (c["direction"] == "outbound" and "no answer" in str(c["disposition"]).lower()):
             for sc in [acct, daily.setdefault(c["day"], blank())]:
                 sc["voicemails"] += 1
+        if kind == "vm":
+            kind = None
         kind_inbound = (c["direction"] == "inbound" and c["duration"] > 0
                         and str(c["status"]).lower() != "missed")
         if not kind and not kind_inbound:
             continue
+        recs = set(res.get("num_recs", {}).get(_digits10(c["number"]), set()))
+        m = re.search(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", str(c.get("crm_link") or ""))
+        if m:
+            recs.add(m.group(0))
+        noted = any((u, c["day"]) in res.get("outcome_days", set()) for u in recs)
         scopes = [acct, daily.setdefault(c["day"], blank())]
         user = str(c["user"] or "").strip()
         if user and user != "Unassigned":
@@ -713,7 +753,7 @@ def add_smrtphone(res: dict, day_from: str, day_to: str, bench: dict) -> None:
             sc["talk_seconds"] += d
             if d >= mean_s:
                 sc["meaningful_conversations"] += 1
-            if d >= conv_s:
+            if d >= conv_s or noted:
                 sc["conversations"] += 1
             elif d >= vm_s:
                 sc["band_brief"] += 1
@@ -745,7 +785,7 @@ def render_md(res: dict, bench: dict) -> str:
            f"- Dials: {dials}  |  Voicemail / no answer: {a['voicemails']}",
            f"- Reached a person: {a['reached']} = owner {a['answered']} + inbound callback "
            f"{a['inbound_owner_talks']} + someone else (wrong #) {a['non_owner_talks']}",
-           f"- Of those: under 1 min {a['reached'] - a['conversations']}  |  1 min+ {a['conversations']}"
+           f"- Conversations (1 min+ or noted on the message board): {a['conversations']}  |  brief pickups {a['reached'] - a['conversations']}"
            f"  |  2 min+ {a['meaningful_conversations']}  |  Calls & talk time: {res.get('call_source', 'DataSift only')}",
            f"- Correct numbers: {a['correct_numbers']} ({pct(a['correct_numbers'], dials)} right-party)"
            f"  |  Wrong {a['wrong_numbers']}  Dead {a['dead_numbers']}  DNC {a['dnc_numbers']}",
@@ -839,8 +879,8 @@ def post_slack(res: dict, webhook: str, bench: dict, note: str = "") -> None:
         f"• Dials: *{dials}*  |  Voicemail / no answer: {a['voicemails']}",
         f"• Reached a person: *{a['reached']}*  =  owner {a['answered']}"
         f"  +  inbound callback {a['inbound_owner_talks']}  +  someone else (wrong #) {a['non_owner_talks']}",
-        f"• Of those: under 1 min {a['reached'] - a['conversations']}"
-        f"  |  1 min+ *{a['conversations']}*  |  2 min+ *{a['meaningful_conversations']}*"
+        f"• Conversations: *{a['conversations']}* (1 min+, or a talk / outcome on the message board)"
+        f"  |  Brief pickups: {a['reached'] - a['conversations']}  |  2 min+: *{a['meaningful_conversations']}*"
         f"  |  Talk time {fmt_hms(a['talk_seconds'])}",
         f"• Correct numbers: *{a['correct_numbers']}* ({pct(a['correct_numbers'], dials)})  |  Dials per correct: {dpc}",
         f"• Wrong {a['wrong_numbers']}  |  Dead {a['dead_numbers']}  |  DNC {a['dnc_numbers']}",

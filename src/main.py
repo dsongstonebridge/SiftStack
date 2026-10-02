@@ -2134,6 +2134,14 @@ def _create_records_for_batch(args, csv_path: Path) -> list[dict] | None:
                      ", ".join(f"{r.get('First Name','')} {r.get('Last Name','')}".strip()
                                for r in deceased))
 
+    # Word each street the way SiftMap does, or DataSift cannot link the record
+    # to its SiftMap parcel: no "Open in SiftMap" link, no property data, and
+    # the post-enrichment gate has nothing to screen. Free; never blocks a row.
+    from siftmap_address import align_rows_to_siftmap
+    _t = run_timer.start("SiftMap address wording")
+    align_rows_to_siftmap(template_rows)
+    run_timer.stop(_t)
+
     # No trace results yet, by design -- see the docstring.
     datasift_csv = build_datasift_csv_from_template(
         template_rows, [], notice_type=notice_type, county=county,

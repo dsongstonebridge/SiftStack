@@ -297,15 +297,34 @@ import re as _re
 _VM_NOTE = _re.compile(
     r"\b(no answer|n/?a\b|didn'?t answer|did not answer|vm|v/m|lvm|left (a )?(vm|voicemail|message|msg)|"
     r"voice ?mail|mailbox|went to (vm|voicemail)|no pick ?up|rang out|straight to (vm|voicemail)|"
-    r"can'?t get a ?hold|couldn'?t (get a ?hold|reach)|unable to reach|no luck)\b",
+    r"can'?t get a ?hold|couldn'?t (get a ?hold|reach)|unable to reach|no luck|answering (machine|service)|"
+    r"nobody answered|no one answered|wasn'?t answered)\b",
     _re.I)
 
 
 # A note that clearly describes a real conversation wins over a stray "vm" mention.
-_TALK_NOTE = _re.compile(r"\b(talked|spoke|spoken|convo|conversation|said|says|wants|asking|told me|motivated|interested|offer|appointment|appt|reached|hung up|picked up|when i said)\b", _re.I)
+_TALK_NOTE_RE = _re.compile(r"\b(talked|spoke|spoken|convo|conversation|said|says|wants|asking|told me|motivated|interested|offer|appointment|appt|reached|hung up|picked up|when i said|answer|answered)\b", _re.I)
+
+
+class _TalkNote:
+    """Same .search() interface as before, but ignores negated 'answer' phrases."""
+    @staticmethod
+    def search(text):
+        return _TALK_NOTE_RE.search(_talk_words(text))
+
+
+_TALK_NOTE = _TalkNote()
 
 _STRONG_TALK = _re.compile(r"\b(talked|spoke|spoken|convo|conversation|told me|picked up|hung up|"
-                           r"answered|got a ?hold|reached (him|her|them|owner))\b", _re.I)
+                           r"answer|answered|got a ?hold|reached (him|her|them|owner))\b", _re.I)
+# "answer(ed)" means a person picked up (Jeff, 2026-10-02) - but never in a negated phrase.
+_NEGATED_ANSWER = _re.compile(r"\b(no|not|never|nobody|didn'?t|did not|don'?t|won'?t|wouldn'?t|wasn'?t|"
+                              r"was not|doesn'?t)\s+(\w+\s+)?answer(ed|ing|s)?\b|\banswering (machine|service)\b", _re.I)
+
+
+def _talk_words(text: str) -> str:
+    """The note with negated 'answer' phrases removed, so only real talk words remain."""
+    return _NEGATED_ANSWER.sub(" ", text or "")
 
 
 def _is_vm_note(text: str) -> bool:
@@ -317,7 +336,7 @@ def _is_vm_note(text: str) -> bool:
     # A voicemail note is only overruled by words that mean a person was actually on the
     # line. Soft words ("said", "wants") are not enough: "VM greeting said his name" is a
     # voicemail (Jeff, 2026-10-02).
-    return bool(_VM_NOTE.search(text)) and not _STRONG_TALK.search(text)
+    return bool(_VM_NOTE.search(text)) and not _STRONG_TALK.search(_talk_words(text))
 
 
 def _message_text(ev) -> str:

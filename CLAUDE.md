@@ -1664,6 +1664,71 @@ gate protects spend, not the CRM.** Any trial of `skip-trace --create` puts real
 records in DataSift — which is exactly why the buy box and `batch_review.py` run
 on the extracted sheet, before creation, rather than as a post-upload cleanup.
 
+## Tulsa KPI Engine + KPI Bot (daily Slack post + Friday sheet post, 2026-10)
+
+Two pieces, one Slack channel:
+
+| Piece | Code | Posts |
+|---|---|---|
+| **KPI Engine** | `kpi-engine/pull_kpis.py` (+ `smrtphone_calls.py`) | the short daily summary, **every weekday** |
+| Sheet fill | `kpi-engine/fill_sheet.py` | fills the Google Sheet "Tulsa Homebuyers KPIs" (same rules) |
+| **KPI Bot** | `kpi-bot/kpi_slack_bot.py` | the big sheet summary, **Fridays only** (far more detail) |
+
+**How it runs.** `.github/workflows/kpi-posts.yml` does the work in GitHub's cloud
+(fill sheet -> daily post -> Friday sheet post, in that order). It has **no timer**:
+GitHub's cron ran hours late or not at all. Manual "Run workflow" only, inputs
+`what` = daily / weekly-sheet-post / both and an optional `date` (YYYY-MM-DD; posts that
+day and refills the sheet from that day).
+
+**What presses the button: Windows task "KPI posts 630 PM weekdays"** on Jeff's PC, at
+**6:30 PM** (Jeff wants 6:30, not 6:31), no end date. It runs
+`kpi-engine/trigger_kpi_post.ps1`: `gh workflow run kpi-posts.yml`, Friday = `both`,
+otherwise `daily`. Wake-to-run plus run-on-logon: a missed day is posted as soon as the PC
+is back, **for the day that was missed** (passed as `date`), never as "today". On-time runs
+leave `date` blank, exactly like pressing the button. State in
+`kpi-engine/reports/kpi_post_last.txt` (last day posted, so no double posts), log in
+`kpi-engine/reports/kpi_post_trigger.log`. Needs the PC logged in (asleep/locked is fine).
+- Do NOT re-add a GitHub `schedule:` or use a Claude session cron (expires after 7 days).
+- The cloud routine that used to press the button (paused) drove Chrome, which breaks
+  Jeff's no-screen-takeover rule. Leave it off.
+- The older Windows tasks "DataSift KPI Engine" / "DataSift KPI Bot" ran the same engine
+  and bot locally (`run_engine.bat`, `run_kpi_bot.bat`). They are disabled; turning them on
+  while the GitHub path runs posts everything twice. Never delete them.
+
+**Counting rules (Jeff's, all in `pull_kpis.py`; fill_sheet uses the same ones):**
+- Two sources. smrtPhone call log = every call, duration, disposition -> conversations,
+  talk time, inbound. DataSift = dials, Jeff's phone markings, message board notes,
+  statuses, leads.
+- Inbound answered calls always count. Outbound counts only if a person answered
+  (smrtPhone dispo Correct/Wrong/etc., or undispositioned but the number is marked
+  Correct/Wrong in DataSift). Correct numbers = only what was marked in DataSift.
+- A same-day "VM / no answer" message-board note on the record = voicemail, even if the
+  number was marked Correct/Wrong (the greeting said a name). "answer/answered" = talk;
+  "no answer / didn't answer / nobody answered / answering machine" = voicemail.
+- Conversation = reached a person AND (1 min+ OR an owner call with a same-day talk note or
+  owner-outcome status: Not interested / a lead). This includes wrong-number calls of 1 min+.
+- Slack lines must add up: Reached = owner + inbound callback + someone else (wrong #);
+  Conversations + brief pickups = Reached; 2 min+ is separate. Leads = any lead status incl.
+  New Lead; Qualified = Cold/Warm/Hot. Follow-up tasks = tasks with "follow" in the title.
+- **Audit line (2026-10-02):** every post lists `smrtPhone calls over 2 min not counted:
+  time + reason` (or "none") so a miss surfaces the same night. Also a ⚠️ line when
+  smrtPhone outbound calls differ from DataSift dials. If smrtPhone login fails the post
+  says "DataSift only".
+- Known cosmetic gap: the report file's Daily trend table does not subtract an excluded
+  (admin) user's markings, so its Correct can read 1 higher than the total. The total and
+  the Slack post are right.
+
+**Testing locally** (Jeff's PC reaches DataSift and smrtPhone directly; skip `--slack`
+unless Jeff says post): `python kpi-engine/pull_kpis.py --from 2026-09-30 --to 2026-09-30`.
+Sep 30 is the regression day: Dials 142, VM 78, Reached 31 = 6 + 3 + 22, Conversations 10,
+brief 21, 2 min+ 0, Talk 16m18s, Correct 12, Wrong 26, Dead 27, Leads 0, NI 4, Follow-ups 7.
+
+**smrtPhone session expires ~Oct 31, 2026:** run `kpi-engine\smrtphone_login.bat`, then paste
+`kpi-engine\reports\SMRTPHONE_STATE_paste_me.txt` into the `SMRTPHONE_STATE` GitHub secret.
+
+**Never commit:** `.env`, `kpi-bot/.env`, `kpi-bot/service_account.json`,
+`smrtphone_state.json`, `kpi-engine/manual_calls.csv`, `kpi-engine/reports/`.
+
 ## DataSift.ai (REISift) Integration
 
 DataSift.ai (formerly REISift) is the CRM where scraped records land for niche sequential marketing campaigns.

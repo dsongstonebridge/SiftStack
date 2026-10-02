@@ -463,11 +463,15 @@ def pull(token: str, day_from: str, day_to: str, tz, bench: dict) -> dict:
     vm_note_days -= talk_note_days
     # Jeff, 2026-10-02: a short call is still a conversation when the record shows it was one:
     # a talk note that day, or a status he set that day (Not interested, a lead, ...).
+    # Only an OWNER outcome counts (Not interested or a lead status) - not moving a record
+    # to exhausted / deep prospecting after wrong numbers.
+    outcome_set = lead_set | {"not_interested", "not interested"}
     outcome_days = set(talk_note_days)
     for uuid, evs in rec_events.items():
         for dt, e in evs:
             if e.get("event_type") == "property.status.updated" and author_of(e)[0] != "system":
-                outcome_days.add((uuid, dt.date().isoformat()))
+                if str(new_status(e, "property", s_idx) or "").lower() in outcome_set:
+                    outcome_days.add((uuid, dt.date().isoformat()))
 
     num_recs = defaultdict(set)       # number -> DataSift records it was called on
     for uuid, evs in rec_events.items():
@@ -542,7 +546,8 @@ def pull(token: str, day_from: str, day_to: str, tz, bench: dict) -> dict:
                     bump(email, day, "talk_seconds", dur)
                     if dur >= mean_s:
                         bump(email, day, "meaningful_conversations")
-                    if dur >= conv_s or (uuid, day) in outcome_days:
+                    owner_talk = inbound or num in correct_by_rec.get(uuid, set())
+                    if dur >= conv_s or (owner_talk and (uuid, day) in outcome_days):
                         bump(email, day, "conversations")
                     elif dur >= vm_s:
                         bump(email, day, "band_brief")
@@ -748,7 +753,7 @@ def add_smrtphone(res: dict, day_from: str, day_to: str, bench: dict) -> None:
         m = re.search(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", str(c.get("crm_link") or ""))
         if m:
             recs.add(m.group(0))
-        noted = any((u, c["day"]) in res.get("outcome_days", set()) for u in recs)
+        noted = kind == "owner" and any((u, c["day"]) in res.get("outcome_days", set()) for u in recs)
         scopes = [acct, daily.setdefault(c["day"], blank())]
         user = str(c["user"] or "").strip()
         if user and user != "Unassigned":

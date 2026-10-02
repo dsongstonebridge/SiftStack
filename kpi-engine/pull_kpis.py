@@ -134,18 +134,51 @@ def req(token: str, path: str, *, method="GET", body=None, method_override=None,
     data = json.dumps(body).encode() if body is not None else None
     r = urllib.request.Request(url, data=data, headers=headers, method=method)
     time.sleep(0.03)
+    # DataSift rate-limits bursts (429), e.g. right after the sheet fill made hundreds
+    # of calls. Wait and retry instead of failing the whole post (2026-10-01 incident).
+    for attempt in range(8):
+        try:
+            with urllib.request.urlopen(r, timeout=30) as resp:
+                raw = resp.read()
+                return json.loads(raw) if raw else {}
+        except urllib.error.HTTPError as e:
+            if e.code not in (429, 502, 503, 504) or attempt == 7:
+                return _http_fail(e, path)
+            wait = _retry_wait(e, attempt)
+            log(f"DataSift said {e.code} on {path}; waiting {wait:.0f}s and retrying ({attempt + 1}/7)")
+            time.sleep(wait)
+        except (urllib.error.URLError, TimeoutError) as e:
+            if attempt == 7:
+                raise
+            log(f"network error on {path} ({e}); retrying")
+            time.sleep(5 * (attempt + 1))
+
+
+def _retry_wait(e, attempt: int) -> float:
+    hdr = (e.headers or {}).get("Retry-After") if hasattr(e, "headers") else None
     try:
-        with urllib.request.urlopen(r, timeout=30) as resp:
-            raw = resp.read()
-            return json.loads(raw) if raw else {}
-    except urllib.error.HTTPError as e:
-        if e.code == 401:
-            sys.exit("DataSift said 401 (not authorized) on " + path +
-                     " - the API key or token was rejected for this endpoint.")
-        if e.code == 403:
-            sys.exit("DataSift said 403 (forbidden) on " + path +
-                     " - this endpoint does not accept these credentials.")
-        raise
+        if hdr:
+            return min(max(float(hdr), 1.0), 120.0)
+    except ValueError:
+        pass
+    try:   # DataSift's body says "Expected available in N seconds."
+        import re as _r
+        m = _r.search(r"available in (\d+)", e.read().decode("utf-8", "replace"))
+        if m:
+            return min(float(m.group(1)) + 1, 120.0)
+    except Exception:
+        pass
+    return min(5.0 * 2 ** attempt, 60.0)
+
+
+def _http_fail(e, path):
+    if e.code == 401:
+        sys.exit("DataSift said 401 (not authorized) on " + path +
+                 " - the API key or token was rejected for this endpoint.")
+    if e.code == 403:
+        sys.exit("DataSift said 403 (forbidden) on " + path +
+                 " - this endpoint does not accept these credentials.")
+    raise e
 
 
 def search_updated(token: str, day_from: str, day_to_excl: str) -> list[dict]:

@@ -1,19 +1,12 @@
-# Daily KPI Engine post + sheet fill (weekdays from 6:30 PM Tulsa time, once per day) and the weekly
-# sheet-bot post (Fridays). Runs in GitHub's cloud, so the PC can be off.
+# Daily KPI Engine post + sheet fill, and the weekly sheet-bot post (Fridays). Runs in
+# GitHub's cloud. Started by "Run workflow" (Claude presses it at 6:30 PM weekdays).
 # Secrets (Settings > Secrets and variables > Actions):
 #   DATASIFT_API_KEY, KPI_SLACK_WEBHOOK_URL, KPI_SPREADSHEET_ID, KPI_SERVICE_ACCOUNT_JSON
 name: KPI posts
 
 on:
-  schedule:
-    # GitHub often starts timed runs late (sometimes by an hour+) or drops one.
-    # So we knock every hour from 6:30 PM to ~10:30 PM Tulsa time; the first run
-    # that gets through posts, and the rest see "already posted today" and stop.
-    - cron: "30 23 * * *"
-    - cron: "30 0 * * *"
-    - cron: "30 1 * * *"
-    - cron: "30 2 * * *"
-    - cron: "30 3 * * *"
+  # The GitHub timer was turned OFF on 2026-10-02 (Jeff): it started hours late or not
+  # at all. Claude now presses "Run workflow" at 6:30 PM on weekdays instead.
   workflow_dispatch:
     inputs:
       what:
@@ -21,6 +14,11 @@ on:
         type: choice
         options: [daily, weekly-sheet-post, both]
         default: daily
+      date:
+        description: "Day to report, YYYY-MM-DD (blank = today, Tulsa time)"
+        type: string
+        required: false
+        default: ""
 
 concurrency: kpi-posts
 
@@ -129,7 +127,14 @@ jobs:
       - name: Post the daily KPI Engine summary
         if: steps.gate.outputs.daily == 'true'
         working-directory: kpi-engine
-        run: python pull_kpis.py --days 1 --slack auto
+        env:
+          DAY: ${{ github.event.inputs.date }}
+        run: |
+          if [ -n "$DAY" ]; then
+            python pull_kpis.py --from "$DAY" --to "$DAY" --slack auto
+          else
+            python pull_kpis.py --days 1 --slack auto
+          fi
 
       - name: Post the weekly sheet summary (Fridays)
         if: steps.gate.outputs.weekly == 'true'

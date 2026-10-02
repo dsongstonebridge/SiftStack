@@ -907,9 +907,9 @@
         "scripts/build_text_touches.py"
       ],
       "file_count": 3,
-      "bytes": 30795,
+      "bytes": 30512,
       "download": "https://raw.githubusercontent.com/DataSift-Ty-Personal/SiftStack/main/dist/text-touch-builder.skill",
-      "sha256": "ee627d292a0a2e4a03de07413bf91311e6db8f7365717097a221918acf8c7ea8",
+      "sha256": "0dd35ea505f63354e25561234802d2a4ba2e7f8f63ef2a59532269ec32cb1e02",
       "requires": {
         "tier": "none",
         "fallback": null,

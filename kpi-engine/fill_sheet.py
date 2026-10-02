@@ -202,8 +202,13 @@ def build(days: list[str]):
                     row[["Initial Dial", "FU 1 Dial", "FU2 Dial", "FU 3 Dial"][stage]] += 1
                     (rec_days_new if stage == 0 else rec_days_fu).add((who, day))
             elif et == "owner.call.answered":
-                live = call_number(call) in correct_ever and day not in vm_days
                 inbound = call.get("direction") == "inbound"
+                num = call_number(call)
+                # Inbound = the owner called us, always a real conversation. A number later
+                # marked Wrong also means a person answered (Jeff, 2026-10-02), so it is not
+                # a voicemail either.
+                live = inbound or (day not in vm_days and (num in correct_ever
+                                   or ph_last.get(num) in k.WRONG_STATES))
                 if inbound:
                     lm[("Inbound" if who == "Inbound" else who, day)]["Inbound calls"] += 1
                 if not live:

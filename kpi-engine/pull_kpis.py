@@ -334,7 +334,7 @@ def _human_author(ev) -> bool:
 def blank():
     return {"dials": 0, "answered": 0, "noanswer": 0, "talk_seconds": 0, "sms_sent": 0,
             "sms_received": 0, "conversations": 0, "meaningful_conversations": 0,
-            "band_vm": 0, "band_brief": 0, "voicemails": 0, "inbound_calls": 0, "correct_numbers": 0, "wrong_numbers": 0,
+            "band_vm": 0, "band_brief": 0, "voicemails": 0, "non_owner_talks": 0, "inbound_calls": 0, "correct_numbers": 0, "wrong_numbers": 0,
             "dead_numbers": 0, "dnc_numbers": 0, "leads": 0, "qualified": 0, "not_interested": 0,
             "follow_ups": 0, "appointments": 0, "records": set(), "days": set(),
             "first_call": None, "last_call": None}
@@ -405,7 +405,7 @@ def pull(token: str, day_from: str, day_to: str, tz, bench: dict) -> dict:
     # number called is dispositioned Correct on that record. Otherwise the pickup was a
     # voicemail. Uses the record's whole history, so a number marked Correct on an
     # earlier day still counts. Inbound calls are always real (the owner called us).
-    correct_by_rec = {}
+    correct_by_rec, wrong_by_rec = {}, {}
     for uuid, evs in rec_all.items():
         last = {}
         for e in evs:
@@ -417,6 +417,7 @@ def pull(token: str, day_from: str, day_to: str, tz, bench: dict) -> dict:
             if ph and st and (ph not in last or ts >= last[ph][0]):
                 last[ph] = (ts, st)
         correct_by_rec[uuid] = {ph for ph, (_, st) in last.items() if str(st).upper() in CORRECT_STATES}
+        wrong_by_rec[uuid] = {ph for ph, (_, st) in last.items() if str(st).upper() in WRONG_STATES}
 
     # Jeff's second rule: on a record with a Correct number, a same-day Message Board note
     # (written by a person, not the pipeline) saying "no answer / VM / voicemail / left
@@ -483,12 +484,17 @@ def pull(token: str, day_from: str, day_to: str, tz, bench: dict) -> dict:
                     else:
                         # Outbound live = the RIGHT owner picked up: the number is
                         # dispositioned Correct and no same-day "no answer / VM" note.
-                        live = (call_number(call) in correct_by_rec.get(uuid, set())
-                                and (uuid, day) not in vm_note_days)
-                        if not live:
+                        num, vm_day = call_number(call), (uuid, day) in vm_note_days
+                        if num in correct_by_rec.get(uuid, set()) and not vm_day:
+                            bump(email, day, "answered")
+                        elif num in wrong_by_rec.get(uuid, set()) and not vm_day:
+                            # A person answered but it was not the owner (relative, new
+                            # tenant...). Still a real conversation: Jeff, 2026-10-02, after
+                            # a 7-minute "Wrong Number" call went uncounted.
+                            bump(email, day, "non_owner_talks")
+                        else:
                             bump(email, day, "voicemails")
                             continue
-                        bump(email, day, "answered")
                     bump(email, day, "talk_seconds", dur)
                     if dur >= mean_s:
                         bump(email, day, "meaningful_conversations")
@@ -641,7 +647,8 @@ def render_md(res: dict, bench: dict) -> str:
            f"  Inbound calls answered: {a['inbound_calls']}",
            "  (live = talked to the right owner: number marked Correct and no same-day 'no answer/VM' note;"
            " interest is measured by Leads / Not interested, not by 'live')",
-           f"- Conversations 60s+ (outbound + inbound): {a['conversations']}  |  "
+           f"- Talked to someone else (wrong number): {a['non_owner_talks']}",
+           f"- Conversations 60s+ (owner, inbound or wrong number): {a['conversations']}  |  "
            f"Meaningful 120s+: {a['meaningful_conversations']}",
            f"- Correct numbers: {a['correct_numbers']} ({pct(a['correct_numbers'], dials)} right-party)"
            f"  |  Wrong {a['wrong_numbers']}  Dead {a['dead_numbers']}  DNC {a['dnc_numbers']}",
@@ -733,7 +740,8 @@ def post_slack(res: dict, webhook: str, bench: dict, note: str = "") -> None:
     lines = [
         f"*📞 Prospecting KPIs — DataSift (KPI Engine)*  |  {period}" + (f"  |  _{note}_" if note else ""),
         f"• Dials: *{dials}*  |  Owner picked up: {a['answered']} ({pct(a['answered'], dials)})  |  Voicemails: {a['voicemails']}  |  Inbound answered: {a['inbound_calls']}",
-        f"• Conversations 60s+ (outbound + inbound): *{a['conversations']}*  |  120s+: {a['meaningful_conversations']}",
+        f"• Talked to someone else (wrong number): {a['non_owner_talks']}",
+        f"• Conversations 60s+ (owner, inbound or wrong number): *{a['conversations']}*  |  120s+: {a['meaningful_conversations']}",
         f"• Correct numbers: *{a['correct_numbers']}* ({pct(a['correct_numbers'], dials)})  |  Dials per correct: {dpc}",
         f"• Wrong {a['wrong_numbers']}  |  Dead {a['dead_numbers']}  |  DNC {a['dnc_numbers']}",
         f"• Leads: *{a['leads']}*  |  Qualified (Cold/Warm/Hot): *{a['qualified']}*  |  Not interested: {a['not_interested']}  |  Follow-up tasks: {a['follow_ups']}",

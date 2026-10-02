@@ -469,18 +469,26 @@ def pull(token: str, day_from: str, day_to: str, tz, bench: dict) -> dict:
                             scope["last_call"] = dt
                 elif et == "owner.call.answered":
                     dur = int(call.get("duration") or 0)
-                    # Live = a real conversation with the RIGHT owner: the number is
-                    # dispositioned Correct and no same-day "no answer / VM" note.
-                    # Same rule for inbound (a callback can be the wrong person).
-                    if call.get("direction") == "inbound":
+                    inbound = call.get("direction") == "inbound"
+                    if inbound:
                         bump(email, day, "inbound_calls")
-                    live = (call_number(call) in correct_by_rec.get(uuid, set())
-                            and (uuid, day) not in vm_note_days)
-                    if not live:
-                        if call.get("direction") != "inbound":
+                        # The owner called us, so it is a real conversation whatever the
+                        # number's status: callbacks often come from a number that is not
+                        # marked Correct, or not on the record at all (Jeff, 2026-10-02).
+                        # Credit it to whoever answered, when DataSift says who.
+                        who = (call.get("external_user") or {}).get("email")
+                        if who:
+                            email = who
+                            names[who] = (call.get("external_user") or {}).get("name") or who
+                    else:
+                        # Outbound live = the RIGHT owner picked up: the number is
+                        # dispositioned Correct and no same-day "no answer / VM" note.
+                        live = (call_number(call) in correct_by_rec.get(uuid, set())
+                                and (uuid, day) not in vm_note_days)
+                        if not live:
                             bump(email, day, "voicemails")
-                        continue
-                    bump(email, day, "answered")
+                            continue
+                        bump(email, day, "answered")
                     bump(email, day, "talk_seconds", dur)
                     if dur >= mean_s:
                         bump(email, day, "meaningful_conversations")
@@ -561,7 +569,8 @@ def pull(token: str, day_from: str, day_to: str, tz, bench: dict) -> dict:
                 who = "inbound" if (row.get("direction") or "").strip().lower() == "inbound" else "manual"
                 if who == "inbound":
                     bump(who, d, "inbound_calls")
-                bump(who, d, "answered")
+                else:
+                    bump(who, d, "answered")
                 bump(who, d, "talk_seconds", secs)
                 if secs >= mean_s:
                     bump(who, d, "meaningful_conversations")
@@ -628,11 +637,11 @@ def render_md(res: dict, bench: dict) -> str:
     take = bench["appointment_take_rate"]
     dials = a["dials"]
     out = [f"# KPI Report, {res['from']} to {res['to']}", "",
-           f"- Dials: {dials}  |  Talked to owner: {a['answered']} ({pct(a['answered'], dials)})  |  Voicemails: {a['voicemails']}",
+           f"- Dials: {dials}  |  Owner picked up: {a['answered']} ({pct(a['answered'], dials)})  |  Voicemails: {a['voicemails']}",
            f"  Inbound calls answered: {a['inbound_calls']}",
            "  (live = talked to the right owner: number marked Correct and no same-day 'no answer/VM' note;"
            " interest is measured by Leads / Not interested, not by 'live')",
-           f"- Conversations 60s+: {a['conversations']} ({pct(a['conversations'], dials)})  |  "
+           f"- Conversations 60s+ (outbound + inbound): {a['conversations']}  |  "
            f"Meaningful 120s+: {a['meaningful_conversations']}",
            f"- Correct numbers: {a['correct_numbers']} ({pct(a['correct_numbers'], dials)} right-party)"
            f"  |  Wrong {a['wrong_numbers']}  Dead {a['dead_numbers']}  DNC {a['dnc_numbers']}",
@@ -723,8 +732,8 @@ def post_slack(res: dict, webhook: str, bench: dict, note: str = "") -> None:
     dpc = f"{dials / a['correct_numbers']:.1f}" if a["correct_numbers"] else "n/a"
     lines = [
         f"*📞 Prospecting KPIs — DataSift (KPI Engine)*  |  {period}" + (f"  |  _{note}_" if note else ""),
-        f"• Dials: *{dials}*  |  Talked to owner: {a['answered']} ({pct(a['answered'], dials)})  |  Voicemails: {a['voicemails']}  |  Inbound: {a['inbound_calls']}",
-        f"• Conversations 60s+: *{a['conversations']}* ({pct(a['conversations'], dials)})  |  120s+: {a['meaningful_conversations']}",
+        f"• Dials: *{dials}*  |  Owner picked up: {a['answered']} ({pct(a['answered'], dials)})  |  Voicemails: {a['voicemails']}  |  Inbound answered: {a['inbound_calls']}",
+        f"• Conversations 60s+ (outbound + inbound): *{a['conversations']}*  |  120s+: {a['meaningful_conversations']}",
         f"• Correct numbers: *{a['correct_numbers']}* ({pct(a['correct_numbers'], dials)})  |  Dials per correct: {dpc}",
         f"• Wrong {a['wrong_numbers']}  |  Dead {a['dead_numbers']}  |  DNC {a['dnc_numbers']}",
         f"• Leads: *{a['leads']}*  |  Qualified (Cold/Warm/Hot): *{a['qualified']}*  |  Not interested: {a['not_interested']}  |  Follow-up tasks: {a['follow_ups']}",

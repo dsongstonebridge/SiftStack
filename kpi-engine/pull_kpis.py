@@ -622,7 +622,92 @@ def pull(token: str, day_from: str, day_to: str, tz, bench: dict) -> dict:
     details.sort(key=lambda d: (-d["is_lead"], -d["dials"]))
     return {"from": day_from, "to": day_to, "account_totals": acct,
             "callers": dict(per), "daily": dict(daily), "names": names,
+            "marked_correct": set().union(*correct_by_rec.values()) if correct_by_rec else set(),
+            "marked_wrong": set().union(*wrong_by_rec.values()) if wrong_by_rec else set(),
             "records_detail": details}
+
+
+# ---- smrtPhone: the call log is the source of truth for talk time ----
+# Jeff, 2026-10-02: use BOTH sources. DataSift says who the owner is (numbers he marked
+# Correct / Wrong, leads, statuses); smrtPhone hears every call, including callbacks from
+# numbers that are on no record. So conversations, minutes and inbound come from smrtPhone,
+# and "Correct numbers" stays exactly what he marked in DataSift.
+CALL_FIELDS = ("talk_seconds", "conversations", "meaningful_conversations", "inbound_calls",
+               "non_owner_talks", "band_brief", "band_vm")
+
+
+def _sp_is_talk(c: dict, marked_correct: set, marked_wrong: set):
+    """'owner' / 'other' / None for one smrtPhone call."""
+    if c["duration"] <= 0 or str(c["status"]).lower() not in ("completed", "answered", ""):
+        return None
+    d = str(c["disposition"]).lower()
+    num = _digits10(c["number"])
+    if c["direction"] == "inbound":
+        return "other" if "wrong" in d else "owner"     # they called us: always a real call
+    if "no answer" in d or "dead" in d or "busy" in d:
+        return None                                      # voicemail / never reached anyone
+    if "wrong" in d:
+        return "other"
+    if d in ("", "no disposition"):                      # not dispositioned: ask DataSift
+        if num in marked_correct:
+            return "owner"
+        if num in marked_wrong:
+            return "other"
+        return None
+    return "owner"                                       # Correct, Not interested, Lead, Callback...
+
+
+def add_smrtphone(res: dict, day_from: str, day_to: str, bench: dict) -> None:
+    res["call_source"] = "DataSift only"
+    try:
+        import smrtphone_calls as sp
+        calls = [c for c in sp.calls_since(day_from) if day_from <= c["day"] <= day_to]
+    except Exception as ex:                              # session expired, network...
+        log(f"smrtPhone not used ({ex}); conversations come from DataSift alone")
+        res["call_source"] = f"DataSift only - smrtPhone unavailable ({str(ex)[:80]})"
+        return
+    acct, per, daily, names = res["account_totals"], res["callers"], res["daily"], res["names"]
+    by_name = {str(n).strip().lower(): e for e, n in names.items()}
+    for scope in [acct, *per.values(), *daily.values()]:
+        for f in CALL_FIELDS:
+            scope[f] = 0
+    conv_s, mean_s, vm_s = (bench["conversation_min_seconds"],
+                            bench["meaningful_conversation_min_seconds"], bench["voicemail_max_seconds"])
+    out_dials = 0
+    for c in calls:
+        if c["direction"] == "outbound":
+            out_dials += 1
+        kind = _sp_is_talk(c, res.get("marked_correct", set()), res.get("marked_wrong", set()))
+        kind_inbound = (c["direction"] == "inbound" and c["duration"] > 0
+                        and str(c["status"]).lower() != "missed")
+        if not kind and not kind_inbound:
+            continue
+        scopes = [acct, daily.setdefault(c["day"], blank())]
+        user = str(c["user"] or "").strip()
+        if user and user != "Unassigned":
+            who = by_name.get(user.lower()) or ("sp:" + user)
+            names.setdefault(who, user)
+            scopes.append(per.setdefault(who, blank()))
+        for sc in scopes:
+            if kind_inbound:
+                sc["inbound_calls"] += 1
+            if not kind:
+                continue
+            if kind == "other":
+                sc["non_owner_talks"] += 1
+            d = c["duration"]
+            sc["talk_seconds"] += d
+            if d >= mean_s:
+                sc["meaningful_conversations"] += 1
+            if d >= conv_s:
+                sc["conversations"] += 1
+            elif d >= vm_s:
+                sc["band_brief"] += 1
+            else:
+                sc["band_vm"] += 1
+    res["call_source"] = "smrtPhone call log + DataSift"
+    res["sp_outbound"] = out_dials
+    log(f"smrtPhone: {len(calls)} call(s) in window; conversations/talk time taken from smrtPhone")
 
 
 # ---- rendering ----
@@ -747,6 +832,10 @@ def post_slack(res: dict, webhook: str, bench: dict, note: str = "") -> None:
         f"• Leads: *{a['leads']}*  |  Qualified (Cold/Warm/Hot): *{a['qualified']}*  |  Not interested: {a['not_interested']}  |  Follow-up tasks: {a['follow_ups']}",
         f"• Talk time: {fmt_hms(a['talk_seconds'])}  |  Texts: {a['sms_sent']} out / {a['sms_received']} in",
     ]
+    sp_out = res.get("sp_outbound")
+    if sp_out is not None and dials and abs(sp_out - dials) > max(5, 0.05 * dials):
+        lines.append(f"• ⚠️ Check: smrtPhone shows {sp_out} outbound calls vs {dials} dials logged in DataSift")
+    lines.append(f"_Calls & talk time: {res.get('call_source', 'DataSift only')}. Correct numbers: as marked in DataSift._")
     callers = [(e, c) for e, c in sorted(res["callers"].items(), key=lambda kv: -kv[1]["dials"])
                if any(c[k] for k in ("dials", "correct_numbers", "leads", "not_interested"))]
     if callers:
@@ -795,6 +884,7 @@ def main() -> int:
     PROBE["on"] = args.probe
     token = get_token()
     res = pull(token, day_from, day_to, tz, bench)
+    add_smrtphone(res, day_from, day_to, bench)
     md = render_md(res, bench)
     print("\n" + md)
     out_dir = HERE / "reports"

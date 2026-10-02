@@ -334,7 +334,8 @@ def _human_author(ev) -> bool:
 def blank():
     return {"dials": 0, "answered": 0, "noanswer": 0, "talk_seconds": 0, "sms_sent": 0,
             "sms_received": 0, "conversations": 0, "meaningful_conversations": 0,
-            "band_vm": 0, "band_brief": 0, "voicemails": 0, "non_owner_talks": 0, "inbound_calls": 0, "correct_numbers": 0, "wrong_numbers": 0,
+            "band_vm": 0, "band_brief": 0, "voicemails": 0, "non_owner_talks": 0, "reached": 0,
+            "inbound_owner_talks": 0, "inbound_calls": 0, "correct_numbers": 0, "wrong_numbers": 0,
             "dead_numbers": 0, "dnc_numbers": 0, "leads": 0, "qualified": 0, "not_interested": 0,
             "follow_ups": 0, "appointments": 0, "records": set(), "days": set(),
             "first_call": None, "last_call": None}
@@ -495,6 +496,9 @@ def pull(token: str, day_from: str, day_to: str, tz, bench: dict) -> dict:
                         else:
                             bump(email, day, "voicemails")
                             continue
+                    bump(email, day, "reached")
+                    if inbound:
+                        bump(email, day, "inbound_owner_talks")
                     bump(email, day, "talk_seconds", dur)
                     if dur >= mean_s:
                         bump(email, day, "meaningful_conversations")
@@ -633,7 +637,8 @@ def pull(token: str, day_from: str, day_to: str, tz, bench: dict) -> dict:
 # numbers that are on no record. So conversations, minutes and inbound come from smrtPhone,
 # and "Correct numbers" stays exactly what he marked in DataSift.
 CALL_FIELDS = ("talk_seconds", "conversations", "meaningful_conversations", "inbound_calls",
-               "non_owner_talks", "band_brief", "band_vm")
+               "non_owner_talks", "band_brief", "band_vm", "answered", "voicemails",
+               "reached", "inbound_owner_talks")
 
 
 def _sp_is_talk(c: dict, marked_correct: set, marked_wrong: set):
@@ -678,6 +683,9 @@ def add_smrtphone(res: dict, day_from: str, day_to: str, bench: dict) -> None:
         if c["direction"] == "outbound":
             out_dials += 1
         kind = _sp_is_talk(c, res.get("marked_correct", set()), res.get("marked_wrong", set()))
+        if c["direction"] == "outbound" and "no answer" in str(c["disposition"]).lower():
+            for sc in [acct, daily.setdefault(c["day"], blank())]:
+                sc["voicemails"] += 1
         kind_inbound = (c["direction"] == "inbound" and c["duration"] > 0
                         and str(c["status"]).lower() != "missed")
         if not kind and not kind_inbound:
@@ -693,8 +701,14 @@ def add_smrtphone(res: dict, day_from: str, day_to: str, bench: dict) -> None:
                 sc["inbound_calls"] += 1
             if not kind:
                 continue
+            # every counted call lands in exactly ONE bucket, so the buckets add up to "reached"
+            sc["reached"] += 1
             if kind == "other":
                 sc["non_owner_talks"] += 1
+            elif c["direction"] == "inbound":
+                sc["inbound_owner_talks"] += 1
+            else:
+                sc["answered"] += 1
             d = c["duration"]
             sc["talk_seconds"] += d
             if d >= mean_s:
@@ -728,13 +742,11 @@ def render_md(res: dict, bench: dict) -> str:
     take = bench["appointment_take_rate"]
     dials = a["dials"]
     out = [f"# KPI Report, {res['from']} to {res['to']}", "",
-           f"- Dials: {dials}  |  Owner picked up: {a['answered']} ({pct(a['answered'], dials)})  |  Voicemails: {a['voicemails']}",
-           f"  Inbound calls answered: {a['inbound_calls']}",
-           "  (live = talked to the right owner: number marked Correct and no same-day 'no answer/VM' note;"
-           " interest is measured by Leads / Not interested, not by 'live')",
-           f"- Talked to someone else (wrong number): {a['non_owner_talks']}",
-           f"- Conversations 60s+ (owner, inbound or wrong number): {a['conversations']}  |  "
-           f"Meaningful 120s+: {a['meaningful_conversations']}",
+           f"- Dials: {dials}  |  Voicemail / no answer: {a['voicemails']}",
+           f"- Reached a person: {a['reached']} = owner {a['answered']} + inbound callback "
+           f"{a['inbound_owner_talks']} + someone else (wrong #) {a['non_owner_talks']}",
+           f"- Of those: under 1 min {a['reached'] - a['conversations']}  |  1 min+ {a['conversations']}"
+           f"  |  2 min+ {a['meaningful_conversations']}  |  Calls & talk time: {res.get('call_source', 'DataSift only')}",
            f"- Correct numbers: {a['correct_numbers']} ({pct(a['correct_numbers'], dials)} right-party)"
            f"  |  Wrong {a['wrong_numbers']}  Dead {a['dead_numbers']}  DNC {a['dnc_numbers']}",
            f"- Leads: {a['leads']} (qualified Cold/Warm/Hot: {a['qualified']})  |  Not interested: {a['not_interested']}  |  "
@@ -824,13 +836,16 @@ def post_slack(res: dict, webhook: str, bench: dict, note: str = "") -> None:
     dpc = f"{dials / a['correct_numbers']:.1f}" if a["correct_numbers"] else "n/a"
     lines = [
         f"*📞 Prospecting KPIs — DataSift (KPI Engine)*  |  {period}" + (f"  |  _{note}_" if note else ""),
-        f"• Dials: *{dials}*  |  Owner picked up: {a['answered']} ({pct(a['answered'], dials)})  |  Voicemails: {a['voicemails']}  |  Inbound answered: {a['inbound_calls']}",
-        f"• Talked to someone else (wrong number): {a['non_owner_talks']}",
-        f"• Conversations 60s+ (owner, inbound or wrong number): *{a['conversations']}*  |  120s+: {a['meaningful_conversations']}",
+        f"• Dials: *{dials}*  |  Voicemail / no answer: {a['voicemails']}",
+        f"• Reached a person: *{a['reached']}*  =  owner {a['answered']}"
+        f"  +  inbound callback {a['inbound_owner_talks']}  +  someone else (wrong #) {a['non_owner_talks']}",
+        f"• Of those: under 1 min {a['reached'] - a['conversations']}"
+        f"  |  1 min+ *{a['conversations']}*  |  2 min+ *{a['meaningful_conversations']}*"
+        f"  |  Talk time {fmt_hms(a['talk_seconds'])}",
         f"• Correct numbers: *{a['correct_numbers']}* ({pct(a['correct_numbers'], dials)})  |  Dials per correct: {dpc}",
         f"• Wrong {a['wrong_numbers']}  |  Dead {a['dead_numbers']}  |  DNC {a['dnc_numbers']}",
         f"• Leads: *{a['leads']}*  |  Qualified (Cold/Warm/Hot): *{a['qualified']}*  |  Not interested: {a['not_interested']}  |  Follow-up tasks: {a['follow_ups']}",
-        f"• Talk time: {fmt_hms(a['talk_seconds'])}  |  Texts: {a['sms_sent']} out / {a['sms_received']} in",
+        f"• Texts: {a['sms_sent']} out / {a['sms_received']} in",
     ]
     sp_out = res.get("sp_outbound")
     if sp_out is not None and dials and abs(sp_out - dials) > max(5, 0.05 * dials):

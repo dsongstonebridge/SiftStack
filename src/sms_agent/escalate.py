@@ -124,6 +124,40 @@ def hot_lead(
     return _post(text, blocks, program=program)
 
 
+_REPLY_HEADLINE = {
+    "INTERESTED": "Positive reply. Call within 5 minutes.",
+    "OPT_OUT": ("Opted out. This number is suppressed and marked; do not text it. "
+                "The record's other numbers keep their texts."),
+    "WRONG_NUMBER": ("Says wrong number. This number is marked; no action needed. "
+                     "The record's other numbers keep their texts."),
+}
+
+
+def reply_alert(phone: str, inbound: str, intent: str,
+                context: Optional[dict] = None, record_uuid: str = "") -> bool:
+    """SMS_AGENT_STOP_ON_ANY_REPLY: every reply reaches a person, once.
+
+    Deliberately plainer than hot_lead(): it claims nothing about selling,
+    because "who is this?" is a reply too. The headline says what the agent
+    already did so the reader knows what is left for them.
+    """
+    ctx = context or {}
+    who = ctx.get("owner_first") or "Owner"
+    where = ", ".join(x for x in (ctx.get("street"), ctx.get("city")) if x)
+    mention = f"<@{config.HANDOFF_SLACK_ID}> " if config.HANDOFF_SLACK_ID else ""
+    headline = _REPLY_HEADLINE.get(intent, "Replied. Texts stopped; reply from the smrtPhone inbox.")
+    lines = [
+        f"{mention}*{config.HANDOFF_NAME}: SMS reply - {who}*",
+        f"{_fmt_phone(phone)}" + (f"  {where}" if where else ""),
+        f"> {inbound.strip()[:400]}",
+        headline,
+    ]
+    if record_uuid:
+        lines.append(RECORD_URL.format(uuid=record_uuid))
+    text = "\n".join(lines)
+    return _post(text, [{"type": "section", "text": {"type": "mrkdwn", "text": text}}])
+
+
 def draft_for_approval(
     phone: str,
     inbound: str,

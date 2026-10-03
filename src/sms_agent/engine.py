@@ -160,6 +160,9 @@ def handle_inbound(payload: dict) -> dict:
         if context:
             store.map_phone(phone, record_uuid=record_uuid, context=context)
 
+    if config.STOP_ON_ANY_REPLY:
+        outcome["actions"] += _stop_on_reply(phone, record_uuid, body, result, context)
+
     # ---- terminal intents: write, suppress, stop talking ----
     if result.intent == "OPT_OUT":
         outcome["actions"] += _do_opt_out(phone, record_uuid, matches, body)
@@ -174,6 +177,20 @@ def handle_inbound(payload: dict) -> dict:
     if result.intent == "ESCALATE":
         outcome["actions"] += _do_sensitive(phone, record_uuid, body, result, matches)
         outcome["action"] = "escalated"
+        return outcome
+
+    if config.STOP_ON_ANY_REPLY:
+        # The automation is finished with this record; a person has it now.
+        # Record the reply on the property so it is visible in the CRM, and
+        # mark the line CORRECT only on a positive reply (a "who is this?"
+        # proves the line works, not that it reaches the owner).
+        if config.PHASE >= 2 and record_uuid:
+            crm.post_note(record_uuid, f"SMS reply from {phone}: \"{body[:250]}\"", pinned=True)
+            if result.intent == "INTERESTED":
+                outcome["actions"].append(
+                    "phone status -> CORRECT: "
+                    + _report(crm.set_phone_status(record_uuid, phone, "CORRECT")))
+        outcome["action"] = "handed_to_human"
         return outcome
 
     # ---- live conversation ----
@@ -243,6 +260,54 @@ def handle_inbound(payload: dict) -> dict:
                                     context, program)
     outcome["action"] = "replied"
     return outcome
+
+
+_FINAL_STATES = ("opted_out", "closed")
+
+
+def _stop_on_reply(phone: str, record_uuid: str, body: str, result,
+                   context: dict) -> list[str]:
+    """SMS_AGENT_STOP_ON_ANY_REPLY: one reply ends the automation for the
+    whole RECORD, and a person is told once.
+
+    Local writes only up to the Slack post, so it is safe under DRY_RUN and
+    runs before any CRM call can fail. Never downgrades an opted-out or
+    closed line to merely paused.
+    """
+    acts = []
+    # Opt-out and wrong number speak for THIS LINE only (Jeff, 2026-10-03):
+    # "wrong number" is evidence the line is not the owner, and a STOP is a
+    # per-number opt-out. The terminal handlers below already suppress and
+    # close the line; the owner's other numbers keep their sequence.
+    # Anything else is a person engaging, so the whole record stops.
+    whole_record = result.intent not in TERMINAL_INTENTS
+    lines = [phone]
+    if whole_record:
+        lines += [p for p in store.phones_for_record(record_uuid) if p != phone]
+        if record_uuid:
+            store.set_meta(f"record_replied:{record_uuid}", phone)
+    stopped = cancelled = 0
+    for line in lines:
+        conv = store.ensure_conversation(line)
+        cancelled += store.cancel_queued(line, f"record replied from {phone}")
+        if conv.get("state") not in _FINAL_STATES:
+            store.pause_conversation(
+                line, f"replied; handed to {config.HANDOFF_NAME}"
+                if line == phone else f"record replied from {phone}")
+            stopped += 1
+    acts.append(f"automation stopped on {stopped} line(s) of this record, "
+                f"{cancelled} queued text(s) cancelled")
+
+    # Sensitive replies already post their own, louder alert.
+    if result.intent == "ESCALATE" or config.PHASE < 2:
+        return acts
+    if store.mark_notified(phone, "reply"):
+        ok = escalate.reply_alert(phone, body, result.intent, context, record_uuid)
+        acts.append(f"posted reply alert for {config.HANDOFF_NAME}" if ok
+                    else "reply alert FAILED to post")
+    else:
+        acts.append("reply alert already posted for this line")
+    return acts
 
 
 def _do_opt_out(phone: str, record_uuid: str, matches: Optional[list] = None,

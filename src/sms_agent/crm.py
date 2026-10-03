@@ -495,6 +495,41 @@ def find_records_by_phone(phone: str, limit: int = 10) -> list[dict]:
     return out
 
 
+_text_touch_fields: dict = {}
+
+
+def text_touch(record_uuid: str, touch: int) -> tuple[str, str]:
+    """(copy, "") for the record's `Text Touch <n>` custom field, or
+    ("", reason) when it cannot be used. Read-only.
+
+    Used by SMS_AGENT_TOUCH_SOURCE=fields. Every failure returns a reason
+    rather than raising, so the caller holds THIS record and keeps building.
+    """
+    c = client()
+    if not c or not record_uuid:
+        return "", "no CRM client to read the Text Touch field"
+    label = f"Text Touch {touch}"
+    try:
+        if not _text_touch_fields:
+            body = request_retry(c, "/api/internal/custom-fields/?limit=999") or {}
+            rows = body.get("results", body) if isinstance(body, dict) else body
+            for f in rows or []:
+                if isinstance(f, dict) and str(f.get("label", "")).startswith("Text Touch "):
+                    _text_touch_fields[f["label"]] = f.get("uuid")
+        field_uuid = _text_touch_fields.get(label)
+        if not field_uuid:
+            return "", f"no '{label}' custom field in this account"
+        body = request_retry(c, f"/api/internal/property/{record_uuid}/custom-field/") or {}
+        rows = body.get("results", body) if isinstance(body, dict) else body
+    except Exception as exc:  # noqa: BLE001 - hold the record, keep the build going
+        return "", f"could not read {label} from the CRM ({str(exc)[:60]})"
+    for item in rows or []:
+        if isinstance(item, dict) and (item.get("custom_field") or {}).get("uuid") == field_uuid:
+            value = str(item.get("value") or "").strip()
+            return (value, "") if value else ("", f"{label} is blank on this record")
+    return "", f"{label} is blank on this record"
+
+
 def record_phones(record_uuid: str) -> list[str]:
     """Every phone on the record, cleaned to 10 digits.
 

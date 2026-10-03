@@ -49,9 +49,55 @@ def drain_events(limit: int = 50) -> int:
 
 # ------------------------------------------------------------------ outbox
 
+REPLY_CHECK_KEY = "reply_check_ok_at"
+_last_blind_alert = 0.0
+
+
+def reply_check_stale() -> str:
+    """Why sending must wait, or "" when replies were seen recently enough.
+
+    Only active with SMS_AGENT_REPLY_CHECK_MAX_AGE. Never having had a good
+    poll counts as stale: the first pass of the day proves the session works
+    before anything goes out.
+    """
+    limit = config.REPLY_CHECK_MAX_AGE_MINUTES
+    if not limit:
+        return ""
+    last = store.get_meta(REPLY_CHECK_KEY)
+    if not last:
+        return "no successful smrtPhone reply check yet"
+    try:
+        age = (datetime.now(timezone.utc) - datetime.fromisoformat(last)).total_seconds() / 60
+    except ValueError:
+        return f"unreadable reply-check timestamp {last!r}"
+    if age > limit:
+        return f"last successful smrtPhone reply check was {age:.0f} min ago (limit {limit})"
+    return ""
+
+
+def _warn_blind(reason: str) -> None:
+    """Log every time, alert at most hourly: a stuck session is one problem."""
+    global _last_blind_alert
+    log.warning("SENDING HELD: %s", reason)
+    if time.time() - _last_blind_alert >= 3600:
+        _last_blind_alert = time.time()
+        from . import escalate
+
+        escalate.alert("SMS sending is HELD", f"{reason}. Texts wait until the smrtPhone "
+                       "login works again (re-run kpi-engine/smrtphone_login.bat).")
+
+
 def drain_outbox(limit: int = 25) -> dict:
     """Send what is due. Every guard lives here and nowhere else."""
     sent = held = skipped = failed = 0
+
+    blind = reply_check_stale()
+    if blind:
+        # Cannot see replies, so cannot know who must not be texted.
+        # Hold everything; the next good poll releases it unchanged.
+        _warn_blind(blind)
+        return {"sent": 0, "held": len(store.due_outbox(limit)), "skipped": 0,
+                "failed": 0, "blind": blind}
 
     for row in store.due_outbox(limit):
         phone = row["phone"]
@@ -84,6 +130,26 @@ def drain_outbox(limit: int = 25) -> dict:
             store.mark_outbox(row["id"], "cancelled", moved)
             skipped += 1
             continue
+
+        if config.SEND_TIME_PHONE_CHECK:
+            from . import seed
+
+            rec_uuid = (conv.get("record_uuid")
+                        or (store.lookup_phone(phone) or {}).get("record_uuid") or "")
+            if not rec_uuid:
+                store.mark_outbox(row["id"], "cancelled", "no record to re-check the number against")
+                skipped += 1
+                continue
+            ok, why = seed.phone_still_textable(rec_uuid, phone)
+            if ok is None:
+                log.info("holding outbox %s: %s", row["id"], why)
+                held += 1
+                continue
+            if not ok:
+                store.mark_outbox(row["id"], "cancelled", f"send-time check: {why}")
+                log.info("cancelled outbox %s -> %s: %s", row["id"], phone, why)
+                skipped += 1
+                continue
 
         if not sender_pool.within_quiet_hours(phone):
             nb = sender_pool.next_send_window(phone).isoformat(timespec="seconds")
@@ -278,10 +344,16 @@ def run_once(with_reconcile: bool = True) -> dict:
     # writer at a time) so the two loops do not corrupt each other.
     _start_campaign_thread()
 
+    # Fail-closed installs read replies BEFORE sending: with no webhook the
+    # log poll is the only way a reply is seen, and a send that runs ahead
+    # of it can text someone who answered minutes ago.
+    early: dict = {}
+    if config.REPLY_CHECK_MAX_AGE_MINUTES:
+        _reconcile_pass(early, with_reconcile)
     events = drain_events()
     handoffs = flush_escalations()
     outbox = drain_outbox()
-    result = {"events": events, "handoffs": handoffs, **outbox}
+    result = {"events": events, "handoffs": handoffs, **outbox, **early}
     if _campaign_result.get("released"):
         result["campaign_released"] = _campaign_result.pop("released")
 
@@ -298,6 +370,14 @@ def run_once(with_reconcile: bool = True) -> dict:
         except Exception:  # noqa: BLE001 - a bookkeeping sweep must not stop sends
             log.exception("handoff re-pin sweep failed")
 
+    if not config.REPLY_CHECK_MAX_AGE_MINUTES:
+        _reconcile_pass(result, with_reconcile)
+    return result
+
+
+def _reconcile_pass(result: dict, with_reconcile: bool) -> None:
+    """The smrtPhone log backstop (moved verbatim out of run_once so the
+    fail-closed mode can run it BEFORE the outbox drains)."""
     # Backstop poll. smrtPhone gives no delivery guarantee, so a dropped
     # webhook is a lost reply with nothing to notice it. This catches those.
     global _last_reconcile
@@ -316,6 +396,8 @@ def run_once(with_reconcile: bool = True) -> dict:
                     result["takeovers_recovered"] = rec["outbound_replayed"]
                 if rec.get("error"):
                     log.warning("reconcile failed: %s", rec["error"])
+                else:
+                    store.set_meta(REPLY_CHECK_KEY, store.now())
             except Exception:  # noqa: BLE001 - never let the backstop stop the loop
                 log.exception("reconcile pass failed")
 
@@ -334,7 +416,6 @@ def run_once(with_reconcile: bool = True) -> dict:
                     log.warning("call takeover failed: %s", calls["error"])
             except Exception:  # noqa: BLE001 - never let the backstop stop the loop
                 log.exception("call takeover pass failed")
-    return result
 
 
 def run_forever(interval: int = 20) -> None:

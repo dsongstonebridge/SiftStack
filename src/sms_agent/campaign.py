@@ -84,6 +84,24 @@ SOURCES = [
     Source("FTM - 03 Call Attempt 1", 0.05, deep=True),
 ]
 
+
+def _sources_from_env(raw: str) -> list:
+    """SMS_AGENT_CAMPAIGN_SOURCES -> [Source]. Refuses a malformed entry
+    outright, because a source that silently fails to parse is a book that
+    never gets texted."""
+    out = []
+    for part in [p.strip() for p in raw.split(";") if p.strip()]:
+        bits = [b.strip() for b in part.split("|")]
+        if len(bits) not in (2, 3) or not bits[0]:
+            raise ValueError(f"bad SMS_AGENT_CAMPAIGN_SOURCES entry: {part!r}")
+        deep = len(bits) == 3 and bits[2].lower() in ("deep", "1", "true")
+        out.append(Source(bits[0], float(bits[1]), deep=deep))
+    return out
+
+
+if config.CAMPAIGN_SOURCES:
+    SOURCES = _sources_from_env(config.CAMPAIGN_SOURCES)
+
 # Kept so anything still importing it keeps working; the shares live above.
 STAGE_TOUCHES = [(s.title, 0) for s in SOURCES]
 

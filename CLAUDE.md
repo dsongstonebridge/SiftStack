@@ -1729,6 +1729,79 @@ brief 21, 2 min+ 0, Talk 16m18s, Correct 12, Wrong 26, Dead 27, Leads 0, NI 4, F
 **Never commit:** `.env`, `kpi-bot/.env`, `kpi-bot/service_account.json`,
 `smrtphone_state.json`, `kpi-engine/manual_calls.csv`, `kpi-engine/reports/`.
 
+## Tulsa Text Touches + SMS Agent for Diego (2026-10-02/03, IN PROGRESS)
+
+**Goal (Jeff):** Ty's two-way SMS agent (`src/sms_agent/`) texts FTM records the
+four text touches automatically, weekdays only, signed Diego from Diego's 3
+smrtPhone numbers, and tags Diego in Slack `#SMS` whenever someone replies.
+Runs on Jeff's PC (no Fly), with no Anthropic key. **Proceed with caution:
+nothing has been texted by the agent yet.** Rollout order: dry run on real
+FTM records -> one canary text to Jeff's phone -> day-1 cap ~5 -> raise.
+
+**Text Touch fields (done 2026-10-02).** Text Touch 1-4 custom fields (text,
+property) in a new `Misc.` group; written to all 78 FTM records (02 Ready to
+Call + Call Attempts 1-3) and read back. They are now REFERENCE ONLY: the agent
+writes its own copy, and that copy matches the fields word for word (312 of
+312), because both use the same pools, the same md5 seed
+(`street|owner_full`) and the same `7**i` selection. Keep the pools in sync:
+the named "Hi there!" Touch 1 variant was removed from BOTH the skill and
+`knowledge/touches.py`. `touches.fix_ordinals()` lowercases "103Rd" -> "103rd"
+(DataSift title-cases streets; Ty's agent had no fix).
+
+**Fork switches (all default OFF, so Ty's behaviour is unchanged upstream):**
+
+| Env | What it does |
+|---|---|
+| `SMS_AGENT_STOP_ON_ANY_REPLY=1` | Any reply stops every queued + future touch to EVERY number on the record and posts once to Slack tagging Diego. **Exception (Jeff): STOP/opt-out and wrong number stop only THAT number**; the record's other lines keep going. Upstream let a neutral "who is this?" and a reply from the owner's second line leave the next touch live. |
+| `SMS_AGENT_SEND_TIME_PHONE_CHECK=1` | Fresh DataSift re-read right before each send: status not DNC/WRONG/DEAD, Dial First/Second, not a known landline. The build runs once a morning and sends trickle all day, so a number marked Wrong at 10am would otherwise get the 2pm text. Unreadable = hold. |
+| `SMS_AGENT_REPLY_CHECK_MAX_AGE=10` | Fail closed: no send unless the smrtPhone log poll succeeded within N minutes, and the poll now runs BEFORE the outbox drains. Without webhooks the poll is the only way a reply is seen, and upstream kept sending when it failed. |
+| `SMS_AGENT_CAMPAIGN_SOURCES` | `Title|share|deep;...`. Ty's sources are hard-coded with HIS preset titles ("FTM - 02 ...", "Adriana - Actively Prospecting"); ours are "FTM- 02 ...". |
+| `SMS_AGENT_SLACK_FALLBACK=0` | Never fall back to `SLACK_WEBHOOK_URL` (the KPI channel). **Slack posts are NOT gated by DRY_RUN.** |
+| `SMS_AGENT_TOUCH_SOURCE=fields` | Send the Text Touch field verbatim (blank = hold). Built and tested but NOT used: pool mode matches the fields exactly. |
+
+Set in `.env` (gitignored): `SMS_AGENT_SLACK_WEBHOOK` (#SMS),
+`SMS_AGENT_HANDOFF_SLACK_ID=U0BDZ4DS1B4`, `SMS_AGENT_HANDOFF_NAME=Diego`,
+`SMS_AGENT_SLACK_FALLBACK=0`. Test post to #SMS tagging Diego landed 2026-10-03.
+
+**Bugs found in Ty's agent on this account, all fixed:**
+- **The agent had no CRM at all here**: it looks for Ty's Deal Room checkout or
+  `REISIFT_API_KEY`. `config.REISIFT_API_KEY` now falls back to `DATASIFT_API_KEY`.
+- **5-digit Tulsa house numbers read as zip codes**: `respond.validate` blocks any
+  5-digit run, so 15 of 78 FTM owners ("16547 E 2nd Pl") would have been
+  silently held forever. `seed.build` now passes the record's street as
+  `allowed_address`; a stray zip elsewhere is still blocked.
+
+**Phone rules (Jeff), enforced at build AND send time:** mobile always; UNKNOWN
+line type only at Dial First/Second; known LANDLINE/VOIP never; Dial Third,
+Fourth, Drop and untagged never (a litigator flag carries no tier, so it is out
+too); status DNC, CORRECT_DNC, WRONG_DNC, WRONG, DEAD never. Measured on all 78
+FTM records: 158 of 507 phones qualify, 72 of 78 records have one. One number
+per record per touch (Dial First > Second, then mobile > unknown).
+
+**smrtPhone:** the API key SENDS only (verified with the no-send `/sms/send`
+check); it cannot read messages, so replies come from the web-session log
+(`smrtphone_state.json`, same session as the KPI engine, expires ~Oct 31). When it
+expires the fail-closed switch holds every send and alerts #SMS. 3 numbers are
+routed to "Diego Hoemann" (`cli.py numbers --refresh --dry-run`), 25/day each.
+Jeff is adding them to the newly approved A2P campaign (approved 2026-10-02).
+
+**Tests:** `python tests/test_sms_agent_tulsa.py` (42 checks, offline, stubbed).
+Ty's `cli.py selftest` fails 4 of 251 on UNMODIFIED code too: three Eastern-time
+window tests vs the fork's Chicago tz, and no `fastapi` (the webhook receiver,
+unused on a desktop install).
+
+**Gotcha hit twice this session:** a `\b` regex written through a bash heredoc
+lands as a literal backspace byte and silently matches nothing. Write regex
+files with the Write tool, or build the string with `chr(92)`, and assert on
+known inputs.
+
+**Still to do:** confirm A2P for Diego's numbers; set `SMS_AGENT_CAMPAIGN_SOURCES`
+to the FTM presets + `STOP_ON_ANY_REPLY`, `SEND_TIME_PHONE_CHECK`,
+`REPLY_CHECK_MAX_AGE`, `SENDER_NAME=Diego`, `PHASE=2`, `CAMPAIGN=1`; dry run on
+real records (DRY_RUN=1, watch Slack); canary; Windows task running
+`cli.py work --loop` on weekdays; decide same-day vs next-morning queueing for
+records created mid-day.
+
 ## DataSift.ai (REISift) Integration
 
 DataSift.ai (formerly REISift) is the CRM where scraped records land for niche sequential marketing campaigns.

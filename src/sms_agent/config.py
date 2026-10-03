@@ -81,10 +81,17 @@ SIFT_ACCOUNT = _env("SMS_AGENT_SIFT_ACCOUNT", "datasift-apikey")
 SIFT_IMPERSONATE = _env("SMS_AGENT_SIFT_IMPERSONATE", "")  # e.g. ty+2@dataflik.com
 # No-expiry Open API key. This is what lets the agent run on a cloud box with no
 # Deal Room checkout on disk, and it cannot go stale mid-run the way a JWT does.
-REISIFT_API_KEY = _env("REISIFT_API_KEY", "")
+# The Tulsa fork's .env names this key DATASIFT_API_KEY (same key, same
+# Api-Key header); without the fallback the agent ran with no CRM at all.
+REISIFT_API_KEY = _env("REISIFT_API_KEY", "") or _env("DATASIFT_API_KEY", "")
 
 # ---------------------------------------------------------------- Slack
-SLACK_WEBHOOK_URL = _env("SMS_AGENT_SLACK_WEBHOOK") or _env("SLACK_WEBHOOK_URL", "")
+# SMS_AGENT_SLACK_FALLBACK=0 refuses the shared SLACK_WEBHOOK_URL: in the Tulsa
+# fork that one is the KPI channel, and a seller reply posted there is a lead
+# nobody watching it will act on. Default 1 keeps upstream behaviour.
+SLACK_WEBHOOK_URL = _env("SMS_AGENT_SLACK_WEBHOOK") or (
+    _env("SLACK_WEBHOOK_URL", "")
+    if _env("SMS_AGENT_SLACK_FALLBACK", "1") not in ("0", "false", "no") else "")
 # The dispo program posts to its OWN channel. Buyer traffic and seller
 # traffic are different audiences and different people act on them, so
 # a single webhook would put 'a price went out to 156 buyers' in the
@@ -144,6 +151,38 @@ CAMPAIGN_DAILY_CAP = int(_env("SMS_AGENT_CAMPAIGN_DAILY_CAP", "0"))  # 0 = pool 
 # fell from 180 to 19 over four days in August and nothing said so; this is the
 # line that would have caught it the first morning.
 CAMPAIGN_MIN_EXPECTED = int(_env("SMS_AGENT_CAMPAIGN_MIN_EXPECTED", "0"))
+
+# Which presets the morning build draws from, in priority order. Ty's list is
+# hard-coded in campaign.SOURCES with his own preset titles; a title that does
+# not resolve is a silent zero, so the Tulsa fork names its own here.
+# Format: "Title|share|deep;Title|share|deep". Empty keeps campaign.SOURCES.
+CAMPAIGN_SOURCES = _env("SMS_AGENT_CAMPAIGN_SOURCES", "")
+
+# ---- Tulsa fork switches (Jeff, 2026-10-03). All default OFF, so Ty's
+# behaviour is unchanged unless a deployment opts in.
+#
+# Any reply at all stops the automation for that RECORD: every queued and
+# future touch to every number on it. Upstream only stops on opt-out, wrong
+# number, sensitive and interested; a neutral "who is this?" left the next
+# touch live, and a reply from the owner's second line left the first line's
+# touch live. Each reply also posts once to Slack tagging HANDOFF_NAME.
+STOP_ON_ANY_REPLY = _env("SMS_AGENT_STOP_ON_ANY_REPLY", "0") in ("1", "true", "True")
+# Where touch copy comes from. "pool" renders knowledge/touches.py (upstream).
+# "fields" sends the record's own Text Touch 1-4 custom field VERBATIM, the
+# copy the text-touch-builder skill wrote and a human reviewed. A blank field
+# holds the record; the agent never improvises copy in this mode.
+TOUCH_SOURCE = _env("SMS_AGENT_TOUCH_SOURCE", "pool").strip().lower()
+# Fail closed when replies cannot be seen. With no public webhook (a desktop
+# install) the smrtPhone log poll is the ONLY way a reply is noticed, and
+# upstream kept sending when that poll failed. Above this many minutes since
+# the last successful poll, nothing sends. 0 disables (upstream behaviour).
+REPLY_CHECK_MAX_AGE_MINUTES = int(_env("SMS_AGENT_REPLY_CHECK_MAX_AGE", "0"))
+# Re-read the number in DataSift immediately before each send and refuse it
+# unless it STILL passes the morning build's rules (status not DNC/WRONG/DEAD,
+# Dial First or Second, not a known landline). The build runs once and sends
+# trickle out all day, so a number a caller marks Wrong at 10am would otherwise
+# still get the 2pm text. Unreadable = held, never sent unchecked.
+SEND_TIME_PHONE_CHECK = _env("SMS_AGENT_SEND_TIME_PHONE_CHECK", "0") in ("1", "true", "True")
 
 # May we text a phone whose do-not-call flag we cannot see?
 #

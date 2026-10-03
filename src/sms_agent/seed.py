@@ -125,6 +125,32 @@ def textable_line(phone_type: str, tier: str) -> tuple[bool, str]:
     return False, f"not a mobile number ({t.lower()})"
 
 
+def phone_still_textable(record_uuid: str, phone: str) -> tuple[Optional[bool], str]:
+    """The send-time re-check. (True, "") to send, (False, why) to cancel,
+    (None, why) when the record could not be read, which means HOLD.
+
+    Same three rules as the build, against a FRESH read of the record.
+    """
+    try:
+        _, obj = crm.find_phone_object(record_uuid, phone, fresh=True)
+    except Exception as exc:  # noqa: BLE001 - unreadable is a hold, not a pass
+        return None, f"could not re-read the number ({str(exc)[:60]})"
+    if obj is None:
+        if crm.get_record(record_uuid) is None:
+            return None, "could not re-read the record"
+        return False, "number is no longer on the record"
+    status = (obj.get("status") or "").upper()
+    if status in SKIP_PHONE_STATUSES:
+        return False, f"number now marked {status}"
+    tier = crm.dial_tier(record_uuid, phone)
+    if tier not in ALLOWED_DIAL_TIERS:
+        return False, f"dial tier now {tier or 'untagged'}"
+    ok, why = textable_line(obj.get("type"), tier)
+    if not ok:
+        return False, why
+    return True, ""
+
+
 def from_preset(title: str, limit: int = 0, keep_unresolved: bool = False,
                 stats: Optional[dict] = None) -> tuple[list[dict], str]:
     """Pull the cohort straight from a DataSift filter preset.
@@ -388,6 +414,11 @@ def build(rows: Iterable[dict], touch: int, sender_fallback: str = "",
             # conversation is the same failure as two people texting at once.
             out.append(cand.hold("already replied; touch would interrupt a live thread"))
             continue
+        if config.STOP_ON_ANY_REPLY and not new_deal and _record_replied(cand.record_uuid):
+            # Any line on this record answered. The owner replying from their
+            # second number is still the owner replying.
+            out.append(cand.hold("another number on this record already replied"))
+            continue
 
         # Entities and initials-only owners get owner-of-the-address wording.
         # Only a real owner FIRST NAME may become a greeting. Falling back to
@@ -407,16 +438,32 @@ def build(rows: Iterable[dict], touch: int, sender_fallback: str = "",
             out.append(cand.hold("no assigned caller name; a touch is signed or it is not sent"))
             continue
 
-        cand.message = touches.render(
-            touch,
-            seed=f"{cand.street}|{cand.owner_full}".lower(),
-            first=cand.first,
-            addr=cand.street,
-            city=cand.city,
-            sender=cand.sender,
-        )
+        if config.TOUCH_SOURCE == "fields":
+            # Send the reviewed copy on the record, verbatim. Never fall back
+            # to the pool: an unreviewed text is exactly what this mode exists
+            # to prevent, so a blank or unreadable field holds the record.
+            copy, why = crm.text_touch(cand.record_uuid, touch)
+            if not copy:
+                out.append(cand.hold(why))
+                continue
+            cand.message = copy
+        else:
+            cand.message = touches.render(
+                touch,
+                seed=f"{cand.street}|{cand.owner_full}".lower(),
+                first=cand.first,
+                addr=cand.street,
+                city=cand.city,
+                sender=cand.sender,
+            )
 
-        ok, problems = respond.validate(cand.message, max_questions=2)
+        # The record's own street line is exempt from the zip check: Tulsa
+        # house numbers run to five digits ("16547 E 2nd Pl"), and without the
+        # exemption every such owner was silently held (15 of 78 FTM records,
+        # 2026-10-03). A zip anywhere else in the text is still blocked.
+        ok, problems = respond.validate(
+            cand.message, max_questions=2,
+            allowed_address=touches.fix_ordinals(cand.street))
         if not ok:
             out.append(cand.hold("copy failed the human-voice check: " + "; ".join(problems)))
             continue
@@ -424,6 +471,15 @@ def build(rows: Iterable[dict], touch: int, sender_fallback: str = "",
         already_queued_this_run.add(phone)
         out.append(cand)
     return out
+
+
+def _record_replied(record_uuid: str) -> bool:
+    """True when a reply on any line stopped this whole record.
+
+    Set by engine._stop_on_reply. An opt-out or wrong-number reply does not
+    set it: those stop only their own line, which the per-phone checks above
+    already hold."""
+    return bool(record_uuid and store.get_meta(f"record_replied:{record_uuid}"))
 
 
 def _resolve_sender(row: dict, record_uuid: str, fallback: str) -> str:

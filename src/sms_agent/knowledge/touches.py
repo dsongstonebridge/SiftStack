@@ -19,7 +19,6 @@ TOUCH1 = [
     "Hi {first}! I hope your week is going great. My name is {sender}, I was looking at {addr} and was wondering if it's yours? Thanks so much!",
     "Hi {first}, I pray all is well your way! I'm {sender}, and I know this is random, but does {addr} happen to be yours? Do I have the right person?",
     "Hey {first}, I hope you are doing great! I'm not even sure I have the right number, but is {addr} yours? Thank you! {sender}",
-    "Hi there! I hope things are going well for you. This is {sender}, hoping to speak with {first} about {addr}. Do I have the right number?",
     "Hi {first}! My name is {sender}. I've been looking at {addr} in {city} and was wondering, does it belong to you by any chance? Have a great day!",
 ]
 TOUCH1_NONAME = [
@@ -454,5 +453,12 @@ def render(touch: int, seed: str, first: str, addr: str, city: str, sender: str,
     chosen = noname if not first else pool
     n = int(hashlib.md5(seed.encode()).hexdigest(), 16)
     template = chosen[(n // (7 ** (touch - 1))) % len(chosen)]
-    text = template.format(first=first, addr=addr, city=city or "the area", sender=sender)
+    text = template.format(first=first, addr=fix_ordinals(addr), city=city or "the area", sender=sender)
     return re.sub(r"\s+", " ", text).strip()
+
+
+def fix_ordinals(addr: str) -> str:
+    """"2318 S 103Rd Ave E" -> "2318 S 103rd Ave E". DataSift title-cases
+    street names, and a capitalized ordinal is the first thing that makes a
+    text read machine-written. Matches the text-touch-builder fields."""
+    return re.sub(r"(\d)(St|Nd|Rd|Th)\b", lambda m: m.group(1) + m.group(2).lower(), addr or "")

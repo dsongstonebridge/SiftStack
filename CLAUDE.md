@@ -1782,7 +1782,7 @@ per record per touch (Dial First > Second, then mobile > unknown).
 check); it cannot read messages, so replies come from the web-session log
 (`smrtphone_state.json`, same session as the KPI engine, expires ~Oct 31). When it
 expires the fail-closed switch holds every send and alerts #SMS. 3 numbers are
-routed to "Diego Hoemann" (`cli.py numbers --refresh --dry-run`), 25/day each.
+routed to Diego (`cli.py numbers --refresh --dry-run`), 25/day each.
 Jeff is adding them to the newly approved A2P campaign (approved 2026-10-02).
 
 **Tests:** `python tests/test_sms_agent_tulsa.py` (42 checks, offline, stubbed).

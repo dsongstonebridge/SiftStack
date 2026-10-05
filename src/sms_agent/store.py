@@ -287,6 +287,22 @@ def get_conversation(phone: str) -> Optional[dict]:
     return dict(row) if row else None
 
 
+def record_from_number(record_uuid: str) -> str:
+    """The sending number already used for ANY phone on this record.
+
+    Jeff, 2026-10-05: every phone on one record is texted from the same
+    smrtPhone number. Oldest conversation wins so the answer is stable.
+    """
+    if not record_uuid:
+        return ""
+    row = _conn().execute(
+        "SELECT from_number FROM conversations WHERE record_uuid=? "
+        "AND COALESCE(from_number,'')!='' ORDER BY created_at LIMIT 1",
+        (record_uuid,),
+    ).fetchone()
+    return row[0] if row else ""
+
+
 def ensure_conversation(phone: str, from_number: str = "", record_uuid: str = "") -> dict:
     p = clean_phone(phone)
     with tx() as c:

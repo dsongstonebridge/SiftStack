@@ -278,6 +278,8 @@ def build(sender_fallback: str = "", log_pages: int = 6,
             "holds": {},
         }
 
+    followups_only = False
+
     def take(src: Source, quota: int) -> int:
         """Vet this source's rows until `quota` candidates are ready."""
         if quota <= 0 or src.title not in fetched:
@@ -355,6 +357,10 @@ def build(sender_fallback: str = "", log_pages: int = 6,
                 else:
                     plan.skipped_waiting += 1
                 continue
+            if followups_only and touch == 1:
+                # Pass zero continues a record's sequence on the numbers that
+                # are in it; it never opens a new number mid-sequence.
+                continue
 
             built = seed.build([row], touch=touch, sender_fallback=sender_fallback)
             cand = built[0] if built else None
@@ -375,6 +381,33 @@ def build(sender_fallback: str = "", log_pages: int = 6,
         return taken
 
     cap = limit or 0
+    if config.FOLLOWUPS_FIRST:
+        # Pass zero (Tulsa fork): records that already had a touch and are due
+        # the next one go first, ahead of every source's share. A record counts
+        # if ANY of its phones has history, so a whole household advances.
+        due_records = set()
+        for ph, entry in history.items():
+            touch, _ = next_touch(entry, min_days, today)
+            if touch and touch > 1:
+                mapped = store.lookup_phone(ph) or {}
+                if mapped.get("record_uuid"):
+                    due_records.add(mapped["record_uuid"])
+        for src in SOURCES:
+            if src.title not in fetched:
+                continue
+            rows = fetched[src.title]
+            due = [r for r in rows if r.get("uuid") in due_records]
+            if not due:
+                continue
+            fetched[src.title] = due
+            followups_only = True
+            take(src, (cap or len(due) * 10) - len(plan.candidates))
+            followups_only = False
+            # Records mid-sequence stay out of today's new-number passes too.
+            fetched[src.title] = [r for r in rows if r.get("uuid") not in due_records]
+            if cap and len(plan.candidates) >= cap:
+                break
+
     if cap:
         # Pass one: each source fills its own reserved share, so a big source
         # cannot eat a small one's allocation.

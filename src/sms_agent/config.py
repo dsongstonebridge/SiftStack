@@ -204,6 +204,11 @@ IGNORE_DNC_FLAG = _env("SMS_AGENT_IGNORE_DNC_FLAG", "0") in ("1", "true", "True"
 # A record with a number marked Correct still gets only that number.
 TEXT_ALL_BEST = _env("SMS_AGENT_TEXT_ALL_BEST", "0") in ("1", "true", "True")
 
+# Tulsa fork (Jeff, 2026-10-05): records already in the sequence get their
+# next touch BEFORE anyone new gets touch 1. Without it the per-source shares
+# cut follow-ups off (six of 23 due owners missed touch 2 in a dry run).
+FOLLOWUPS_FIRST = _env("SMS_AGENT_FOLLOWUPS_FIRST", "0") in ("1", "true", "True")
+
 # Tulsa fork (Jeff, 2026-10-05): DataSift's do-not-call flag belongs to ONE
 # number, not the owner. Upstream drops the whole record when the search row's
 # representative phone is flagged; with this on, that number is skipped and

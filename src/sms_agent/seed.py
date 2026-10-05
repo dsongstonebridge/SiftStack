@@ -310,10 +310,131 @@ def spoken_on(events: list, phone: str) -> str:
     return ""
 
 
+# Phone relationship tags (the probate/co-borrower tag set) -> words a caller
+# writes on the board. Jeff, 2026-10-05 (8110 S Birch Ave): a number tagged Wife
+# is texted to the WIFE by name, from the second owner or the board. Greeting
+# the primary owner on his wife's phone is the mistake this prevents.
+RELATION_TAGS = {
+    "Wife": ("wife",), "Husband": ("husband",), "Son": ("son",),
+    "Daughter": ("daughter",), "Grandchild": ("grandson", "granddaughter", "grandchild"),
+    "Relative": (),
+}
+_SPOUSE_TAGS = {"Wife", "Husband"}
+_NAME_STOP = {
+    "Left", "Said", "Says", "Answered", "Called", "Call", "Is", "The", "She", "He",
+    "Not", "No", "Vm", "VM", "Wants", "Will", "Was", "Has", "Had", "And", "But",
+    "Picked", "Hung", "Texted", "Number", "Phone", "Cell", "Mom", "Dad", "Owner",
+}
+
+
+def _tag_names(obj: dict) -> set:
+    return {
+        (t.get("title") or t.get("name") or t.get("tag")) if isinstance(t, dict) else str(t)
+        for t in (obj.get("tags") or [])
+    }
+
+
+def _name_from_notes(texts: list, words: tuple, avoid: str) -> str:
+    """A first name a caller wrote next to the relationship word, or ""."""
+    if not words:
+        return ""
+    alt = "|".join(words)
+    pats = [
+        re.compile(r"(?i:\b(?:" + alt + r")\b)(?:'s name is|'s name|\s+is named|\s+named|\s+is|\s*[:,-])?\s+([A-Z][a-z]{1,14})\b"),
+        re.compile(r"\b([A-Z][a-z]{1,14})\s*\(\s*(?i:(?:the\s+)?(?:" + alt + r"))\s*\)"),
+        re.compile(r"\b([A-Z][a-z]{1,14}),?\s+(?i:(?:his|her|the)\s+(?:" + alt + r"))\b"),
+    ]
+    for text in texts:
+        for pat in pats:
+            for m in pat.finditer(text or ""):
+                name = m.group(1)
+                if name not in _NAME_STOP and name.lower() != (avoid or "").lower():
+                    return name
+    return ""
+
+
+def relation_addressee(record_uuid: str, phone: str) -> Optional[str]:
+    """Who a relationship-tagged number belongs to, by first name.
+
+    None  -> the number carries no relationship tag: greet the owner as usual.
+    ""    -> it does, but no name was found: greet nobody by name.
+    name  -> the relative's first name (second owner for a spouse, else the board).
+    """
+    _, obj = crm.find_phone_object(record_uuid, phone)
+    if not obj:
+        return None
+    tags = _tag_names(obj)
+    rel = next((t for t in RELATION_TAGS if t in tags), None)
+    if not rel:
+        return None
+    rec = crm.get_record(record_uuid) or {}
+    owner = rec.get("owner") if isinstance(rec.get("owner"), dict) else {}
+    primary = (owner.get("first_name") or "").strip()
+    if rel in _SPOUSE_TAGS:
+        for so in rec.get("secondary_owners") or []:
+            first = (so.get("first_name") or "").strip() if isinstance(so, dict) else ""
+            if first and first.lower() != primary.lower() and not touches.is_entity(first):
+                return first
+    words = RELATION_TAGS[rel] + (("spouse",) if rel in _SPOUSE_TAGS else ())
+    events = crm.activity_log(record_uuid) or []
+    texts = [t for t in (_hand_note(ev) for ev in events) if t]
+    return _name_from_notes(texts, words, primary)
+
+
+_STICKY_TTL = 300
+_sticky_cache: dict = {}
+
+
+def sticky_correct_numbers(events: list) -> set:
+    """Numbers whose status history says Correct, where NO_ANSWER never wins.
+
+    Jeff, 2026-10-05: "No answer never trumps Correct." A no-answer call
+    disposition overwrites the phone status in DataSift (8518 N 102nd East Ave:
+    UNKNOWN -> CORRECT -> NO_ANSWER), which silently dropped the Correct-number
+    rule. Replayed oldest first; WRONG / DEAD / DNC still override Correct,
+    because a person judged the number.
+    """
+    rows = []
+    for i, ev in enumerate(events or []):
+        if ev.get("event_type") != "owner.phone.status.updated":
+            continue
+        owner = (ev.get("payload") or {}).get("owner") or {}
+        change = owner.get("status") or []
+        if len(change) != 2:
+            continue
+        rows.append((_event_time(ev), -i, store.clean_phone(owner.get("phone")),
+                     (change[1] or "").upper()))
+    # Oldest first. Without timestamps fall back to the log's newest-first order.
+    rows.sort(key=lambda r: (r[0] is None, r[0] or datetime.min.replace(tzinfo=timezone.utc), r[1]))
+    effective: dict = {}
+    for _, _, phone, new in rows:
+        if new == "NO_ANSWER" and effective.get(phone) == "CORRECT":
+            continue
+        effective[phone] = new
+    return {p for p, s in effective.items() if s == "CORRECT"}
+
+
+def _sticky_for(record_uuid: str) -> set:
+    hit = _sticky_cache.get(record_uuid)
+    now_ts = datetime.now(timezone.utc).timestamp()
+    if hit and now_ts - hit[0] < _STICKY_TTL:
+        return hit[1]
+    events = crm.activity_log(record_uuid)
+    found = sticky_correct_numbers(events) if events else set()
+    if events is not None:
+        _sticky_cache[record_uuid] = (now_ts, found)
+    return found
+
+
 def correct_phones(rec: dict) -> list[dict]:
     owner = rec.get("owner") if isinstance(rec.get("owner"), dict) else {}
-    return [p for p in owner.get("phones") or []
-            if isinstance(p, dict) and (p.get("status") or "").upper() == "CORRECT"]
+    phones = [p for p in owner.get("phones") or [] if isinstance(p, dict)]
+    out = [p for p in phones if (p.get("status") or "").upper() == "CORRECT"]
+    no_answer = [p for p in phones if (p.get("status") or "").upper() == "NO_ANSWER"]
+    if no_answer and rec.get("uuid"):
+        sticky = _sticky_for(rec["uuid"])
+        out += [p for p in no_answer if store.clean_phone(p.get("number")) in sticky]
+    return out
 
 
 def _correct_number_verdict(record_uuid: str, phone: str,
@@ -760,6 +881,13 @@ def build(rows: Iterable[dict], touch: int, sender_fallback: str = "",
         else:
             cand.first = touches.clean_first(cand.owner_full)
 
+        # A number tagged Wife / Son / ... belongs to that relative, so the
+        # greeting is their name, or no name; never the primary owner's.
+        if cand.record_uuid and crm.client():
+            rel_name = relation_addressee(cand.record_uuid, phone)
+            if rel_name is not None:
+                cand.first = touches.clean_first(rel_name) if rel_name else ""
+
         if cand.record_uuid and not cand.county:
             cand.county = crm.deal_context(cand.record_uuid).get("county", "")
         cand.sender = _resolve_sender(row, cand.record_uuid, sender_fallback)
@@ -854,6 +982,7 @@ def schedule(candidates: list[Candidate]) -> list[tuple[Candidate, str, str]]:
     pool_by_owner: dict[str, list[str]] = {}
     last_used: dict[str, datetime] = {}
     sticky: dict[str, str] = {}  # phone -> number, held for this run
+    by_record: dict[str, str] = {}  # record -> number, held for this run
     now = datetime.now(timezone.utc)
     cursor = now
     out: list[tuple[Candidate, str, str]] = []
@@ -876,12 +1005,24 @@ def schedule(candidates: list[Candidate]) -> list[tuple[Candidate, str, str]]:
         # person wins over the pool's least-recently-used pick, because two
         # numbers texting one owner about one house reads as a spam farm to the
         # person receiving it, which matters more than balancing the pool.
+        #
+        # ONE NUMBER PER RECORD (Jeff, 2026-10-05). With TEXT_ALL_BEST a record
+        # gets a text on each good phone; spread across the pool, one owner saw
+        # three of Diego's numbers text the same thing within 13 seconds. So
+        # after the phone's own thread, the record's number wins: one already
+        # used on any of its phones, else the one picked earlier in this batch.
         existing = (store.get_conversation(cand.phone) or {}).get("from_number") or ""
+        rec = cand.record_uuid or ""
+        rec_number = (by_record.get(rec) or store.record_from_number(rec)) if rec else ""
         if existing in numbers:
             from_number = existing
+        elif rec_number in numbers:
+            from_number = rec_number
         else:
             from_number = min(numbers, key=lambda n: (ready_at(n), last_used.get(n, now)))
         sticky[cand.phone] = from_number
+        if rec:
+            by_record.setdefault(rec, from_number)
 
         slot = max(cursor, ready_at(from_number))
 

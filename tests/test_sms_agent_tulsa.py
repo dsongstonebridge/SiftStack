@@ -473,6 +473,74 @@ check("landline rejection cancels the send (no retry)", store.outbox_status(q_ll
 check("landline rejection suppresses the number", store.is_suppressed(LL) == "smrtphone says landline",
       str(store.is_suppressed(LL)))
 
+# ---- one sending number per record (Jeff, 2026-10-05: 534 E Pine Pl got three)
+from sms_agent import seed  # noqa: E402
+_pool, _quiet = seed.sender_pool.pool, seed.sender_pool.within_quiet_hours
+seed.sender_pool.pool = lambda owner="": ["+19180000001", "+19180000002", "+19180000003"]
+seed.sender_pool.within_quiet_hours = lambda phone, when=None: True
+cands = [seed.Candidate(phone=p, record_uuid=r, sender="Diego") for p, r in (
+    ("9185550201", "rec-multi"), ("9185550202", "rec-multi"), ("9185550203", "rec-multi"),
+    ("9185550204", "rec-solo"))]
+plan = seed.schedule(cands)
+multi = {n for c, n, _ in plan if c.record_uuid == "rec-multi"}
+solo = {n for c, n, _ in plan if c.record_uuid == "rec-solo"}
+check("all phones on one record share one number", len(multi) == 1, str(multi))
+check("a different record still rotates", solo and not (solo & multi), f"{solo} vs {multi}")
+store.ensure_conversation("9185550301", from_number="+19180000003", record_uuid="rec-earlier")
+plan = seed.schedule([seed.Candidate(phone="9185550302", record_uuid="rec-earlier", sender="Diego")])
+check("new phone reuses the number already texting its record", plan[0][1] == "+19180000003",
+      plan[0][1])
+seed.sender_pool.pool, seed.sender_pool.within_quiet_hours = _pool, _quiet
+
+# ---- relationship-tagged number greets the relative (Jeff, 2026-10-05, 8110 S Birch Ave)
+_fpo, _gr, _al = seed.crm.find_phone_object, seed.crm.get_record, seed.crm.activity_log
+REL = {
+    "r-wife-so": ({"tags": [{"title": "Wife"}, {"title": "Dial First"}]},
+                  {"owner": {"first_name": "Christopher"},
+                   "secondary_owners": [{"first_name": "Sarah"}]}, []),
+    "r-wife-board": ({"tags": ["Wife"]}, {"owner": {"first_name": "Bob"}},
+                     [{"text": "Left vm. Wife's name is Linda, call after 5"}]),
+    "r-son-none": ({"tags": ["Son"]}, {"owner": {"first_name": "Bob"}},
+                   [{"text": "Bob said call back next week"}]),
+    "r-plain": ({"tags": ["Dial First"]}, {"owner": {"first_name": "Bob"}}, []),
+}
+seed.crm.find_phone_object = lambda u, p, fresh=False: ("", REL[u][0])
+seed.crm.get_record = lambda u, fresh=False: REL[u][1]
+seed.crm.activity_log = lambda u: REL[u][2]
+_hn = seed._hand_note
+seed._hand_note = lambda ev: ev.get("text", "")
+check("spouse tag -> second owner's name", seed.relation_addressee("r-wife-so", "1") == "Sarah")
+check("spouse tag, no second owner -> name from the board",
+      seed.relation_addressee("r-wife-board", "1") == "Linda", str(seed.relation_addressee("r-wife-board", "1")))
+check("relative tag with no name found -> no name, never the owner's",
+      seed.relation_addressee("r-son-none", "1") == "")
+check("untagged number -> greet the owner as usual", seed.relation_addressee("r-plain", "1") is None)
+seed.crm.find_phone_object, seed.crm.get_record, seed.crm.activity_log = _fpo, _gr, _al
+seed._hand_note = _hn
+
+# ---- NO_ANSWER never trumps CORRECT (Jeff, 2026-10-05, 8518 N 102nd East Ave)
+def _st(phone, old, new, ts):
+    return {"event_type": "owner.phone.status.updated", "timestamp": ts,
+            "payload": {"owner": {"phone": phone, "status": [old, new]}}}
+EV = [  # newest first, as the API returns it
+    _st("9185550401", "CORRECT", "NO_ANSWER", "2026-10-05 18:00:00"),
+    _st("9185550402", "CORRECT", "WRONG", "2026-10-05 17:00:00"),
+    _st("9185550401", "UNKNOWN", "CORRECT", "2026-10-04 12:00:00"),
+    _st("9185550402", "UNKNOWN", "CORRECT", "2026-10-04 11:00:00"),
+    _st("9185550403", "UNKNOWN", "NO_ANSWER", "2026-10-04 10:00:00"),
+]
+sticky = seed.sticky_correct_numbers(EV)
+check("Correct then No Answer stays Correct", "9185550401" in sticky, str(sticky))
+check("Correct then Wrong is not Correct", "9185550402" not in sticky)
+check("plain No Answer is not Correct", "9185550403" not in sticky)
+seed.crm.activity_log = lambda u: EV
+seed._sticky_cache.clear()
+rec = {"uuid": "r-sticky", "owner": {"phones": [
+    {"number": "9185550401", "status": "NO_ANSWER"}, {"number": "9185550403", "status": "NO_ANSWER"}]}}
+check("correct_phones keeps the Correct-then-No-Answer number",
+      [p["number"] for p in seed.correct_phones(rec)] == ["9185550401"])
+seed.crm.activity_log = _al
+
 print()
 print(f"{len(FAILS)} failed" if FAILS else "all passed")
 sys.exit(1 if FAILS else 0)

@@ -32,6 +32,10 @@ os.environ.update({
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from sms_agent import campaign, config, crm, engine, escalate, seed, store, transport, worker  # noqa: E402
+# The live .env turns fork switches on; each test section turns on only what it tests.
+config.IGNORE_DNC_FLAG = config.TEXT_ALL_BEST = config.NUMBER_HEALTH_CHECK = False
+config.CORRECT_NUMBER_FIRST = config.DNC_TRY_OTHER_NUMBERS = False
+config.ONLY_RECORDS = set()
 
 FAILS = []
 

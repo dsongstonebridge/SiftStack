@@ -1691,9 +1691,13 @@ the button. The workflow passes that date to the sheet bot as `KPI_AS_OF`, so a 
 caught up on Monday still reports Friday's day and week. State in
 `kpi-engine/reports/kpi_post_last.txt` (last day posted, so no double posts), log in
 `kpi-engine/reports/kpi_post_trigger.log` (written only when something is due). Needs the PC
-logged in. Why the extra triggers: on 2026-10-02 the PC slept through 6:30, woke for 8
-seconds Saturday and slept again mid-run, and with only a logon trigger nothing retried
-until Monday.
+logged in. Why the extra triggers: on 2026-10-02 the PC slept through 6:30. At 8:56 Saturday
+it woke by itself for 8 seconds; Windows started the missed run (StartWhenAvailable), and
+sleep killed it (0xC000013A), but Windows counted the missed run as used. Jeff then used the
+PC from ~10:40 AM to 12:15 PM Saturday and nothing ran: opening the lid and unlocking is
+not a logon, and logon was the only other trigger. So nothing posted until Monday. Read the
+System event log (IDs 1, 42, 107, 506/507) before explaining a miss; Modern Standby logs
+many wake events that are not someone using the PC.
 - Do NOT re-add a GitHub `schedule:` or use a Claude session cron (expires after 7 days).
 - The cloud routine that used to press the button (paused) drove Chrome, which breaks
   Jeff's no-screen-takeover rule. Leave it off.

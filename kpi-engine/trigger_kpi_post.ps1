@@ -15,9 +15,10 @@ New-Item -ItemType Directory -Force (Split-Path $state) | Out-Null
 function Log($m) { "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  $m" | Out-File -Append -Encoding utf8 $log }
 
 $now  = Get-Date
-# Jeff, 2026-10-05: Oct 2 never posted. The PC slept through 6:30, woke for 8 seconds on
-# Saturday and slept again mid-run, and nothing retried until Monday. The task now also fires
-# every 15 minutes and on wake/unlock; this script is safe to run any number of times.
+# Jeff, 2026-10-05: Oct 2 never posted. The PC slept through 6:30; a self-wake at 8:56 Sat
+# started the missed run and sleep killed it. Jeff then used the PC 10:40-12:15 Sat, but
+# unlocking is not a logon, so nothing retried until Monday. The task now also fires every
+# 15 minutes and on wake/unlock; this script is safe to run any number of times.
 $last = if (Test-Path $state) { [datetime]::ParseExact((Get-Content $state -Raw).Trim(), "yyyy-MM-dd", $null) }
         else { $now.Date.AddDays(-1) }
 

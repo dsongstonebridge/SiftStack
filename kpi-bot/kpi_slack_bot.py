@@ -70,16 +70,25 @@ def parse_date(val):
     return None
 
 
+def _now():
+    """The moment the report is 'as of'. KPI_AS_OF=YYYY-MM-DD posts a missed day
+    (Jeff, 2026-10-05: a Friday post caught up on Monday must still be Friday's week)."""
+    as_of = os.environ.get("KPI_AS_OF", "").strip()
+    if as_of:
+        return datetime.strptime(as_of, "%Y-%m-%d").replace(hour=18, minute=30)
+    return datetime.now()
+
+
 def get_today_and_week():
     """Return today's date and the start of the current week (Monday)."""
-    today = datetime.now().date()
+    today = _now().date()
     week_start = today - timedelta(days=today.weekday())  # Monday
     return today, week_start
 
 
 def get_period_starts():
     """Return the first day of the current month, quarter, and year."""
-    today = datetime.now().date()
+    today = _now().date()
     month_start = today.replace(day=1)
     quarter_month = ((today.month - 1) // 3) * 3 + 1
     quarter_start = today.replace(month=quarter_month, day=1)
@@ -244,9 +253,9 @@ def executive_summary_kpis(sheet):
     qual_rate_qtd = f"{(qualified_qtd / leads_qtd * 100):.0f}%" if leads_qtd else "—"
     qual_rate_ytd = f"{(qualified_ytd / leads_ytd * 100):.0f}%" if leads_ytd else "—"
 
-    month_name = datetime.now().strftime("%B")
-    quarter_num = (datetime.now().month - 1) // 3 + 1
-    year = datetime.now().year
+    month_name = _now().strftime("%B")
+    quarter_num = (_now().month - 1) // 3 + 1
+    year = _now().year
 
     lines = [
         f"*{month_name} MTD  |  Q{quarter_num} QTD  |  {year} YTD*",
@@ -1119,8 +1128,8 @@ def _text_to_blocks(text, max_chars=2900):
 
 def build_slack_message(sheet):
     """Build the full Slack message from all tabs."""
-    _now = datetime.now()
-    today = f"{_now:%A, %B} {_now.day}, {_now:%Y}"  # Windows-safe (no %-d)
+    n = _now()
+    today = f"{n:%A, %B} {n.day}, {n:%Y}"  # Windows-safe (no %-d)
 
     blocks = [
         {

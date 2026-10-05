@@ -1206,6 +1206,34 @@ def _primary_relationship_tag(subject: dict) -> str | None:
     return rel
 
 
+#: Phone fields a caller or the dialer sets, which upsert-phones wipes when
+#: they are left out of the payload.
+_KEPT_PHONE_FIELDS = ("status", "is_connected", "verified")
+
+
+def _current_phone_state(property_uuid: str) -> dict[str, dict]:
+    """What each number already on the record carries that we must not lose.
+
+    `upsert-phones` REPLACES the phone object by number, so a payload of just
+    number + type resets a caller's DEAD / NO_ANSWER / WRONG back to UNKNOWN.
+    Harmless on a brand-new record, destructive on one already dialed: hit
+    2026-10-05 on 2405 W Delmar St, where a Tracerfy pass after a DataSift-only
+    trace wiped three dispositions. Read fresh right before the write, because
+    a status set between resolve and writeback must survive too.
+
+    Raises on a failed read; the caller decides what to do without it.
+    """
+    rec = _api.get_property(property_uuid)
+    out: dict[str, dict] = {}
+    for p in ((rec.get("owner") or {}).get("phones") or []):
+        if not isinstance(p, dict):
+            continue
+        n = norm_phone(p.get("number"))
+        if n:
+            out[n] = {k: p[k] for k in _KEPT_PHONE_FIELDS if p.get(k) is not None}
+    return out
+
+
 def writeback(subjects: list[dict], *, sources: list[str],
                dry_run: bool = True) -> dict:
     """Write phones + tags + one message-board post per record.
@@ -1272,6 +1300,20 @@ def writeback(subjects: list[dict], *, sources: list[str],
                     # accepts several per number, and batching avoids N calls.
                     number_to_tags.setdefault(ph["number"], []).extend(tags)
 
+            if phones:
+                # Carry each existing number's status / connected / verified
+                # flags into the upsert, or the write resets them.
+                try:
+                    current = _current_phone_state(uuid)
+                except _api.DataSiftAPIError as e:
+                    logger.warning("could not read current phones on %s, NOT writing "
+                                   "phones (would wipe caller statuses): %s", uuid, e)
+                    result["skipped"].append({"street": s["property_address"],
+                                               "reason": f"phones not written, read failed: {e}"})
+                    phones = []
+                else:
+                    for entry in phones:
+                        entry.update(current.get(entry["number"], {}))
             if phones:
                 try:
                     _api.upsert_phones(owner_uuid, phones)

@@ -208,6 +208,125 @@ for ph, (obj, want) in cases.items():
 check("send-time: unreadable record -> held, not sent", store.outbox_status(q_down) == "queued",
       store.outbox_status(q_down))
 
+# ---- Correct number first, unless we already spoke with them (2026-10-05)
+# Event shapes copied from real FTM records (numbers swapped for fakes).
+def _call(num, ts, direction="outbound"):
+    key = "destination_number" if direction == "outbound" else "origin_number"
+    return {"event_type": "owner.call.answered", "source": "smrtphone", "author": "system",
+            "timestamp": ts, "payload": {"call": {"direction": direction, key: num,
+                                                  "extra": {"status": "answered"}, "duration": 70}}}
+
+
+def _note(text, ts, source="internal-api", kind="property.message.added"):
+    return {"event_type": kind, "source": source, "author": "kdhoemann@gmail.com",
+            "timestamp": ts, "payload": {"message": text}}
+
+
+C1 = "9185550160"
+check("VM note read as voicemail",
+      seed.is_vm_note("no answer, left vm, but the message said this is tim"))
+check("VM greeting with a name is still voicemail",
+      seed.is_vm_note("no answer but vm says this is Brian. Left vm"))
+check("'spoke with' is a conversation", seed.is_talk_note("spoke with matthew and he said its his primary residence"))
+check("VM note is not a conversation", not seed.is_talk_note("no answer, left vm, but the message said this is tim"))
+check("answered call + same-day VM note -> not spoken",
+      seed.spoken_on([_call(C1, "2026-09-30 21:20:57"),
+                      _note("no answer, left vm, but the message said this is tim", "2026-09-30 21:21:20")], C1) == "")
+check("answered call, no note -> spoken",
+      seed.spoken_on([_call(C1, "2026-09-30 21:20:57")], C1) != "")
+check("talk note anywhere -> spoken",
+      seed.spoken_on([_note("spoke with matthew, not interested", "2026-09-30 21:56:38")], C1) != "")
+check("2442 E 3rd St: dad talk note + her VM note, same day -> not spoken on hers",
+      seed.spoken_on([_call("9185550810", "2026-10-01 20:54:18"),
+                      _note("810 is the dad and says if i want to reach her", "2026-10-01 20:55:56"),
+                      _call(C1, "2026-10-01 20:58:43"),
+                      _note("left her a vm", "2026-10-01 20:59:04")], C1) == "")
+check("2442 E 3rd St: the dad's line DOES count as spoken",
+      seed.spoken_on([_call("9185550810", "2026-10-01 20:54:18"),
+                      _note("810 is the dad and says if i want to reach her", "2026-10-01 20:55:56")],
+                     "9185550810") != "")
+check("talk note the same day this number was answered -> spoken",
+      seed.spoken_on([_call(C1, "2026-10-01 18:00:00"),
+                      _note("spoke with her, call back friday", "2026-10-01 18:05:00")], C1) != "")
+check("11300 N 118th E Ave: one 'left vms' after a dialing run covers the earlier calls",
+      seed.spoken_on([_call(C1, "2026-09-30 22:24:40"),
+                      _call("9185550657", "2026-09-30 22:32:06"),
+                      _note("left vms", "2026-09-30 22:32:18")], C1) == "")
+check("1288 E 143rd St: VM note, then 'called twice' -> not spoken",
+      seed.spoken_on([_call(C1, "2026-10-01 15:31:59"),
+                      _note("No answer but recorded vm says Dana. mailbox is full", "2026-10-01 15:32:37"),
+                      _call(C1, "2026-10-01 15:33:28"),
+                      _note("called twice", "2026-10-01 15:33:39")], C1) == "")
+check("neutral note with no voicemail that day -> still spoken",
+      seed.spoken_on([_call(C1, "2026-10-01 15:33:28"),
+                      _note("called twice", "2026-10-01 15:33:39")], C1) != "")
+check("inbound answered call -> spoken",
+      seed.spoken_on([_call(C1, "2026-09-30 15:00:00", "inbound")], C1) != "")
+check("answered call on ANOTHER number does not count",
+      seed.spoken_on([_call("9185550999", "2026-09-30 21:20:57")], C1) == "")
+check("pipeline upload post ignored",
+      seed.spoken_on([_note("Skip traced via Tracerfy. Petition info said ...", "2026-08-19 22:05:42",
+                            source="upload")], C1) == "")
+check("late-evening UTC call and VM note on the same Central day pair up",
+      seed.spoken_on([_call(C1, "2026-10-01 02:10:00"),          # 9:10pm Central, Sep 30
+                      _note("lvm", "2026-09-30 21:00:00")], C1) == "")
+
+config.CORRECT_NUMBER_FIRST = True
+RECS, LOGS = {}, {}
+crm.get_record = lambda rec, fresh=False: RECS.get(rec)
+crm.activity_log = lambda rec: LOGS.get(rec)
+crm.phone_is_dnc = lambda phone: False
+
+
+def _rec(*phones):
+    return {"owner": {"phones": [{"number": n, "status": s, "type": t, "tags": tags}
+                                 for n, s, t, tags in phones]}}
+
+
+RECS["r-c1"] = _rec(("9185550161", "UNKNOWN", "MOBILE", ["Dial First"]),
+                    ("9185550162", "CORRECT", "MOBILE", ["Dial Third"]))
+LOGS["r-c1"] = []
+got, why = seed.apply_correct_number({"uuid": "r-c1", "phone": "9185550161"}, set())
+check("Correct number replaces the search-row number", bool(got) and got["phone"] == "9185550162", str((got, why)))
+check("Correct number ignores its Dial Third tier", bool(got) and got["dial_tier"] == "Correct")
+
+LOGS["r-c1"] = [_call("9185550162", "2026-09-30 21:00:00"),
+                _note("talked to him, call back next week", "2026-09-30 21:05:00")]
+got, why = seed.apply_correct_number({"uuid": "r-c1", "phone": "9185550161"}, set())
+check("spoke on the Correct number -> no text to the record", got is None and "spoke" in why, why)
+
+RECS["r-c2"] = _rec(("9185550163", "UNKNOWN", "MOBILE", ["Dial First"]))
+row = {"uuid": "r-c2", "phone": "9185550163"}
+got, _ = seed.apply_correct_number(row, set())
+check("no Correct number -> row unchanged (no number hopping)", got is row)
+
+RECS["r-c3"] = _rec(("9185550164", "UNKNOWN", "MOBILE", ["Dial First"]),
+                    ("9185550165", "CORRECT", "LANDLINE", ["Dial First"]))
+got, why = seed.apply_correct_number({"uuid": "r-c3", "phone": "9185550164"}, set())
+check("Correct landline -> no text, never falls back to the other number", got is None, why)
+
+RECS["r-c4"] = _rec(("9185550166", "CORRECT", "MOBILE", ["Dial First"]))
+got, why = seed.apply_correct_number({"uuid": "r-c4", "phone": "9185550166"}, set())
+check("unreadable call log -> held", got is None and "could not read" in why, why)
+
+# Send time: phone_still_textable on the same rules.
+crm.find_phone_object = lambda rec, phone, fresh=False: (
+    "own", next((p for p in (RECS.get(rec) or {}).get("owner", {}).get("phones", [])
+                 if p["number"] == phone), None))
+crm.dial_tier = lambda rec, phone: "Dial First"
+LOGS["r-c1"] = []
+ok, why = seed.phone_still_textable("r-c1", "9185550161")
+check("send-time: another number marked Correct -> cancelled", ok is False and "Correct" in why, why)
+ok, why = seed.phone_still_textable("r-c1", "9185550162")
+check("send-time: the Correct number (Dial Third) -> sent", ok is True, why)
+LOGS["r-c1"] = [_note("spoke with him", "2026-10-05 15:00:00")]
+ok, why = seed.phone_still_textable("r-c1", "9185550162")
+check("send-time: spoke since queueing -> cancelled", ok is False and "spoke" in why, why)
+LOGS.pop("r-c1")
+ok, why = seed.phone_still_textable("r-c1", "9185550162")
+check("send-time: call log unreadable -> held", ok is None, why)
+config.CORRECT_NUMBER_FIRST = False
+
 print()
 print(f"{len(FAILS)} failed" if FAILS else "all passed")
 sys.exit(1 if FAILS else 0)

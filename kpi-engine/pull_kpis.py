@@ -295,7 +295,7 @@ def call_number(call: dict) -> str:
 
 import re as _re
 _VM_NOTE = _re.compile(
-    r"\b(no answer|n/?a\b|didn'?t answer|did not answer|vm|v/m|lvm|left (a )?(vm|voicemail|message|msg)|"
+    r"\b(no answer|n/?a\b|didn'?t answer|did not answer|vms?|v/m|lvm|left (a )?(vms?|voicemails?|messages?|msg)|"
     r"voice ?mail|mailbox|went to (vm|voicemail)|no pick ?up|rang out|straight to (vm|voicemail)|"
     r"can'?t get a ?hold|couldn'?t (get a ?hold|reach)|unable to reach|no luck|answering (machine|service)|"
     r"nobody answered|no one answered|wasn'?t answered)\b",

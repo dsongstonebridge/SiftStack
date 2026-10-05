@@ -295,6 +295,20 @@ def build(sender_fallback: str = "", log_pages: int = 6,
                 plan.skipped_duplicate_person += 1
                 continue
 
+            # Tulsa fork: a Correct number overrides everything below.
+            if config.CORRECT_NUMBER_FIRST:
+                swapped, why = seed.apply_correct_number(row, dnc_numbers)
+                if not swapped:
+                    stage["holds"][why] = stage["holds"].get(why, 0) + 1
+                    plan.holds[why] = plan.holds.get(why, 0) + 1
+                    continue
+                if swapped is not row:
+                    row = swapped
+                    phone = store.clean_phone(row.get("phone"))
+                    if phone in seen_phone:
+                        plan.skipped_duplicate_person += 1
+                        continue
+
             # Deep sources: the search row's phone is often not the record's
             # best. Resolve now, at the moment we would actually use the row,
             # so an unused row never costs a record fetch.

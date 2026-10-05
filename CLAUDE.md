@@ -1757,6 +1757,7 @@ the named "Hi there!" Touch 1 variant was removed from BOTH the skill and
 | `SMS_AGENT_REPLY_CHECK_MAX_AGE=10` | Fail closed: no send unless the smrtPhone log poll succeeded within N minutes, and the poll now runs BEFORE the outbox drains. Without webhooks the poll is the only way a reply is seen, and upstream kept sending when it failed. |
 | `SMS_AGENT_CAMPAIGN_SOURCES` | `Title|share|deep;...`. Ty's sources are hard-coded with HIS preset titles ("FTM - 02 ...", "Adriana - Actively Prospecting"); ours are "FTM- 02 ...". |
 | `SMS_AGENT_SLACK_FALLBACK=0` | Never fall back to `SLACK_WEBHOOK_URL` (the KPI channel). **Slack posts are NOT gated by DRY_RUN.** |
+| `SMS_AGENT_CORRECT_NUMBER_FIRST=1` | A number marked CORRECT is the only one the record is texted on (any tier; landline/VoIP/do-not-call = no text, never a fallback). No text at all if we already spoke on it: each board note pairs with the answered call just before it (30 min); a talk note on that call, or an answered call with no voicemail note that day, = spoken. smrtPhone logs voicemails as "answered", so the note decides. "vms" = voicemails; one "left vms" covers a whole dialing run. Build + send time. |
 | `SMS_AGENT_TOUCH_SOURCE=fields` | Send the Text Touch field verbatim (blank = hold). Built and tested but NOT used: pool mode matches the fields exactly. |
 
 Set in `.env` (gitignored): `SMS_AGENT_SLACK_WEBHOOK` (#SMS),

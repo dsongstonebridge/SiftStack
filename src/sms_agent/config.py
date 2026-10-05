@@ -184,6 +184,14 @@ REPLY_CHECK_MAX_AGE_MINUTES = int(_env("SMS_AGENT_REPLY_CHECK_MAX_AGE", "0"))
 # still get the 2pm text. Unreadable = held, never sent unchecked.
 SEND_TIME_PHONE_CHECK = _env("SMS_AGENT_SEND_TIME_PHONE_CHECK", "0") in ("1", "true", "True")
 
+# Tulsa fork (Jeff, 2026-10-05): a number marked CORRECT is the ONLY number the
+# record gets texted on, whatever its dial tier, and the record's other numbers
+# stop. UNLESS we already spoke with them on it (an answered call with no
+# same-day voicemail note, or a hand-written board note describing a
+# conversation): then the record gets no automated text at all. Checked at
+# build AND, with SEND_TIME_PHONE_CHECK, right before each send.
+CORRECT_NUMBER_FIRST = _env("SMS_AGENT_CORRECT_NUMBER_FIRST", "0") in ("1", "true", "True")
+
 # May we text a phone whose do-not-call flag we cannot see?
 #
 # The flag exists ONLY on a records-search row's representative phone.

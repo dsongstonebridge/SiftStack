@@ -571,6 +571,30 @@ def owner_uuid_for(record_uuid: str) -> str:
     return owner.get("uuid") or ""
 
 
+def activity_log(record_uuid: str) -> Optional[list]:
+    """The record's activity log (calls, board posts, ...), or None if unreadable.
+
+    smrtPhone syncs every call into it as `owner.call.made` / `.answered` with
+    origin and destination numbers, and unlike smrtPhone's own log it does not
+    purge after 30 days.
+    """
+    c = client()
+    if not c or not record_uuid:
+        return None
+    last = None
+    for attempt in range(4):
+        try:
+            return c.get_activity_log(record_uuid, limit=100, max_pages=5)
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            wait = _transient_wait(exc, attempt) if attempt < 3 else 0.0
+            if not wait:
+                break
+            time.sleep(wait)
+    log.warning('activity_log %s failed: %s', record_uuid, last)
+    return None
+
+
 def find_phone_object(record_uuid: str, phone: str,
                       fresh: bool = False) -> tuple[str, Optional[dict]]:
     """(owner_uuid, phone object) for a number on a record."""

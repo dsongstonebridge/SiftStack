@@ -19,6 +19,7 @@ from __future__ import annotations
 import csv
 import logging
 import random
+import re
 from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -142,6 +143,10 @@ def phone_still_textable(record_uuid: str, phone: str) -> tuple[Optional[bool], 
     status = (obj.get("status") or "").upper()
     if status in SKIP_PHONE_STATUSES:
         return False, f"number now marked {status}"
+    if config.CORRECT_NUMBER_FIRST:
+        verdict = _correct_number_verdict(record_uuid, phone, obj)
+        if verdict is not None:
+            return verdict
     tier = crm.dial_tier(record_uuid, phone)
     if tier not in ALLOWED_DIAL_TIERS:
         return False, f"dial tier now {tier or 'untagged'}"
@@ -149,6 +154,228 @@ def phone_still_textable(record_uuid: str, phone: str) -> tuple[Optional[bool], 
     if not ok:
         return False, why
     return True, ""
+
+
+# ---------------------------------------------------------------------------
+# Tulsa fork: a Correct number wins, unless we already spoke with them on it.
+# (config.CORRECT_NUMBER_FIRST; Jeff, 2026-10-05.)
+#
+# Measured on the FTM book 2026-10-05: smrtPhone logs a VOICEMAIL as
+# `owner.call.answered` (status answered, 64-79s), so the call log alone cannot
+# tell a conversation from a greeting. The board note decides, exactly as in
+# the KPI engine (kpi-engine/pull_kpis.py, whose patterns these are): "no
+# answer, left vm, but the message said this is tim" is a voicemail and still
+# gets texted; "spoke with matthew ..." is a conversation and does not.
+
+_CENTRAL = None
+
+
+def _central():
+    global _CENTRAL
+    if _CENTRAL is None:
+        from zoneinfo import ZoneInfo
+        _CENTRAL = ZoneInfo(config.CAMPAIGN_TZ)
+    return _CENTRAL
+
+
+_VM_NOTE = re.compile(
+    r"\b(no answer|n/?a\b|didn'?t answer|did not answer|vms?|v/m|lvm|left (a )?(vms?|voicemails?|messages?|msg)|"
+    r"voice ?mail|mailbox|went to (vm|voicemail)|no pick ?up|rang out|straight to (vm|voicemail)|"
+    r"can'?t get a ?hold|couldn'?t (get a ?hold|reach)|unable to reach|no luck|answering (machine|service)|"
+    r"nobody answered|no one answered|wasn'?t answered)\b",
+    re.I)
+_TALK_NOTE = re.compile(
+    r"\b(talked|spoke|spoken|convo|conversation|said|says|wants|asking|told me|motivated|interested|"
+    r"offer|appointment|appt|reached|hung up|picked up|when i said|answer|answered)\b", re.I)
+_STRONG_TALK = re.compile(
+    r"\b(talked|spoke|spoken|convo|conversation|told me|picked up|hung up|"
+    r"answer|answered|got a ?hold|reached (him|her|them|owner))\b", re.I)
+_NEGATED_ANSWER = re.compile(
+    r"\b(no|not|never|nobody|didn'?t|did not|don'?t|won'?t|wouldn'?t|wasn'?t|"
+    r"was not|doesn'?t)\s+(\w+\s+)?answer(ed|ing|s)?\b|\banswering (machine|service)\b", re.I)
+# Pipeline posts (petition detail, skip-trace summaries) are not call notes.
+_PIPELINE_NOTE = re.compile(r"SIGNING CHAIN|CASE:|PROPERTY:|OWNER:|PETITION|Tracerfy|Skip traced", re.I)
+
+
+def _hand_note(ev: dict) -> str:
+    """The text of a hand-typed board note, or "" if the event is anything else."""
+    if not str(ev.get("event_type") or "").endswith(("message.added", "notes.added")):
+        return ""
+    if ev.get("source") == "upload" or ev.get("author") == "system":
+        return ""
+    pl = ev.get("payload") or {}
+    text = pl.get("message") if isinstance(pl.get("message"), str) else ""
+    text = text or (pl.get("note") if isinstance(pl.get("note"), str) else "")
+    if not text or len(text) > 280 or _PIPELINE_NOTE.search(text):
+        return ""
+    return text
+
+
+def is_vm_note(text: str) -> bool:
+    talk = _NEGATED_ANSWER.sub(" ", text or "")
+    return bool(_VM_NOTE.search(text or "")) and not _STRONG_TALK.search(talk)
+
+
+def is_talk_note(text: str) -> bool:
+    return (not is_vm_note(text)) and bool(_TALK_NOTE.search(_NEGATED_ANSWER.sub(" ", text or "")))
+
+
+def _event_time(ev: dict) -> Optional[datetime]:
+    raw = str(ev.get("timestamp") or "")
+    try:
+        return datetime.fromisoformat(raw.replace(" ", "T")).replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _event_day(ev: dict) -> str:
+    when = _event_time(ev)
+    if when is None:
+        return str(ev.get("timestamp") or "")[:10]
+    return when.astimezone(_central()).date().isoformat()
+
+
+# A note written within this long after an answered call is about THAT call.
+_NOTE_PAIR_SECONDS = 30 * 60
+
+
+def spoken_on(events: list, phone: str) -> str:
+    """Why we count as having spoken with them on `phone`, or "" if we have not.
+
+    Each hand-typed board note is paired with the answered call just before it
+    (within 30 min), because that is the call it describes. Measured on 2442 E
+    3rd St, 2026-10-01: dad's line answered -> "810 is the dad ...", then her
+    line answered -> "left her a vm". Pairing by DAY read the dad conversation
+    as a talk on her number (Jeff, 2026-10-05: text her).
+
+    Spoken when:
+    - a conversation note is paired with a call on `phone`, or follows no call
+      at all (it cannot be pinned to another number, so it counts);
+    - they called in from `phone` and it was answered;
+    - we called `phone`, it was answered, and its paired note is not a
+      voicemail note (no note at all counts as spoken: texting someone we
+      already talked to is the worse mistake), unless an unpaired voicemail
+      note was written the same day.
+    """
+    target = store.clean_phone(phone)
+    calls, notes = [], []
+    for ev in events:
+        when = _event_time(ev)
+        if ev.get("event_type") == "owner.call.answered":
+            call = (ev.get("payload") or {}).get("call") or {}
+            inbound = (call.get("direction") or "").lower() == "inbound"
+            other = store.clean_phone(call.get("origin_number") if inbound else call.get("destination_number"))
+            calls.append({"when": when, "number": other, "inbound": inbound,
+                          "day": _event_day(ev), "note": None})
+            continue
+        text = _hand_note(ev)
+        if text:
+            notes.append({"when": when, "text": text, "day": _event_day(ev), "call": None})
+
+    for note in notes:
+        before = [c for c in calls if c["when"] and note["when"] and c["when"] <= note["when"]
+                  and (note["when"] - c["when"]).total_seconds() <= _NOTE_PAIR_SECONDS]
+        if before:
+            call = max(before, key=lambda c: c["when"])
+            note["call"] = call
+            if call["note"] is None or call["note"]["when"] > note["when"]:
+                call["note"] = note
+
+    for note in notes:
+        if not is_talk_note(note["text"]):
+            continue
+        if note["call"] is None or note["call"]["number"] == target:
+            return f'board note: "{note["text"][:80]}"'
+
+    # A voicemail note covers every un-noted answered call that day: a caller
+    # dials a run of numbers and writes one "left vms" at the end (11300 N
+    # 118th E Ave, 2026-09-30: five lines, one note, paired with the last call).
+    vm_days = {n["day"] for n in notes if is_vm_note(n["text"])}
+    for call in calls:
+        if call["number"] != target:
+            continue
+        if call["inbound"]:
+            return f'they called in from it {call["day"]} and it was answered'
+        paired = call["note"]
+        if paired is not None:
+            if is_vm_note(paired["text"]):
+                continue
+            if is_talk_note(paired["text"]):
+                return f'answered call {call["day"]}, note: "{paired["text"][:60]}"'
+            # Neither voicemail nor conversation ("called twice", 1288 E 143rd
+            # St, right after "No answer but recorded vm says Dana"): read it as
+            # un-noted and let that day's voicemail note decide.
+        if call["day"] not in vm_days:
+            return f'answered call {call["day"]} with no voicemail note after it'
+    return ""
+
+
+def correct_phones(rec: dict) -> list[dict]:
+    owner = rec.get("owner") if isinstance(rec.get("owner"), dict) else {}
+    return [p for p in owner.get("phones") or []
+            if isinstance(p, dict) and (p.get("status") or "").upper() == "CORRECT"]
+
+
+def _correct_number_verdict(record_uuid: str, phone: str,
+                            obj: dict) -> Optional[tuple[Optional[bool], str]]:
+    """Send-time rule. None = no Correct number on the record (normal rules apply)."""
+    rec = crm.get_record(record_uuid) or {}
+    correct = correct_phones(rec)
+    if not correct:
+        return None
+    target = store.clean_phone(phone)
+    if target not in {store.clean_phone(p.get("number")) for p in correct}:
+        return False, "a different number on the record is marked Correct"
+    # The tier is irrelevant once a person has confirmed the number.
+    ok, why = textable_line(obj.get("type"), "Dial First")
+    if not ok:
+        return False, why
+    events = crm.activity_log(record_uuid)
+    if events is None:
+        return None, "could not read the call log / board"
+    spoke = spoken_on(events, target)
+    if spoke:
+        return False, f"already spoke with them: {spoke}"
+    return True, ""
+
+
+def apply_correct_number(row: dict, dnc_numbers: set) -> tuple[Optional[dict], str]:
+    """Build-time rule. Returns (row, "") with the row UNCHANGED when the record
+    has no Correct number, so a record's touch sequence never hops numbers;
+    (row on the Correct number, "") when it should be texted there; or
+    (None, why) when the record gets no text at all.
+    """
+    uuid = row.get("uuid") or ""
+    rec = crm.get_record(uuid) if uuid else None
+    if not rec:
+        return None, "could not read the record"
+    best = None
+    for p in correct_phones(rec):
+        number = store.clean_phone(p.get("number"))
+        if len(number) != 10 or number in dnc_numbers:
+            continue
+        ok, _ = textable_line(p.get("type"), "Dial First")
+        if not ok:
+            continue
+        rank = 0 if (p.get("type") or "").upper() == "MOBILE" else 1
+        if best is None or rank < best[0]:
+            best = (rank, number)
+    if not correct_phones(rec):
+        return row, ""
+    if best is None:
+        return None, "Correct number is not textable (landline, VoIP or do-not-call)"
+    if crm.phone_is_dnc(best[1]):
+        return None, "Correct number is flagged do-not-call"
+    events = crm.activity_log(uuid)
+    if events is None:
+        return None, "could not read the call log / board"
+    if spoken_on(events, best[1]):
+        return None, "already spoke with them on the Correct number"
+    out = dict(row)
+    out.pop("_needs_best_phone", None)
+    out["phone"] = best[1]
+    out["dial_tier"] = "Correct"
+    return out, ""
 
 
 def from_preset(title: str, limit: int = 0, keep_unresolved: bool = False,
@@ -380,7 +607,9 @@ def build(rows: Iterable[dict], touch: int, sender_fallback: str = "",
         #
         # The first live run went out without this check: 24 of 84 sends landed
         # on Third, Fourth or Drop, and 7 more on untagged numbers.
-        if cand.record_uuid and crm.client():
+        # Tulsa fork: a number a person marked Correct skips the tier gate
+        # (apply_correct_number already checked line type and do-not-call).
+        if cand.record_uuid and crm.client() and row.get("dial_tier") != "Correct":
             tier, checked = crm.dial_tier_checked(cand.record_uuid, phone)
             if not checked:
                 # Could not read the record. Held rather than sent, but named

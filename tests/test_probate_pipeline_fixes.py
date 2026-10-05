@@ -111,6 +111,7 @@ class WritebackRelationshipTests(_Offline):
             return {"ok": True, "missing": {}, "retried": [], "partial": {}}
 
         with mock.patch.object(api, "set_dry_run"), \
+             mock.patch.object(api, "get_property", return_value={"owner": {"phones": []}}), \
              mock.patch.object(api, "upsert_phones"), \
              mock.patch.object(api, "apply_phone_tags_verified", side_effect=apply), \
              mock.patch.object(api, "add_tags"), \
@@ -138,6 +139,63 @@ class WritebackRelationshipTests(_Offline):
         for tags in sent.values():
             self.assertNotIn("Daughter", tags)
 
+
+class WritebackKeepsPhoneStatusTests(_Offline):
+    """upsert-phones replaces the phone object; a caller's DEAD/NO_ANSWER must
+    survive a re-trace (2405 W Delmar St, 2026-10-05)."""
+
+    def _subject(self):
+        return {
+            "property_uuid": "p1", "owner_uuid": "o1", "name": "William Waggoner",
+            "first": "William", "last": "Waggoner", "property_address": "2405 W Delmar St",
+            "has_results": True,
+            "people": [{
+                "first": "William", "last": "Waggoner", "name": "William Waggoner",
+                "key": "william|waggoner", "relationship": None, "is_primary": True,
+                "phones": [
+                    {"number": "8164548559", "sources": ["DataSift"], "tier": "Dial Fourth",
+                     "type_raw": "LANDLINE"},
+                    {"number": "9188099802", "sources": ["Tracerfy"], "tier": "Dial First",
+                     "type_raw": "Mobile"},
+                ],
+                "emails": [], "sources": ["Tracerfy"],
+            }],
+        }
+
+    def _run(self, get_property):
+        upsert = mock.Mock()
+        apply = mock.Mock(return_value={"ok": True, "missing": {}, "retried": [], "partial": {}})
+        with mock.patch.object(api, "set_dry_run"), \
+             mock.patch.object(api, "get_property", get_property), \
+             mock.patch.object(api, "upsert_phones", upsert), \
+             mock.patch.object(api, "apply_phone_tags_verified", apply), \
+             mock.patch.object(api, "add_tags"), \
+             mock.patch.object(api, "post_message_board"):
+            res = agent.writeback([self._subject()], sources=["Tracerfy"], dry_run=False)
+        return res, upsert, apply
+
+    def test_existing_status_is_carried_into_the_upsert(self):
+        rec = {"owner": {"phones": [
+            {"number": "8164548559", "status": "DEAD", "is_connected": False, "verified": False}]}}
+        res, upsert, _ = self._run(mock.Mock(return_value=rec))
+        sent = {p["number"]: p for p in upsert.call_args[0][1]}
+        self.assertEqual(sent["8164548559"]["status"], "DEAD")
+        self.assertIs(sent["8164548559"]["is_connected"], False)
+        # A brand-new number gets no invented status.
+        self.assertNotIn("status", sent["9188099802"])
+        self.assertEqual(res["skipped"], [])
+
+    def test_unreadable_record_writes_no_phones(self):
+        res, upsert, apply = self._run(mock.Mock(side_effect=api.DataSiftAPIError("503")))
+        upsert.assert_not_called()
+        apply.assert_not_called()
+        self.assertTrue(any("read failed" in s["reason"] for s in res["skipped"]))
+
+    def test_number_format_on_the_record_still_matches(self):
+        rec = {"owner": {"phones": [{"number": "(816) 454-8559", "status": "WRONG"}]}}
+        _, upsert, _ = self._run(mock.Mock(return_value=rec))
+        sent = {p["number"]: p for p in upsert.call_args[0][1]}
+        self.assertEqual(sent["8164548559"]["status"], "WRONG")
 
 # ── 2. phone tags: verify + one re-send to EMPTY numbers only ─────────
 

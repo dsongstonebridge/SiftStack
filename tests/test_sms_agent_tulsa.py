@@ -452,6 +452,27 @@ check("available(): flagged number refused", sender_pool.available("9180000003")
 check("available(): clean number allowed", sender_pool.available("9180000001")[0] is True)
 config.NUMBER_HEALTH_CHECK = False
 
+# ---- smrtPhone says landline -> suppress, never retry (2026-10-05, 4305 S Irvington)
+from types import SimpleNamespace  # noqa: E402
+config.SEND_TIME_PHONE_CHECK = False
+LL = "9185550177"
+store.map_phone(LL, record_uuid="rec-ll")
+store.ensure_conversation(LL, record_uuid="rec-ll")
+q_ll = store.queue_message(LL, "touch", "+19180000001")
+store.set_meta(worker.REPLY_CHECK_KEY, store.now())
+worker.sender_pool.within_quiet_hours = lambda phone: True  # reload above reset the stubs
+worker.sender_pool.available = lambda n: (True, "")
+_send, _dry = worker.transport.send, config.DRY_RUN
+config.DRY_RUN = False  # the send is stubbed below
+worker.transport.send = lambda *a, **k: SimpleNamespace(ok=False, sms_id="", error=(
+    "HTTP 400: Error: Unfortunately this number is landline type and can not send sms to this type number."))
+worker.drain_outbox(limit=50)
+worker.transport.send, config.DRY_RUN = _send, _dry
+check("landline rejection cancels the send (no retry)", store.outbox_status(q_ll) == "cancelled",
+      store.outbox_status(q_ll))
+check("landline rejection suppresses the number", store.is_suppressed(LL) == "smrtphone says landline",
+      str(store.is_suppressed(LL)))
+
 print()
 print(f"{len(FAILS)} failed" if FAILS else "all passed")
 sys.exit(1 if FAILS else 0)

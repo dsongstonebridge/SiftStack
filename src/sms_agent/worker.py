@@ -234,6 +234,18 @@ def drain_outbox(limit: int = 25) -> dict:
                 log.info("suppressed %s: on smrtPhone's do-not-text list", phone)
                 continue
 
+            # Same idea for a landline. DataSift often reads a line type as
+            # UNKNOWN, which our rules allow at Dial First/Second, but smrtPhone
+            # knows the real type and refuses. Remember it so the next touch
+            # does not queue the same number and fail again (2026-10-05, ..7819).
+            if "landline type" in (result.error or "").lower():
+                store.suppress(phone, "smrtphone says landline")
+                store.cancel_queued(phone, "landline, cannot take sms")
+                store.mark_outbox(row["id"], "cancelled", result.error)
+                skipped += 1
+                log.info("suppressed %s: smrtPhone says landline", phone)
+                continue
+
             store.mark_outbox(row["id"], "queued" if row["attempts"] < 3 else "failed", result.error)
             failed += 1
             log.warning("send failed %s -> %s: %s", from_number, phone, result.error)

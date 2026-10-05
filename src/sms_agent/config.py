@@ -198,6 +198,13 @@ SEND_TIME_PHONE_CHECK = _env("SMS_AGENT_SEND_TIME_PHONE_CHECK", "0") in ("1", "t
 # okay, but the litigation list ... is what we'd want to suppress".
 DNC_TRY_OTHER_NUMBERS = _env("SMS_AGENT_DNC_TRY_OTHER_NUMBERS", "0") in ("1", "true", "True")
 
+# Tulsa fork (Jeff, 2026-10-05): never send from a number more than
+# NUMBER_HEALTH_MAX_FLAGS carriers (AT&T / T-Mobile / Verizon) flag as spam,
+# per NumberVerifier's Caller ID History. Needs NUMBERVERIFIER_EMAIL and
+# NUMBERVERIFIER_PASSWORD. Unreadable or stale data HOLDS sending.
+NUMBER_HEALTH_CHECK = _env("SMS_AGENT_NUMBER_HEALTH_CHECK", "0") in ("1", "true", "True")
+NUMBER_HEALTH_MAX_FLAGS = int(_env("SMS_AGENT_NUMBER_HEALTH_MAX_FLAGS", "1"))
+
 CORRECT_NUMBER_FIRST = _env("SMS_AGENT_CORRECT_NUMBER_FIRST", "0") in ("1", "true", "True")
 
 # May we text a phone whose do-not-call flag we cannot see?

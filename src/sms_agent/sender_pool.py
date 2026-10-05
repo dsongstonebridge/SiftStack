@@ -238,6 +238,12 @@ def gap_for(number: str) -> int:
 
 def available(from_number: str) -> tuple[bool, str]:
     """Whether this number may send right now: daily cap plus a pacing gap."""
+    if config.NUMBER_HEALTH_CHECK:
+        # Tulsa fork: carrier flags from NumberVerifier. Unknown holds too.
+        from . import number_health
+        healthy, why = number_health.check(from_number)
+        if not healthy:
+            return False, why
     cap = cap_for(from_number)
     if cap and store.sends_today(from_number) >= cap:
         return False, f"daily cap {cap} reached"

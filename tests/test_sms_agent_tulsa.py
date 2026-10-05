@@ -378,6 +378,50 @@ check("note names the reason and has no dashes",
       "do-not-call" in note[0][1] and "—" not in note[0][1] and "–" not in note[0][1])
 config.DRY_RUN = True
 
+# ---- NumberVerifier carrier flags: >1 flagged carrier = number pulled
+from sms_agent import number_health, sender_pool  # noqa: E402
+import datetime as _dt  # noqa: E402
+TODAY = _dt.date.today().isoformat()
+OLD = (_dt.date.today() - _dt.timedelta(days=9)).isoformat()
+ALERTS = []
+escalate.alert = lambda title, detail="", **k: ALERTS.append(title) or True
+config.NUMBER_HEALTH_MAX_FLAGS = 1
+SNAP = {"9180000001": {"day": TODAY, "flags": [0, 0, 0]},
+        "9180000002": {"day": TODAY, "flags": [1, 0, 0]},
+        "9180000003": {"day": TODAY, "flags": [1, 1, 0]},
+        "9180000004": {"day": OLD, "flags": [0, 0, 0]}}
+store.set_meta(number_health.CACHE_KEY, "")
+number_health.fetch = lambda: SNAP
+check("0 flags -> may send", number_health.check("+19180000001") == (True, ""))
+check("1 flag -> may send (more than 1 pulls)", number_health.check("9180000002")[0] is True)
+ok, why = number_health.check("9180000003")
+check("2 flags -> pulled, names the carriers", ok is False and "AT&T, T-Mobile" in why, why)
+check("pulled number alerts #SMS once", ALERTS.count("SMS agent: sending number pulled") == 1, str(ALERTS))
+number_health.check("9180000003")
+check("...and only once a day", ALERTS.count("SMS agent: sending number pulled") == 1, str(ALERTS))
+check("stale data -> hold", number_health.check("9180000004")[0] is None)
+check("unmonitored number -> hold", number_health.check("9180000009")[0] is None)
+
+
+def _boom():
+    raise RuntimeError("login failed")
+
+
+store.set_meta(number_health.CACHE_KEY, "")
+number_health.fetch = _boom
+ok, why = number_health.check("9180000001")
+check("NumberVerifier unreadable -> hold", ok is None and "unreadable" in why, why)
+check("unreadable alerts #SMS", "SMS agent: number health check is failing" in ALERTS, str(ALERTS))
+number_health.fetch = lambda: SNAP
+check("failure is cached for the hour (no login storm)", number_health.check("9180000001")[0] is None)
+store.set_meta(number_health.CACHE_KEY, "")
+import importlib  # noqa: E402
+sender_pool = importlib.reload(sender_pool)  # an earlier test stubbed available()
+config.NUMBER_HEALTH_CHECK = True
+check("available(): flagged number refused", sender_pool.available("9180000003")[0] is False)
+check("available(): clean number allowed", sender_pool.available("9180000001")[0] is True)
+config.NUMBER_HEALTH_CHECK = False
+
 print()
 print(f"{len(FAILS)} failed" if FAILS else "all passed")
 sys.exit(1 if FAILS else 0)

@@ -1730,8 +1730,8 @@ many wake events that are not someone using the PC.
 
 **Testing locally** (Jeff's PC reaches DataSift and smrtPhone directly; skip `--slack`
 unless Jeff says post): `python kpi-engine/pull_kpis.py --from 2026-09-30 --to 2026-09-30`.
-Sep 30 is the regression day: Dials 142, VM 78, Reached 31 = 6 + 3 + 22, Conversations 10,
-brief 21, 2 min+ 0, Talk 16m18s, Correct 12, Wrong 26, Dead 27, Leads 0, NI 4, Follow-ups 7.
+Sep 30 is the regression day: Dials 142, VM 84, Reached 28 = 6 + 3 + 19, Conversations 10,
+brief 18, 2 min+ 0, Talk 14m37s, Correct 12, Wrong 26, Dead 27, Leads 0, NI 4, Follow-ups 7.
 
 **smrtPhone session expires ~Oct 31, 2026:** run `kpi-engine\smrtphone_login.bat`, then paste
 `kpi-engine\reports\SMRTPHONE_STATE_paste_me.txt` into the `SMRTPHONE_STATE` GitHub secret.

@@ -339,6 +339,45 @@ def _correct_number_verdict(record_uuid: str, phone: str,
     return True, ""
 
 
+CORRECT_DNC_REASON = "Correct number is flagged do-not-call"
+
+
+def correct_dnc_note(row: dict) -> str:
+    """Board note for a record skipped because its Correct number is flagged."""
+    return (
+        "SMS agent: no automated text sent. The number marked Correct on this "
+        "record is flagged do-not-call in DataSift, so the agent will not text "
+        "it, and it does not text the record's other numbers while one is "
+        "marked Correct. Call it, or decide by hand whether to text it."
+    )
+
+
+def post_skip_notes(notes: list) -> dict:
+    """Post each (record_uuid, text) board note ONCE per record, ever.
+
+    Under DRY_RUN nothing is posted and nothing is marked, so the first real
+    run still posts. A failed post is not marked either, so it retries tomorrow.
+    """
+    posted, skipped, failed = 0, 0, 0
+    for record_uuid, text in notes:
+        key = f"skip-note:{record_uuid}"
+        if not record_uuid or store.get_meta(key):
+            skipped += 1
+            continue
+        if config.DRY_RUN:
+            log.info("DRY_RUN board note on %s: %s", record_uuid, text[:80])
+            skipped += 1
+            continue
+        res = crm.post_note(record_uuid, text)
+        if isinstance(res, dict) and res.get("error"):
+            log.warning("board note on %s failed: %s", record_uuid, res["error"])
+            failed += 1
+            continue
+        store.set_meta(key, store.now())
+        posted += 1
+    return {"posted": posted, "skipped": skipped, "failed": failed}
+
+
 def apply_correct_number(row: dict, dnc_numbers: set) -> tuple[Optional[dict], str]:
     """Build-time rule. Returns (row, "") with the row UNCHANGED when the record
     has no Correct number, so a record's touch sequence never hops numbers;
@@ -349,23 +388,34 @@ def apply_correct_number(row: dict, dnc_numbers: set) -> tuple[Optional[dict], s
     rec = crm.get_record(uuid) if uuid else None
     if not rec:
         return None, "could not read the record"
-    best = None
+    best, flagged = None, []
     for p in correct_phones(rec):
         number = store.clean_phone(p.get("number"))
-        if len(number) != 10 or number in dnc_numbers:
+        if len(number) != 10:
             continue
         ok, _ = textable_line(p.get("type"), "Dial First")
         if not ok:
+            continue
+        if number in dnc_numbers:
+            flagged.append(number)
             continue
         rank = 0 if (p.get("type") or "").upper() == "MOBILE" else 1
         if best is None or rank < best[0]:
             best = (rank, number)
     if not correct_phones(rec):
         return row, ""
+    if best is None and flagged:
+        # Already talked to them: nothing for a human to decide, so no note.
+        events = crm.activity_log(uuid)
+        if events is None:
+            return None, "could not read the call log / board"
+        if any(spoken_on(events, n) for n in flagged):
+            return None, "already spoke with them on the Correct number"
+        return None, CORRECT_DNC_REASON
     if best is None:
-        return None, "Correct number is not textable (landline, VoIP or do-not-call)"
+        return None, "Correct number is not textable (landline or VoIP)"
     if crm.phone_is_dnc(best[1]):
-        return None, "Correct number is flagged do-not-call"
+        return None, CORRECT_DNC_REASON
     events = crm.activity_log(uuid)
     if events is None:
         return None, "could not read the call log / board"
@@ -427,10 +477,17 @@ def from_preset(title: str, limit: int = 0, keep_unresolved: bool = False,
         if phone.get("doNotCall"):
             if number:
                 counts.setdefault("_dnc_numbers", set()).add(number)
-            drop("phone flagged do-not-call")
-            continue
+            # Tulsa fork: the flag belongs to THIS number, not the owner. Keep
+            # the record for a look at its other numbers; resolve_best_phone
+            # skips every number in the collected DNC set.
+            if not (config.DNC_TRY_OTHER_NUMBERS and keep_unresolved):
+                drop("phone flagged do-not-call")
+                continue
+            flagged_dnc = True
+        else:
+            flagged_dnc = False
 
-        deferred = None
+        deferred = "phone flagged do-not-call" if flagged_dnc else None
         # Tier filtered here, on the search payload, so it costs nothing. Doing
         # it per candidate meant one record fetch each, which is tolerable for
         # 300 records and impossible for the 9,000 the cadences actually hold.

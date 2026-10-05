@@ -93,6 +93,9 @@ def run(force: bool = False, dry_run: bool = False) -> dict:
             kind="campaign",
         )
 
+    if plan.board_notes and not dry_run:
+        log.info("skip board notes: %s", seed.post_skip_notes(plan.board_notes))
+
     if not ready:
         # Say so out loud. A quiet morning and a broken cohort query look
         # identical from the outside, and only one of them is fine.

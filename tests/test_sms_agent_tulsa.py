@@ -327,6 +327,57 @@ ok, why = seed.phone_still_textable("r-c1", "9185550162")
 check("send-time: call log unreadable -> held", ok is None, why)
 config.CORRECT_NUMBER_FIRST = False
 
+# ---- a do-not-call flag skips that NUMBER, not the record (2026-10-05)
+crm.resolve_preset = lambda title: ({"x": 1}, title)
+crm.dial_tier_uuids = lambda *a, **k: {"Dial First": "t1"}
+crm.fetch_cohort = lambda must, limit=0: [{
+    "uuid": "r-dnc", "address": {"street": "1 Test St"}, "owner": {"first_name": "Ann"},
+    "phone": {"number": "9185550170", "doNotCall": True, "tags": ["t1"], "type": "MOBILE"}}]
+config.DNC_TRY_OTHER_NUMBERS = False
+stats = {}
+rows, _ = seed.from_preset("FTM", keep_unresolved=True, stats=stats)
+check("switch off: flagged search phone drops the record (upstream)", rows == [], str(rows))
+config.DNC_TRY_OTHER_NUMBERS = True
+stats = {}
+rows, _ = seed.from_preset("FTM", keep_unresolved=True, stats=stats)
+check("switch on: record kept for its other numbers",
+      len(rows) == 1 and rows[0].get("_needs_best_phone") == "phone flagged do-not-call", str(rows))
+check("flagged number still collected as DNC", "9185550170" in stats.get("_dnc_numbers", set()))
+RECS["r-dnc"] = _rec(("9185550170", "UNKNOWN", "MOBILE", ["Dial First"]),
+                     ("9185550171", "UNKNOWN", "MOBILE", ["Dial Second"]))
+crm.phone_is_dnc = lambda phone: None   # other numbers' flags are invisible
+got, why = seed.resolve_best_phone(rows[0], {"9185550170"})
+check("best OTHER number picked, flagged one skipped", bool(got) and got["phone"] == "9185550171", str((got, why)))
+config.DNC_TRY_OTHER_NUMBERS = False
+
+# ---- a flagged Correct number: no text, one board note saying why
+config.CORRECT_NUMBER_FIRST = True
+RECS["r-cd"] = _rec(("9185550180", "CORRECT", "MOBILE", ["Dial First"]),
+                    ("9185550181", "UNKNOWN", "MOBILE", ["Dial First"]))
+LOGS["r-cd"] = []
+got, why = seed.apply_correct_number({"uuid": "r-cd", "phone": "9185550180"}, {"9185550180"})
+check("flagged Correct number -> no text, own reason", got is None and why == seed.CORRECT_DNC_REASON, why)
+config.CORRECT_NUMBER_FIRST = False
+
+NOTES_POSTED = []
+crm.post_note = lambda uuid, text, pinned=False: NOTES_POSTED.append(uuid) or {"ok": True}
+note = [("r-cd", seed.correct_dnc_note({}))]
+config.DRY_RUN = True
+r = seed.post_skip_notes(note)
+check("dry run: board note not posted", NOTES_POSTED == [] and r["posted"] == 0, str(r))
+config.DRY_RUN = False
+crm.post_note = lambda uuid, text, pinned=False: {"error": "boom"}
+r = seed.post_skip_notes(note)
+check("failed post is not marked (retries tomorrow)", r["failed"] == 1 and not store.get_meta("skip-note:r-cd"), str(r))
+crm.post_note = lambda uuid, text, pinned=False: NOTES_POSTED.append(uuid) or {"ok": True}
+seed.post_skip_notes(note)
+check("board note posted once", NOTES_POSTED == ["r-cd"], str(NOTES_POSTED))
+seed.post_skip_notes(note)
+check("never posted twice for the same record", NOTES_POSTED == ["r-cd"], str(NOTES_POSTED))
+check("note names the reason and has no dashes",
+      "do-not-call" in note[0][1] and "—" not in note[0][1] and "–" not in note[0][1])
+config.DRY_RUN = True
+
 print()
 print(f"{len(FAILS)} failed" if FAILS else "all passed")
 sys.exit(1 if FAILS else 0)

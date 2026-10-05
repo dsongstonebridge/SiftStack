@@ -222,6 +222,8 @@ class Plan:
     holds: dict = field(default_factory=dict)
     unreached: list = field(default_factory=list)
     missing_presets: list = field(default_factory=list)
+    # Tulsa fork: (record_uuid, text) board notes explaining a skip.
+    board_notes: list = field(default_factory=list)
 
 
 def build(sender_fallback: str = "", log_pages: int = 6,
@@ -298,6 +300,8 @@ def build(sender_fallback: str = "", log_pages: int = 6,
             # Tulsa fork: a Correct number overrides everything below.
             if config.CORRECT_NUMBER_FIRST:
                 swapped, why = seed.apply_correct_number(row, dnc_numbers)
+                if not swapped and why == seed.CORRECT_DNC_REASON:
+                    plan.board_notes.append((row.get("uuid") or "", seed.correct_dnc_note(row)))
                 if not swapped:
                     stage["holds"][why] = stage["holds"].get(why, 0) + 1
                     plan.holds[why] = plan.holds.get(why, 0) + 1

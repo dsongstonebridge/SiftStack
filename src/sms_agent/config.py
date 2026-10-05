@@ -190,6 +190,14 @@ SEND_TIME_PHONE_CHECK = _env("SMS_AGENT_SEND_TIME_PHONE_CHECK", "0") in ("1", "t
 # same-day voicemail note, or a hand-written board note describing a
 # conversation): then the record gets no automated text at all. Checked at
 # build AND, with SEND_TIME_PHONE_CHECK, right before each send.
+# Tulsa fork (Jeff, 2026-10-05): DataSift's do-not-call flag belongs to ONE
+# number, not the owner. Upstream drops the whole record when the search row's
+# representative phone is flagged; with this on, that number is skipped and
+# the record's best OTHER number is used (deep sources only). Those numbers'
+# own flags are invisible in the API, which is Ty's accepted risk: "DNC is
+# okay, but the litigation list ... is what we'd want to suppress".
+DNC_TRY_OTHER_NUMBERS = _env("SMS_AGENT_DNC_TRY_OTHER_NUMBERS", "0") in ("1", "true", "True")
+
 CORRECT_NUMBER_FIRST = _env("SMS_AGENT_CORRECT_NUMBER_FIRST", "0") in ("1", "true", "True")
 
 # May we text a phone whose do-not-call flag we cannot see?

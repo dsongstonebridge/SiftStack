@@ -15,6 +15,9 @@ New-Item -ItemType Directory -Force (Split-Path $state) | Out-Null
 function Log($m) { "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  $m" | Out-File -Append -Encoding utf8 $log }
 
 $now  = Get-Date
+# Jeff, 2026-10-05: Oct 2 never posted. The PC slept through 6:30, woke for 8 seconds on
+# Saturday and slept again mid-run, and nothing retried until Monday. The task now also fires
+# every 15 minutes and on wake/unlock; this script is safe to run any number of times.
 $last = if (Test-Path $state) { [datetime]::ParseExact((Get-Content $state -Raw).Trim(), "yyyy-MM-dd", $null) }
         else { $now.Date.AddDays(-1) }
 
@@ -28,7 +31,8 @@ while ($d -le $now.Date) {
     }
     $d = $d.AddDays(1)
 }
-if (-not $due) { Log "nothing due (last posted $($last.ToString('yyyy-MM-dd')))"; exit 0 }
+if (-not $due) { exit 0 }   # runs every 15 min; stay quiet unless something is due
+Log "due: $(($due | ForEach-Object { $_.ToString('yyyy-MM-dd') }) -join ', ')"
 
 foreach ($day in $due) {
     $what = if ($day.DayOfWeek -eq "Friday") { "both" } else { "daily" }

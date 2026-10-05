@@ -142,5 +142,7 @@ jobs:
       - name: Post the weekly sheet summary (Fridays)
         if: steps.gate.outputs.weekly == 'true'
         working-directory: kpi-bot
+        env:
+          KPI_AS_OF: ${{ github.event.inputs.date }}   # a caught-up Friday still reports Friday's week
         run: python kpi_slack_bot.py
 

@@ -190,6 +190,10 @@ SEND_TIME_PHONE_CHECK = _env("SMS_AGENT_SEND_TIME_PHONE_CHECK", "0") in ("1", "t
 # same-day voicemail note, or a hand-written board note describing a
 # conversation): then the record gets no automated text at all. Checked at
 # build AND, with SEND_TIME_PHONE_CHECK, right before each send.
+# Tulsa fork (Jeff, 2026-10-05): a launch allow-list. When set, ONLY these
+# DataSift record uuids (comma separated) can be texted. Empty = everyone.
+ONLY_RECORDS = {x.strip() for x in _env("SMS_AGENT_ONLY_RECORDS", "").split(",") if x.strip()}
+
 # Tulsa fork (Jeff, 2026-10-05, later the same day): IGNORE DataSift's
 # do-not-call registry flag entirely. Real opt-outs (phone STATUS DNC /
 # CORRECT_DNC / WRONG_DNC), WRONG, DEAD and the litigator tag still block.

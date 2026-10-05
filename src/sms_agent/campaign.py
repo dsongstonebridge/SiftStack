@@ -292,6 +292,8 @@ def build(sender_fallback: str = "", log_pages: int = 6,
                 plan.hit_cap = True
                 break
             row = rows.pop(0)
+            if config.ONLY_RECORDS and row.get("uuid") not in config.ONLY_RECORDS:
+                continue  # Tulsa fork: launch allow-list
             phone = store.clean_phone(row.get("phone"))
             if phone and phone in seen_phone:
                 plan.skipped_duplicate_person += 1

@@ -298,7 +298,7 @@ def build(sender_fallback: str = "", log_pages: int = 6,
                 continue
 
             # Tulsa fork: a Correct number overrides everything below.
-            if config.CORRECT_NUMBER_FIRST:
+            if config.CORRECT_NUMBER_FIRST and not row.get("_expanded"):
                 swapped, why = seed.apply_correct_number(row, dnc_numbers)
                 if not swapped and why == seed.CORRECT_DNC_REASON:
                     plan.board_notes.append((row.get("uuid") or "", seed.correct_dnc_note(row)))
@@ -312,6 +312,24 @@ def build(sender_fallback: str = "", log_pages: int = 6,
                     if phone in seen_phone:
                         plan.skipped_duplicate_person += 1
                         continue
+
+            # Tulsa fork: every qualifying number, not just the best. Expanded
+            # rows go back on the front of the queue, so caps, touch history
+            # and holds apply to each number exactly as to a single row.
+            if (config.TEXT_ALL_BEST and not row.get("_expanded")
+                    and row.get("dial_tier") != "Correct"):
+                expanded = seed.all_textable_rows(row, dnc_numbers)
+                if not expanded:
+                    why = "no Dial First or Second phone on the record"
+                    stage["holds"][why] = stage["holds"].get(why, 0) + 1
+                    plan.holds[why] = plan.holds.get(why, 0) + 1
+                    continue
+                rows[0:0] = expanded[1:]
+                row = expanded[0]
+                phone = store.clean_phone(row.get("phone"))
+                if phone in seen_phone:
+                    plan.skipped_duplicate_person += 1
+                    continue
 
             # Deep sources: the search row's phone is often not the record's
             # best. Resolve now, at the moment we would actually use the row,

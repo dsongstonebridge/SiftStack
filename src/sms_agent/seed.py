@@ -396,7 +396,7 @@ def apply_correct_number(row: dict, dnc_numbers: set) -> tuple[Optional[dict], s
         ok, _ = textable_line(p.get("type"), "Dial First")
         if not ok:
             continue
-        if number in dnc_numbers:
+        if number in dnc_numbers and not config.IGNORE_DNC_FLAG:
             flagged.append(number)
             continue
         rank = 0 if (p.get("type") or "").upper() == "MOBILE" else 1
@@ -414,7 +414,7 @@ def apply_correct_number(row: dict, dnc_numbers: set) -> tuple[Optional[dict], s
         return None, CORRECT_DNC_REASON
     if best is None:
         return None, "Correct number is not textable (landline or VoIP)"
-    if crm.phone_is_dnc(best[1]):
+    if not config.IGNORE_DNC_FLAG and crm.phone_is_dnc(best[1]):
         return None, CORRECT_DNC_REASON
     events = crm.activity_log(uuid)
     if events is None:
@@ -474,7 +474,7 @@ def from_preset(title: str, limit: int = 0, keep_unresolved: bool = False,
         # with the field absent, not false (verified live 2026-08-28). So this
         # is the one place it can be seen, and the caller needs the number even
         # when the row is kept for a deeper look.
-        if phone.get("doNotCall"):
+        if phone.get("doNotCall") and not config.IGNORE_DNC_FLAG:
             if number:
                 counts.setdefault("_dnc_numbers", set()).add(number)
             # Tulsa fork: the flag belongs to THIS number, not the owner. Keep
@@ -541,6 +541,49 @@ def from_preset(title: str, limit: int = 0, keep_unresolved: bool = False,
 
 
 _TIER_RANK = {"Dial First": 0, "Dial Second": 1}
+
+
+def all_textable_rows(row: dict, dnc_numbers: set) -> list[dict]:
+    """Tulsa fork (config.TEXT_ALL_BEST): one row per qualifying number on the
+    record, best first. Same rules as resolve_best_phone, minus the "only one".
+    """
+    rec = crm.get_record(row.get("uuid") or "") if row.get("uuid") else None
+    if not rec:
+        return []
+    owner = rec.get("owner") if isinstance(rec.get("owner"), dict) else {}
+    found = []
+    for p in owner.get("phones") or []:
+        if not isinstance(p, dict):
+            continue
+        number = store.clean_phone(p.get("number"))
+        if len(number) != 10:
+            continue
+        if number in dnc_numbers and not config.IGNORE_DNC_FLAG:
+            continue
+        if (p.get("status") or "").upper() in SKIP_PHONE_STATUSES:
+            continue
+        tier = ""
+        for tag in (p.get("tags") or []):
+            name = (tag.get("title") or tag.get("name") or tag.get("tag")
+                    if isinstance(tag, dict) else str(tag))
+            if name in ALLOWED_DIAL_TIERS:
+                tier = name
+                break
+        if not tier:
+            continue
+        ok, _ = textable_line(p.get("type"), tier)
+        if not ok:
+            continue
+        rank = (_TIER_RANK.get(tier, 9),
+                0 if (p.get("type") or "").upper() == "MOBILE" else 1, number)
+        found.append((rank, number, tier))
+    out = []
+    for _, number, tier in sorted(found):
+        r = dict(row)
+        r.pop("_needs_best_phone", None)
+        r["phone"], r["dial_tier"], r["_expanded"] = number, tier, True
+        out.append(r)
+    return out
 
 
 def resolve_best_phone(row: dict, dnc_numbers: set) -> tuple[Optional[dict], str]:
@@ -610,7 +653,7 @@ def resolve_best_phone(row: dict, dnc_numbers: set) -> tuple[Optional[dict], str
     # A real opt-out is not affected either way: that writes DNC / CORRECT_DNC
     # / WRONG_DNC into the phone STATUS, which is on every phone and was
     # already refused above. This governs the registry scrub alone.
-    flagged = crm.phone_is_dnc(best[1])
+    flagged = False if config.IGNORE_DNC_FLAG else crm.phone_is_dnc(best[1])
     if flagged:
         return None, "best phone is flagged do-not-call"
     if flagged is None and config.REQUIRE_VISIBLE_DNC:

@@ -190,6 +190,16 @@ SEND_TIME_PHONE_CHECK = _env("SMS_AGENT_SEND_TIME_PHONE_CHECK", "0") in ("1", "t
 # same-day voicemail note, or a hand-written board note describing a
 # conversation): then the record gets no automated text at all. Checked at
 # build AND, with SEND_TIME_PHONE_CHECK, right before each send.
+# Tulsa fork (Jeff, 2026-10-05, later the same day): IGNORE DataSift's
+# do-not-call registry flag entirely. Real opt-outs (phone STATUS DNC /
+# CORRECT_DNC / WRONG_DNC), WRONG, DEAD and the litigator tag still block.
+IGNORE_DNC_FLAG = _env("SMS_AGENT_IGNORE_DNC_FLAG", "0") in ("1", "true", "True")
+
+# Tulsa fork (Jeff, 2026-10-05): text EVERY qualifying number on a record
+# (Dial First/Second, textable line, good status), not only the best one.
+# A record with a number marked Correct still gets only that number.
+TEXT_ALL_BEST = _env("SMS_AGENT_TEXT_ALL_BEST", "0") in ("1", "true", "True")
+
 # Tulsa fork (Jeff, 2026-10-05): DataSift's do-not-call flag belongs to ONE
 # number, not the owner. Upstream drops the whole record when the search row's
 # representative phone is flagged; with this on, that number is skipped and

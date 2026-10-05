@@ -378,6 +378,32 @@ check("note names the reason and has no dashes",
       "do-not-call" in note[0][1] and "—" not in note[0][1] and "–" not in note[0][1])
 config.DRY_RUN = True
 
+# ---- text EVERY qualifying number; ignore DataSift's do-not-call flag
+RECS["r-all"] = _rec(("9185550190", "UNKNOWN", "MOBILE", ["Dial Second"]),
+                     ("9185550191", "UNKNOWN", "MOBILE", ["Dial First"]),
+                     ("9185550192", "WRONG", "MOBILE", ["Dial First"]),
+                     ("9185550193", "DNC", "MOBILE", ["Dial First"]),
+                     ("9185550194", "UNKNOWN", "LANDLINE", ["Dial First"]),
+                     ("9185550195", "UNKNOWN", "MOBILE", ["Dial Third"]),
+                     ("9185550196", "UNKNOWN", "UNKNOWN", ["Dial First"]),
+                     ("9185550197", "UNKNOWN", "MOBILE", ["Dial First"]))
+config.IGNORE_DNC_FLAG = False
+got = [r["phone"] for r in seed.all_textable_rows({"uuid": "r-all"}, {"9185550197"})]
+check("all numbers: Dial First mobile, then unknown, then Second; bad status/landline/Third out; flag honoured",
+      got == ["9185550191", "9185550196", "9185550190"], str(got))
+config.IGNORE_DNC_FLAG = True
+got = [r["phone"] for r in seed.all_textable_rows({"uuid": "r-all"}, {"9185550197"})]
+check("ignore flag: the flagged Dial First mobile is texted too",
+      got == ["9185550191", "9185550197", "9185550196", "9185550190"], str(got))
+check("ignore flag never un-blocks a DNC / WRONG status", "9185550192" not in got and "9185550193" not in got)
+crm.fetch_cohort = lambda must, limit=0: [{
+    "uuid": "r-dnc", "address": {"street": "1 Test St"}, "owner": {"first_name": "Ann"},
+    "phone": {"number": "9185550170", "doNotCall": True, "tags": ["t1"], "type": "MOBILE"}}]
+rows, _ = seed.from_preset("FTM", keep_unresolved=True, stats={})
+check("ignore flag: flagged search phone kept as a normal row",
+      len(rows) == 1 and not rows[0].get("_needs_best_phone"), str(rows))
+config.IGNORE_DNC_FLAG = False
+
 # ---- NumberVerifier carrier flags: >1 flagged carrier = number pulled
 from sms_agent import number_health, sender_pool  # noqa: E402
 import datetime as _dt  # noqa: E402

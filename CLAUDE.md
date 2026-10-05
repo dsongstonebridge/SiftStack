@@ -1683,11 +1683,17 @@ day and refills the sheet from that day).
 **What presses the button: Windows task "KPI posts 630 PM weekdays"** on Jeff's PC, at
 **6:30 PM** (Jeff wants 6:30, not 6:31), no end date. It runs
 `kpi-engine/trigger_kpi_post.ps1`: `gh workflow run kpi-posts.yml`, Friday = `both`,
-otherwise `daily`. Wake-to-run plus run-on-logon: a missed day is posted as soon as the PC
-is back, **for the day that was missed** (passed as `date`), never as "today". On-time runs
-leave `date` blank, exactly like pressing the button. State in
+otherwise `daily`. **It never wakes the PC** (Jeff, 2026-10-05: wait until he opens it).
+Triggers: 6:30 PM weekdays, logon, unlock, wake from sleep, and every 15 minutes all day,
+so a missed day posts within minutes of the PC being in use, **for the day that was missed**
+(passed as `date`), never as "today". On-time runs leave `date` blank, exactly like pressing
+the button. The workflow passes that date to the sheet bot as `KPI_AS_OF`, so a Friday post
+caught up on Monday still reports Friday's day and week. State in
 `kpi-engine/reports/kpi_post_last.txt` (last day posted, so no double posts), log in
-`kpi-engine/reports/kpi_post_trigger.log`. Needs the PC logged in (asleep/locked is fine).
+`kpi-engine/reports/kpi_post_trigger.log` (written only when something is due). Needs the PC
+logged in. Why the extra triggers: on 2026-10-02 the PC slept through 6:30, woke for 8
+seconds Saturday and slept again mid-run, and with only a logon trigger nothing retried
+until Monday.
 - Do NOT re-add a GitHub `schedule:` or use a Claude session cron (expires after 7 days).
 - The cloud routine that used to press the button (paused) drove Chrome, which breaks
   Jeff's no-screen-takeover rule. Leave it off.

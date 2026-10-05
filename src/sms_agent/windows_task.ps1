@@ -1,5 +1,5 @@
 # Runs Diego's SMS agent for one weekday (Windows task "SMS agent weekdays").
-# The task starts this at 8:45 AM and stops it around 7:00 PM. Sending only
+# The task starts this at 8:00 AM and stops it around 7:00 PM. Sending only
 # happens inside the agent's own hours; the agent itself enforces that.
 # One log file per day. The redirect goes through cmd because Windows
 # PowerShell 5.1 turns every stderr line (Python logging) into an error record.

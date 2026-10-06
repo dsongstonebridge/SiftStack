@@ -209,6 +209,13 @@ TEXT_ALL_BEST = _env("SMS_AGENT_TEXT_ALL_BEST", "0") in ("1", "true", "True")
 # cut follow-ups off (six of 23 due owners missed touch 2 in a dry run).
 FOLLOWUPS_FIRST = _env("SMS_AGENT_FOLLOWUPS_FIRST", "0") in ("1", "true", "True")
 
+# Tulsa fork (Jeff, 2026-10-06): each day, every NEW record starts on one
+# number, the cleanest by NumberVerifier flags, so callers can dial from the
+# number the owner already saw. Records already texted stay on their number.
+# That day's number gets DAILY_NUMBER_CAP instead of the per-number cap.
+ONE_NUMBER_PER_DAY = _env("SMS_AGENT_ONE_NUMBER_PER_DAY", "0") in ("1", "true", "True")
+DAILY_NUMBER_CAP = int(_env("SMS_AGENT_DAILY_NUMBER_CAP", "50"))
+
 # Tulsa fork (Jeff, 2026-10-05): DataSift's do-not-call flag belongs to ONE
 # number, not the owner. Upstream drops the whole record when the search row's
 # representative phone is flagged; with this on, that number is skipped and

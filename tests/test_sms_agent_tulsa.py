@@ -204,7 +204,7 @@ store.set_meta(worker.REPLY_CHECK_KEY, store.now())
 store.cancel_queued(D, "test cleanup")
 worker.time.sleep = lambda s: None
 worker.sender_pool.within_quiet_hours = lambda phone: True
-worker.sender_pool.available = lambda n: (True, "")
+worker.sender_pool.available = lambda n, **k: (True, "")
 worker.drain_outbox(limit=50)
 for ph, (obj, want) in cases.items():
     got = store.outbox_status(rows_q[ph])
@@ -461,7 +461,7 @@ store.ensure_conversation(LL, record_uuid="rec-ll")
 q_ll = store.queue_message(LL, "touch", "+19180000001")
 store.set_meta(worker.REPLY_CHECK_KEY, store.now())
 worker.sender_pool.within_quiet_hours = lambda phone: True  # reload above reset the stubs
-worker.sender_pool.available = lambda n: (True, "")
+worker.sender_pool.available = lambda n, **k: (True, "")
 _send, _dry = worker.transport.send, config.DRY_RUN
 config.DRY_RUN = False  # the send is stubbed below
 worker.transport.send = lambda *a, **k: SimpleNamespace(ok=False, sms_id="", error=(
@@ -490,6 +490,51 @@ store.ensure_conversation("9185550301", from_number="+19180000003", record_uuid=
 plan = seed.schedule([seed.Candidate(phone="9185550302", record_uuid="rec-earlier", sender="Diego")])
 check("new phone reuses the number already texting its record", plan[0][1] == "+19180000003",
       plan[0][1])
+
+# ---- one number per day for new records (Jeff, 2026-10-06)
+config.ONE_NUMBER_PER_DAY, config.NUMBER_HEALTH_CHECK = True, True
+importlib.reload(seed.sender_pool)  # the landline test above stubbed available()
+seed.sender_pool.pool = lambda owner="": ["+19180000001", "+19180000002", "+19180000003"]
+seed.sender_pool.within_quiet_hours = lambda phone, when=None: True
+store.set_meta(number_health.CACHE_KEY, "")
+number_health.fetch = lambda: SNAP  # 0001 clean, 0002 one flag, 0003 pulled
+store.set_meta(seed.sender_pool._daily_key(), "")
+plan = seed.schedule([seed.Candidate(phone=p, record_uuid=r, sender="Diego") for p, r in (
+    ("9185550601", "rec-d1"), ("9185550602", "rec-d2"), ("9185550603", "rec-d2"),
+    ("9185550604", "rec-d3"))])
+check("every new record starts on the day's cleanest number",
+      {n for _, n, _ in plan} == {"+19180000001"}, str({n for _, n, _ in plan}))
+store.ensure_conversation("9185550611", from_number="+19180000003", record_uuid="rec-old")
+plan = seed.schedule([seed.Candidate(phone="9185550612", record_uuid="rec-old", sender="Diego")])
+check("record already texted keeps its number even if it is flagged now",
+      plan[0][1] == "+19180000003", plan[0][1])
+check("day's number gets the daily-number cap",
+      seed.sender_pool.cap_for("+19180000001") == config.DAILY_NUMBER_CAP)
+check("other numbers keep the per-number cap",
+      seed.sender_pool.cap_for("+19180000002") == config.DAILY_CAP_PER_NUMBER)
+check("flagged number refused for a record it never texted",
+      seed.sender_pool.available("+19180000003")[0] is False)
+check("flagged number still sends to a record it already texted",
+      seed.sender_pool.available("+19180000003", committed=True)[0] is True)
+store.map_phone("9185550611", record_uuid="rec-old")
+check("committed only after a real send", not store.record_texted_from("rec-old", "+19180000003"))
+store.record_send("+19180000003", "9185550611")
+check("...and true once it was sent", store.record_texted_from("rec-old", "+19180000003"))
+store.set_meta(seed.sender_pool._daily_key(), "")
+store.set_meta(number_health.CACHE_KEY, "")
+number_health.fetch = lambda: dict(SNAP, **{"9180000005": {"day": TODAY, "flags": [0, 0, 0]}})
+store.record_send("+19180000001", "9185550699")
+check("tie on flags -> the number that sent least this week",
+      seed.sender_pool.daily_number(["+19180000001", "+19180000005"]) == "+19180000005")
+check("the pick holds for the rest of the day",
+      seed.sender_pool.daily_number(["+19180000001", "+19180000005"]) == "+19180000005")
+store.set_meta(seed.sender_pool._daily_key(), "")
+check("fewer flags beats fewer sends",
+      seed.sender_pool.daily_number(["+19180000002", "+19180000005"]) == "+19180000005")
+number_health.fetch = lambda: SNAP
+store.set_meta(number_health.CACHE_KEY, "")
+check("no healthy number -> nothing new starts", seed.sender_pool.daily_number(["+19180000003"]) == "")
+config.ONE_NUMBER_PER_DAY, config.NUMBER_HEALTH_CHECK = False, False
 seed.sender_pool.pool, seed.sender_pool.within_quiet_hours = _pool, _quiet
 
 # ---- relationship-tagged number greets the relative (Jeff, 2026-10-05, 8110 S Birch Ave)

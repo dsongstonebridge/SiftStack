@@ -303,6 +303,31 @@ def record_from_number(record_uuid: str) -> str:
     return row[0] if row else ""
 
 
+def record_texted_from(record_uuid: str, from_number: str) -> bool:
+    """True once this record has actually been SENT a text from this number.
+
+    Jeff, 2026-10-06: after touch 1, every later touch to the record goes out
+    from the same number regardless of that number's health later in the week.
+    A conversation row exists from staging time, so only a real send counts.
+    """
+    if not record_uuid or not from_number:
+        return False
+    row = _conn().execute(
+        "SELECT 1 FROM sends s JOIN phone_map p ON p.phone = s.phone "
+        "WHERE p.record_uuid=? AND s.from_number=? LIMIT 1",
+        (record_uuid, from_number),
+    ).fetchone()
+    return bool(row)
+
+
+def sends_since(from_number: str, since_iso: str) -> int:
+    row = _conn().execute(
+        "SELECT COUNT(*) AS n FROM sends WHERE from_number=? AND sent_at>=?",
+        (from_number, since_iso),
+    ).fetchone()
+    return int(row["n"]) if row else 0
+
+
 def ensure_conversation(phone: str, from_number: str = "", record_uuid: str = "") -> dict:
     p = clean_phone(phone)
     with tx() as c:

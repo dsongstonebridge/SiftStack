@@ -183,7 +183,10 @@ def drain_outbox(limit: int = 25) -> dict:
             failed += 1
             continue
 
-        ok, why = sender_pool.available(from_number)
+        rec_for_number = ((conv or {}).get("record_uuid")
+                          or (store.lookup_phone(phone) or {}).get("record_uuid") or "")
+        committed = store.record_texted_from(rec_for_number, from_number)
+        ok, why = sender_pool.available(from_number, committed=committed)
         if not ok:
             log.info("holding outbox %s: %s (%s)", row["id"], why, from_number)
             held += 1

@@ -212,6 +212,9 @@ def cap_for(number: str) -> int:
     dispo blast needs 32 per number to clear 156 messages in one day across
     5 numbers; the acquisitions numbers must stay where they are.
     """
+    if getattr(config, "ONE_NUMBER_PER_DAY", False) and number and \
+            number == store.get_meta(_daily_key()):
+        return config.DAILY_NUMBER_CAP
     caps = getattr(config, "POOL_CAPS", {}) or {}
     if caps:
         for name, numbers in config.number_pools().items():
@@ -236,9 +239,59 @@ def gap_for(number: str) -> int:
     return config.MIN_SEND_GAP_SECONDS
 
 
-def available(from_number: str) -> tuple[bool, str]:
-    """Whether this number may send right now: daily cap plus a pacing gap."""
-    if config.NUMBER_HEALTH_CHECK:
+def _daily_key() -> str:
+    from datetime import date
+    return "daily_number:" + date.today().isoformat()
+
+
+def daily_number(numbers: list[str]) -> str:
+    """Today's number for every NEW record (Jeff, 2026-10-06).
+
+    The cleanest number: fewest carrier flags in NumberVerifier, then the one
+    that sent least over the last 7 days. Chosen once and kept all day, unless
+    it gets pulled mid-day. A number that fails the health check is never
+    picked; "" when none passes, so nothing new starts.
+    """
+    key = _daily_key()
+    chosen = store.get_meta(key)
+    if chosen in numbers and available_health(chosen):
+        return chosen
+    from datetime import timedelta
+    since = (datetime.now(timezone.utc) - timedelta(days=7)).date().isoformat()
+    ranked = []
+    for n in numbers:
+        if not available_health(n):
+            continue
+        flags = 0
+        if config.NUMBER_HEALTH_CHECK:
+            from . import number_health
+            flags = number_health.flag_count(n) or 0
+        ranked.append((flags, store.sends_since(n, since), n))
+    if not ranked:
+        log.warning("no healthy number to start new records on today")
+        return ""
+    pick = min(ranked)[2]
+    store.set_meta(key, pick)
+    log.info("today's number for new records: ...%s (flags %s, 7-day sends %s)",
+             pick[-4:], min(ranked)[0], min(ranked)[1])
+    return pick
+
+
+def available_health(from_number: str) -> bool:
+    if not config.NUMBER_HEALTH_CHECK:
+        return True
+    from . import number_health
+    return number_health.check(from_number)[0] is True
+
+
+def available(from_number: str, committed: bool = False) -> tuple[bool, str]:
+    """Whether this number may send right now: daily cap plus a pacing gap.
+
+    `committed`: the record was already texted from this number. Jeff,
+    2026-10-06: later touches stay on it regardless of its health, so the
+    carrier-flag check is skipped (cap and pacing still apply).
+    """
+    if config.NUMBER_HEALTH_CHECK and not committed:
         # Tulsa fork: carrier flags from NumberVerifier. Unknown holds too.
         from . import number_health
         healthy, why = number_health.check(from_number)

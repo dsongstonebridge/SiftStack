@@ -210,6 +210,15 @@ def _alert_once(key: str, title: str, body: str) -> None:
         log.warning("number health alert failed: %s", exc)
 
 
+def flag_count(number: str) -> Optional[int]:
+    """How many carriers flag this number on its latest day; None if unknown."""
+    data, _ = _snapshot()
+    row = (data or {}).get(store.clean_phone(number))
+    if not row:
+        return None
+    return sum(1 for n in row["flags"] if n > 0)
+
+
 def check(number: str) -> tuple[Optional[bool], str]:
     """(True, "") may send; (False, why) pulled; (None, why) unknown, hold."""
     data, err = _snapshot()

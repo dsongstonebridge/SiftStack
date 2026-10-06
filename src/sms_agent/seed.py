@@ -1018,6 +1018,12 @@ def schedule(candidates: list[Candidate]) -> list[tuple[Candidate, str, str]]:
             from_number = existing
         elif rec_number in numbers:
             from_number = rec_number
+        elif config.ONE_NUMBER_PER_DAY:
+            # Jeff, 2026-10-06: every new record today starts on the day's
+            # cleanest number, so callers can dial from the number they texted.
+            from_number = sender_pool.daily_number(numbers)
+            if not from_number:
+                continue
         else:
             from_number = min(numbers, key=lambda n: (ready_at(n), last_used.get(n, now)))
         sticky[cand.phone] = from_number

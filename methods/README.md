@@ -20,8 +20,10 @@ roll code back if the user asks; `restore_0929.py` (the skill) is the normal rol
    writes `output/petition_batch.xlsx`.
 3. `python src/main.py skip-trace --csv-path "output/petition_batch.xlsx" --create
    --notice-type foreclosure --county Tulsa` (a dry run). Report the estimate and ask.
-4. The billed step runs trace-only from `output/datasift_ready_foreclosure_<date>.csv` with
-   `--commit`, after the user says go.
+4. The billed step re-runs the SAME command with `--commit` added, after the user says go
+   (2026-10-05: `src/created_rows.py` skips rows the dry run already created, so notes and
+   Message Boards are not re-posted). Batches created before 2026-10-05 are not in that
+   ledger and still run trace-only from `output/datasift_ready_foreclosure_<date>.csv`.
 
 ## 9:30 method (new, on trial from 2026-09-30)
 

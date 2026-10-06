@@ -2020,11 +2020,14 @@ def _create_records_for_batch(args, csv_path: Path) -> list[dict] | None:
     in the review sheet for later manual pass, re-run with --create once
     reviewed.
 
+    SAME COMMAND, ADD --commit (2026-10-05): rows an earlier `--create` already
+    created are skipped here - not created again, Notes and Message Board not
+    re-posted - and go straight to the trace. See `created_rows.py`.
+    `--recreate` turns that off for one run.
+
     Returns the rows to hand to run_pipeline, or None if the batch failed.
     """
-    import asyncio as _asyncio
-    from datasift_formatter import build_datasift_csv_from_template
-    from datasift_uploader import upload_to_datasift
+    import created_rows
 
     template_rows = _read_property_template(csv_path)
     if not template_rows:
@@ -2032,8 +2035,65 @@ def _create_records_for_batch(args, csv_path: Path) -> list[dict] | None:
                       csv_path)
         return None
     logging.info("Read %d record(s) from %s", len(template_rows), csv_path.name)
-
     notice_type = getattr(args, "notice_type", "foreclosure") or "foreclosure"
+
+    done: list[tuple[dict, dict]] = []
+    if not getattr(args, "recreate", False):
+        template_rows, done = created_rows.split(template_rows, notice_type)
+        _report_already_created(done)
+
+    # Keyed on the row AS READ: lookups below rewrite Property Street in place.
+    originals = {id(r): dict(r) for r in template_rows}
+    trace_rows: list[dict] = []
+    if template_rows:
+        outcome = _create_fresh_rows(args, template_rows, notice_type)
+        if outcome is None and not done:
+            return None
+        if outcome is not None:
+            entries = []
+            excluded = {id(r) for r in outcome["excluded"]}
+            no_trace = {id(r) for r in outcome["no_trace"]}
+            for r in outcome["created"]:
+                status = ("excluded" if id(r) in excluded
+                          else "no_trace" if id(r) in no_trace else "trace")
+                tr = _trace_row(r) if status == "trace" else None
+                if tr:
+                    trace_rows.append(tr)
+                entries.append((originals.get(id(r), r), status, tr))
+            n = created_rows.record(entries, notice_type)
+            logging.info("created-rows ledger: recorded %d row(s); re-running this "
+                         "command with --commit will trace them without re-creating", n)
+
+    trace_rows.extend(e["trace_row"] for _, e in done
+                      if e.get("status") == "trace" and e.get("trace_row"))
+    return trace_rows or None
+
+
+def _report_already_created(done: list[tuple[dict, dict]]) -> None:
+    """Say which rows an earlier --create already made, and what happens to them."""
+    if not done:
+        return
+    logging.info("")
+    logging.info("=== ALREADY CREATED BY AN EARLIER --create (%d) - not created again, "
+                 "notes and board not re-posted ===", len(done))
+    what = {"trace": "goes straight to the trace",
+            "no_trace": "Owner Alive = No, never traced",
+            "excluded": "removed by the post-enrichment gate, never traced"}
+    for _, e in done:
+        logging.info("  %s | created %s | %s", e.get("label") or "?",
+                     e.get("recorded") or "?", what.get(e.get("status"), e.get("status")))
+    logging.info("  (pass --recreate to create them again)")
+    logging.info("")
+
+
+def _create_fresh_rows(args, template_rows: list[dict], notice_type: str) -> dict | None:
+    """The creating half of `_create_records_for_batch`: checks, gates, create,
+    enrich, post-enrichment gate. Returns {"created", "no_trace", "excluded"}
+    (lists of the row dicts) or None when nothing was created."""
+    import asyncio as _asyncio
+    from datasift_formatter import build_datasift_csv_from_template
+    from datasift_uploader import upload_to_datasift
+
     county = getattr(args, "county", "") or ""
     trial_tag = getattr(args, "trial_tag", None)
 
@@ -2190,6 +2250,7 @@ def _create_records_for_batch(args, csv_path: Path) -> list[dict] | None:
     from datasift_uploader import forget_uuid_map_entries
     from post_enrich_gate import apply_post_enrich_gate, describe as describe_gate
 
+    created = list(template_rows)
     _t = run_timer.start("post-enrichment gate")
     template_rows, gated = apply_post_enrich_gate(
         template_rows, find_property=find_property_by_address,
@@ -2198,9 +2259,16 @@ def _create_records_for_batch(args, csv_path: Path) -> list[dict] | None:
         post_board=post_message_board)
     run_timer.stop(_t)
     _report_post_enrich_exclusions(gated, describe_gate(notice_type))
-    alive = [r for r in alive if r in template_rows]
 
-    return [row for row in (_trace_row(r) for r in alive) if row]
+    # Identity, not equality: the gate returns kept rows as the same dicts and
+    # excluded rows as copies, so "created but not kept" is what it excluded.
+    kept_ids = {id(r) for r in template_rows}
+    return {
+        "created": created,
+        "excluded": [r for r in created if id(r) not in kept_ids],
+        "no_trace": [r for r in created
+                     if id(r) in kept_ids and id(r) in {id(d) for d in deceased}],
+    }
 
 
 def _report_post_enrich_exclusions(gated: list[dict], criteria: str) -> None:
@@ -3170,6 +3238,13 @@ def cli_main() -> None:
               "(tag 'Tracerfy Skipped' or DataSift skiptraced). Off by default: a "
               "repeat bills twice and stamps 'Pre-existing' beside every number's "
               "true source tag, permanently."),
+    )
+    parser.add_argument(
+        "--recreate", action="store_true",
+        help=("skip-trace --create: create every row again even if an earlier "
+              "--create already made it (re-posts its notes and Message Board). "
+              "Off by default: a re-run skips those rows and goes straight to "
+              "the trace."),
     )
     parser.add_argument(
         "--create", action="store_true",

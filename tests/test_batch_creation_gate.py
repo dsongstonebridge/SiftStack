@@ -47,6 +47,14 @@ class PerRowGateTests(unittest.TestCase):
     def setUp(self):
         self.rows = [_row(1), _row(2), _row(3)]
         self._csv_calls: list[list[dict]] = []
+        # Never read or write the real created-rows ledger from a test.
+        import tempfile
+        import created_rows
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        p = mock.patch.object(created_rows, "LEDGER_PATH", Path(tmp.name) / "created.json")
+        p.start()
+        self.addCleanup(p.stop)
 
     def _run(self, findings):
         async def fake_upload(**kwargs):

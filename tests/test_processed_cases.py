@@ -152,7 +152,10 @@ class PipelineWiringTests(_Ledgered):
             trial_tag = None
             list_name = None
 
+        import created_rows
         with mock.patch.object(pc, "LEDGER_PATH", self.path), \
+             mock.patch.object(created_rows, "LEDGER_PATH",
+                               Path(self._tmp.name) / "created.json"), \
              mock.patch.object(main, "_read_property_template", return_value=rows), \
              mock.patch.object(main, "_enrich_probate_rows",
                                side_effect=AssertionError("looked up an already-processed case")):

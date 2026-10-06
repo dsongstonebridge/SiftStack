@@ -1437,13 +1437,20 @@ Also fixed: **both trace paths passed only street/city/first/last into
 posted on a live run.** `main._trace_row()` now carries the probate columns on
 both paths.
 
-**Running the billed step.** The `--create` dry run already creates the records
-and posts their notes and Message Board. Re-running the same command with
-`--commit` would post both again on every record — `upload_to_datasift()`
-writes them for every record it resolves, existing or not (read from the code,
-not tested live). So after a `--create` dry run, run the billed half
-trace-only: `skip-trace --csv-path output/datasift_ready_probate_<date>.csv
---commit`. That path reads CSV only, never the `.xlsx`.
+**Running the billed step (2026-10-05): same command, add `--commit`.** The
+`--create` dry run creates the records and posts their notes and Message Board,
+and records each input row in `output/.created_rows.json` (`src/created_rows.py`,
+keyed on the row's case number(s), else street + last name, read BEFORE any
+lookup rewrites it). Re-running the same `--create` command with `--commit`
+skips those rows (no re-create, no second notes or board) and traces them, with
+every gate already applied: Owner Alive = No and post-enrichment-gate rows stay
+untraced, co-borrower columns survive. Rows held for review are NOT recorded,
+so a re-run after marking them Property Confirmed = Yes creates them. A new row
+added to the same file is created normally. `--recreate` ignores the ledger for
+one run. Tests: `tests/test_created_rows.py`. **Batches created before
+2026-10-05 are not in the ledger**: for those, still run the billed half
+trace-only from `output/datasift_ready_probate_<date>.csv` (CSV only, never the
+`.xlsx`).
 
 **Common names defeat the decedent search.** "Tina Johnson" returned a 26-way
 tie at 0.67. The Johnson house was found by searching the creditor LLC named in
@@ -1634,10 +1641,9 @@ kept/rejected rows rather than failing the whole batch on one exclusion.
 
 ### Known gaps
 
-1. **`--create` is not safe to re-run** — it re-posts notes and the Message
-   Board on records that already exist (see "Running the billed step" above).
-   Making it skip records already created would let both pipelines work as
-   "same command, just add `--commit`".
+1. ~~`--create` is not safe to re-run~~ **Fixed 2026-10-05** — see "Running
+   the billed step" above. The plain trace-only path (no `--create`) still
+   applies no gates.
 2. Multi-parcel estates: parcels with no situs address ride on the addressed
    record as `additional_parcels`; `output/probate_template_SAMPLE.csv` still
    wrongly assumes one row per case.
@@ -1845,11 +1851,12 @@ self-contained request — don't ask which folder or which command:
    (28 columns, fresh per batch, never appended).
 3. `python src/main.py skip-trace --csv-path "output/petition_batch.xlsx"
    --create --notice-type foreclosure --county Tulsa` — **a dry run**. Report
-   the estimate, ask before `--commit`. **Do not re-run that command with
-   `--commit` added**: the dry run already created the records and posted their
-   notes, and a second `--create` posts them again. Run the billed half
-   trace-only from the `datasift_ready_*.csv` it wrote (and mind the Owner
-   Alive gap below).
+   the estimate, ask before `--commit`. **Then re-run the SAME command with
+   `--commit` added** (2026-10-05): rows the dry run created are skipped and go
+   straight to the trace, with no second notes or board, Owner Alive and the
+   post-enrichment gate still applied, co-borrowers still traced. Batches made
+   before 2026-10-05 are not in the ledger; for those use the trace-only CSV
+   and mind the gaps below.
 4. Verify by reading records back: tags by TITLE, tiers against Trestle's own
    `assigned_tag`, **and every Message Board** (see below). Say exactly what
    was checked; a run is not "verified" until the boards are read.
@@ -1873,7 +1880,7 @@ The 9:29 code is also in git under the tag **`method-0929`** (commit 2a886e0).
 the user asks. The new tools are separate files, and nothing in 9:30 touches
 the CRM.
 
-**Trace-only CSV gaps (both needed on 2026-09-30):**
+**Trace-only CSV gaps (both needed on 2026-09-30; avoided by re-running `--create --commit`):**
 - `datasift_ready_*.csv` has no `Co-Borrower First/Last Name/Relationship`
   columns, so add them back from the petition sheet or co-borrowers are never
   traced.

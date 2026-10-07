@@ -1814,22 +1814,32 @@ expires the fail-closed switch holds every send and alerts #SMS. 3 numbers are
 routed to Diego (`cli.py numbers --refresh --dry-run`), 25/day each.
 Jeff is adding them to the newly approved A2P campaign (approved 2026-10-02).
 
-**Tests:** `python tests/test_sms_agent_tulsa.py` (42 checks, offline, stubbed).
-Ty's `cli.py selftest` fails 4 of 251 on UNMODIFIED code too: three Eastern-time
-window tests vs the fork's Chicago tz, and no `fastapi` (the webhook receiver,
-unused on a desktop install).
+**Tests:** `python tests/test_sms_agent_tulsa.py` (offline, stubbed). As of
+2026-10-07 it has ONE known failure, "a different record still rotates", which
+predates that day's changes (ONE_NUMBER_PER_DAY puts every new record on the
+day's number). `cli.py selftest` run on this PC fails 23 checks on UNMODIFIED
+code too (it picks up the live `.env` fork switches, plus the Eastern-time
+window tests and no `fastapi`). Judge a change by diffing the FAIL list before
+and after (`git stash`), not by the count.
 
 **Gotcha hit twice this session:** a `\b` regex written through a bash heredoc
 lands as a literal backspace byte and silently matches nothing. Write regex
 files with the Write tool, or build the string with `chr(92)`, and assert on
 known inputs.
 
-**Still to do:** confirm A2P for Diego's numbers; set `SMS_AGENT_CAMPAIGN_SOURCES`
-to the FTM presets + `STOP_ON_ANY_REPLY`, `SEND_TIME_PHONE_CHECK`,
-`REPLY_CHECK_MAX_AGE`, `SENDER_NAME=Diego`, `PHASE=2`, `CAMPAIGN=1`; dry run on
-real records (DRY_RUN=1, watch Slack); canary; Windows task running
-`cli.py work --loop` on weekdays; decide same-day vs next-morning queueing for
-records created mid-day.
+**Status (2026-10-07): LIVE.** Windows task "SMS agent weekdays" starts
+`cli.py work --loop` at 8:00 (11h limit; it only sends while the PC is awake,
+and a sleeping PC also delays reply alerts, nothing is lost). Moving it to the
+cloud (~$5-7/mo on Fly) was declined for now. 10/7: 50 queued, 47 sent,
+3 cancelled by a household reply; replies came from 6 numbers on 5 records
+(one yes, one realtor/price, one "what's your scam?", one unclear, two wrong
+numbers). Number ...7981 carried 1 of 3 carrier spam flags that day.
+
+**Open:** no AI model is connected for sorting replies, so nearly every reply
+lands as OTHER 0.30 and Diego reads them all; connecting one is a small
+per-reply cost, Jeff's call. Parked ideas, not to build unprompted: text touch
+N on the day of call attempt N; Slack thread per replying number (needs a
+Slack app, the webhook cannot thread).
 
 ## DataSift.ai (REISift) Integration
 

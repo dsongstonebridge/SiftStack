@@ -382,6 +382,49 @@ def run(live_model: bool = False) -> int:
     with store.tx() as _c:
         _c.execute("DELETE FROM outbox WHERE body LIKE 'layout probe%'")
 
+    # Highest touch first (Jeff, 2026-10-07), and a deferred out-of-state text
+    # must not hold up the rest of a one-number day. The window check is
+    # stubbed so the result does not depend on the hour the selftest runs:
+    # "pacific" phones open in two hours, everyone else is open now.
+    from datetime import timedelta as _td
+    _real_q, _real_n = sender_pool.within_quiet_hours, sender_pool.next_send_window
+    _open_at = _dt.now(_tz.utc) + _td(hours=2)
+    sender_pool.within_quiet_hours = lambda ph, at=None: not ph.startswith("775") or (
+        (at or _dt.now(_tz.utc)) >= _open_at)
+    sender_pool.next_send_window = lambda ph, at=None: max(at or _dt.now(_tz.utc), _open_at)
+    try:
+        for i, t in enumerate((1, 4, 2, 3)):
+            store.queue_message(f"91800010{i:02d}", f"order probe {t}",
+                                from_number="+19180000001", status="held",
+                                intent=f"seed_touch_{t}")
+        seed.reschedule_held()
+        got = [x["body"][-1] for x in store._conn().execute(
+            "SELECT body FROM outbox WHERE body LIKE 'order probe%' ORDER BY not_before")]
+        r.check("highest text touch goes out first", got == ["4", "3", "2", "1"], str(got))
+        with store.tx() as _c:
+            _c.execute("DELETE FROM outbox WHERE body LIKE 'order probe%'")
+
+        store.queue_message("7750002001", "tz probe west", from_number="+19180000002",
+                            status="held", intent="seed_touch_1")
+        for i in range(3):
+            store.queue_message(f"91800020{i:02d}", f"tz probe local {i}",
+                                from_number="+19180000002", status="held",
+                                intent="seed_touch_1")
+        seed.reschedule_held()
+        rows = {x["body"]: x["not_before"] for x in store._conn().execute(
+            "SELECT body, not_before FROM outbox WHERE body LIKE 'tz probe%'")}
+        first_local = min(v for k, v in rows.items() if "local" in k)
+        wait_min = (_dt.fromisoformat(first_local) - _dt.now(_tz.utc)).total_seconds() / 60
+        r.check("an out-of-state text does not hold up the rest of its number",
+                wait_min < 10, f"first local send {wait_min:.0f} min out")
+        r.check("the out-of-state text still waits for its own morning",
+                _dt.fromisoformat(rows["tz probe west"]) >= _open_at - _td(seconds=1),
+                rows["tz probe west"])
+    finally:
+        sender_pool.within_quiet_hours, sender_pool.next_send_window = _real_q, _real_n
+        with store.tx() as _c:
+            _c.execute("DELETE FROM outbox WHERE body LIKE 'order probe%' OR body LIKE 'tz probe%'")
+
     # A thread keeps one number for life. Live, one owner got touch 3 from
     # ...0296 and touch 4 from ...0270 an hour later, because the number is
     # picked when a message is staged and both were staged before either sent.

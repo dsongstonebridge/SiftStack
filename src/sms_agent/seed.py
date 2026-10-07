@@ -1039,12 +1039,20 @@ def schedule(candidates: list[Candidate]) -> list[tuple[Candidate, str, str]]:
         if not sender_pool.within_quiet_hours(cand.phone, send_at):
             send_at = sender_pool.next_send_window(cand.phone, send_at)
 
-        last_used[from_number] = send_at
+        # A deferred text waits on its own (see reschedule_held).
+        if send_at == slot:
+            last_used[from_number] = send_at
         cursor = slot + timedelta(
             seconds=random.randint(config.SEND_SPACING_MIN, config.SEND_SPACING_MAX)
         )
         out.append((cand, from_number, send_at.isoformat(timespec="seconds")))
     return out
+
+
+def _touch_of(intent: Optional[str]) -> int:
+    """Touch number from an outbox intent ("seed_touch_4" -> 4), else 0."""
+    tail = (intent or "").rsplit("_", 1)[-1]
+    return int(tail) if tail.isdigit() else 0
 
 
 def reschedule_held() -> dict:
@@ -1062,11 +1070,17 @@ def reschedule_held() -> dict:
     rows = [
         dict(r)
         for r in store._conn().execute(
-            "SELECT id, phone, from_number FROM outbox WHERE status='held' ORDER BY id"
+            "SELECT id, phone, from_number, intent FROM outbox WHERE status='held' ORDER BY id"
         )
     ]
     if not rows:
         return {"rescheduled": 0}
+
+    # Highest touch first (Jeff, 2026-10-07). He calls from the most call
+    # attempts down, so touch 4s land first, then 3s, 2s and 1s, and each group
+    # has its texts before he reaches it. Ties keep queue order (campaign
+    # source order). A row with no touch number goes last.
+    rows.sort(key=lambda r: (-_touch_of(r.get("intent")), r["id"]))
 
     now = datetime.now(timezone.utc)
     cursor = now
@@ -1105,7 +1119,13 @@ def reschedule_held() -> dict:
         send_at = space_out(send_at)
 
         assigned.append(send_at)
-        last_used[number] = send_at
+        # Only a text that goes out in its slot starts the number's rest. A
+        # text deferred to its recipient's own morning waits on its own: with
+        # one number per day, letting it set the rest held every text behind a
+        # Nevada number until 10am (2026-10-07). The worker still enforces the
+        # real gap between actual sends (sender_pool.available).
+        if send_at == slot:
+            last_used[number] = send_at
 
         # Advance from the SLOT, never from a quiet-hours deferral. Otherwise a
         # single out-of-state recipient drags the entire day behind them: one

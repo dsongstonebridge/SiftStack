@@ -216,3 +216,7 @@ Lead-Manager-Training.html
 
 # KPI step logs
 kpi-engine/fill_sheet.log
+
+# Local, never commit (2026-10-07): plugin setup holds company/team names; KPI schedule fix writes a status log
+.datasift-config.json
+kpi-engine/schedule_status.txt

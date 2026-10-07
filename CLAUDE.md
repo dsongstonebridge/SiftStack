@@ -1715,6 +1715,8 @@ many wake events that are not someone using the PC.
 - A same-day "VM / no answer" message-board note on the record = voicemail, even if the
   number was marked Correct/Wrong (the greeting said a name). "answer/answered" = talk;
   "no answer / didn't answer / nobody answered / answering machine" = voicemail.
+  "VM TXT" (voicemail text; also VMTXT, VM/TXT, VM text) is only written when the owner
+  did not answer, so it is always a voicemail, even if other words in the note look like talk.
 - Conversation = reached a person AND (1 min+ OR an owner call with a same-day talk note or
   owner-outcome status: Not interested / a lead). This includes wrong-number calls of 1 min+.
 - Slack lines must add up: Reached = owner + inbound callback + someone else (wrong #);

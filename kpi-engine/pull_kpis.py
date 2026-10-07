@@ -301,6 +301,10 @@ _VM_NOTE = _re.compile(
     r"nobody answered|no one answered|wasn'?t answered)\b",
     _re.I)
 
+# "VM TXT" = voicemail text. Jeff only writes it when the owner did not answer
+# (2026-10-07), so it always means voicemail, whatever else the note says.
+_VM_TXT_NOTE = _re.compile(r"\bvm\s*[/+&,-]?\s*(txt|text)(ed|s)?\b", _re.I)
+
 
 # A note that clearly describes a real conversation wins over a stray "vm" mention.
 _TALK_NOTE_RE = _re.compile(r"\b(talked|spoke|spoken|convo|conversation|said|says|wants|asking|told me|motivated|interested|offer|appointment|appt|reached|hung up|picked up|when i said|answer|answered)\b", _re.I)
@@ -333,6 +337,8 @@ def _is_vm_note(text: str) -> bool:
     # call notes are read.
     if len(text) > 280 or _re.search(r"SIGNING CHAIN|CASE:|PROPERTY:|OWNER:|PETITION", text):
         return False
+    if _VM_TXT_NOTE.search(text):
+        return True
     # A voicemail note is only overruled by words that mean a person was actually on the
     # line. Soft words ("said", "wants") are not enough: "VM greeting said his name" is a
     # voicemail (Jeff, 2026-10-02).

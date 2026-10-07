@@ -124,8 +124,20 @@ def hot_lead(
     return _post(text, blocks, program=program)
 
 
+# Unclear replies stop only the number that replied; the record's other numbers
+# keep their touches until a person marks a number Correct (Jeff, 2026-10-07).
+_REPLY_VERIFY = ("Can't tell yet if this is the owner. Verify it, and mark this "
+                 "number Correct in DataSift if it is: that stops texts to the "
+                 "record's other numbers. Until then they keep getting their texts. "
+                 "This number gets no more automated texts; reply from the smrtPhone inbox.")
+
 _REPLY_HEADLINE = {
-    "INTERESTED": "Positive reply. Call within 5 minutes.",
+    "INTERESTED": ("Positive reply. Call within 5 minutes. Number marked Correct; "
+                   "texts to the record's other numbers are stopped."),
+    "OWNER_CONFIRMED": ("Confirmed it's theirs. Number marked Correct; texts to the "
+                        "record's other numbers are stopped. Reply from the smrtPhone inbox."),
+    "NOT_INTERESTED": ("Not interested. Number marked Correct; texts to the record's "
+                       "other numbers are stopped."),
     "OPT_OUT": ("Opted out. This number is suppressed and marked; do not text it. "
                 "The record's other numbers keep their texts."),
     "WRONG_NUMBER": ("Says wrong number. This number is marked; no action needed. "
@@ -145,7 +157,7 @@ def reply_alert(phone: str, inbound: str, intent: str,
     who = ctx.get("owner_first") or "Owner"
     where = ", ".join(x for x in (ctx.get("street"), ctx.get("city")) if x)
     mention = f"<@{config.HANDOFF_SLACK_ID}> " if config.HANDOFF_SLACK_ID else ""
-    headline = _REPLY_HEADLINE.get(intent, "Replied. Texts stopped; reply from the smrtPhone inbox.")
+    headline = _REPLY_HEADLINE.get(intent, _REPLY_VERIFY)
     lines = [
         f"{mention}*{config.HANDOFF_NAME}: SMS reply - {who}*",
         f"{_fmt_phone(phone)}" + (f"  {where}" if where else ""),

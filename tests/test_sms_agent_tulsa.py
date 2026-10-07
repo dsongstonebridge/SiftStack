@@ -31,7 +31,7 @@ os.environ.update({
 })
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from sms_agent import campaign, config, crm, engine, escalate, seed, store, transport, worker  # noqa: E402
+from sms_agent import campaign, classify, config, crm, engine, escalate, seed, store, transport, worker  # noqa: E402
 # The live .env turns fork switches on; each test section turns on only what it tests.
 config.IGNORE_DNC_FLAG = config.TEXT_ALL_BEST = config.NUMBER_HEALTH_CHECK = False
 config.CORRECT_NUMBER_FIRST = config.DNC_TRY_OTHER_NUMBERS = False
@@ -78,28 +78,76 @@ try:
 except ValueError:
     check("malformed source entry is refused", True)
 
-# ---- any reply stops every line of the record, one alert tagging Diego
-REC = "rec-1"
+# ---- an unclear reply stops ONLY that line; the others keep their touches
+# until someone marks a number Correct (Jeff, 2026-10-07)
+STATUS_WRITES = []
+crm.set_phone_status = lambda rec, phone, status, *a, **k: (
+    STATUS_WRITES.append((rec, phone, status)) or {"ok": True})
 A, B = "9185550101", "9185550102"
-store.map_phone(A, record_uuid=REC)
-store.map_phone(B, record_uuid=REC)
-store.ensure_conversation(A, record_uuid=REC)
-store.ensure_conversation(B, record_uuid=REC)
+store.map_phone(A, record_uuid="rec-1")
+store.map_phone(B, record_uuid="rec-1")
+store.ensure_conversation(A, record_uuid="rec-1")
+store.ensure_conversation(B, record_uuid="rec-1")
 qa = store.queue_message(A, "touch 2 to A", "+19180000001")
 qb = store.queue_message(B, "touch 2 to B", "+19180000001")
 
-out = engine.handle_inbound({"from": A, "to": "+19180000001", "message": "who is this?", "smsId": "s1"})
-check("neutral reply is handed to a human", out.get("action") == "handed_to_human", str(out))
+out = engine.handle_inbound({"from": A, "to": "+19180000001", "message": "What's your scam?", "smsId": "s1"})
+check("unclear reply is handed to a human", out.get("action") == "handed_to_human", str(out))
 check("replying line's queued text cancelled", store.outbox_status(qa) == "cancelled", store.outbox_status(qa))
-check("sibling line's queued text cancelled", store.outbox_status(qb) == "cancelled", store.outbox_status(qb))
 check("replying line paused", (store.get_conversation(A) or {}).get("state") == "paused")
-check("sibling line paused", (store.get_conversation(B) or {}).get("state") == "paused")
+check("unclear reply leaves the sibling's text queued", store.outbox_status(qb) == "queued",
+      store.outbox_status(qb))
+check("unclear reply leaves the sibling line active",
+      (store.get_conversation(B) or {}).get("state") == "active")
+check("unclear reply does not stop the record", not seed._record_replied("rec-1"))
+check("unclear reply does not mark Correct", not any(w[1] == A for w in STATUS_WRITES), str(STATUS_WRITES))
 check("one Slack post", len(POSTS) == 1, str(len(POSTS)))
 check("post tags Diego", bool(POSTS) and "<@U0DIEGO>" in POSTS[0], POSTS[0] if POSTS else "")
-check("post carries the reply text", bool(POSTS) and "who is this?" in POSTS[0])
+check("post carries the reply text", bool(POSTS) and "What's your scam?" in POSTS[0])
+check("post asks Diego to verify and mark Correct",
+      bool(POSTS) and "Verify" in POSTS[0] and "mark this number Correct" in POSTS[0], POSTS[0] if POSTS else "")
 
 engine.handle_inbound({"from": A, "to": "+19180000001", "message": "hello??", "smsId": "s2"})
-check("second reply does not post again", len(POSTS) == 1, str(len(POSTS)))
+check("second unclear reply does not post again", len(POSTS) == 1, str(len(POSTS)))
+
+# ---- an unmistakable yes marks Correct and stops every line of the record
+REC = "rec-9"
+Y, Y2 = "9185550151", "9185550152"
+for p in (Y, Y2):
+    store.map_phone(p, record_uuid=REC)
+    store.ensure_conversation(p, record_uuid=REC)
+qy2 = store.queue_message(Y2, "touch 2 to Y2", "+19180000001")
+engine.handle_inbound({"from": Y, "to": "+19180000001", "message": "Yes, it is", "smsId": "s9"})
+check("yes marks the replying number Correct", (REC, Y, "CORRECT") in STATUS_WRITES, str(STATUS_WRITES))
+check("yes cancels the sibling's queued text", store.outbox_status(qy2) == "cancelled",
+      store.outbox_status(qy2))
+check("yes stops the whole record", seed._record_replied(REC))
+check("yes alert says marked Correct", "marked Correct" in POSTS[-1], POSTS[-1])
+
+# ---- not interested also marks Correct and stops the record
+N, N2 = "9185550161", "9185550162"
+for p in (N, N2):
+    store.map_phone(p, record_uuid="rec-10")
+    store.ensure_conversation(p, record_uuid="rec-10")
+qn2 = store.queue_message(N2, "touch 2 to N2", "+19180000001")
+engine.handle_inbound({"from": N, "to": "+19180000001", "message": "Not interested", "smsId": "s10"})
+check("not interested marks Correct", ("rec-10", N, "CORRECT") in STATUS_WRITES, str(STATUS_WRITES))
+check("not interested cancels the sibling's text", store.outbox_status(qn2) == "cancelled")
+
+# ---- a later yes on a line that already replied unclear still marks and tells Diego
+before = len(POSTS)
+engine.handle_inbound({"from": A, "to": "+19180000001", "message": "yes that's me", "smsId": "s11"})
+check("later yes marks Correct", ("rec-1", A, "CORRECT") in STATUS_WRITES, str(STATUS_WRITES))
+check("later yes stops the sibling", store.outbox_status(qb) == "cancelled", store.outbox_status(qb))
+check("later yes posts once more", len(POSTS) == before + 1, str(len(POSTS) - before))
+
+# ---- the yes rule is strict: the WHOLE reply has to be the confirmation
+for text, want in (("Yes", True), ("Sure", True), ("yep!", True), ("Yes, that's me.", True),
+                   ("that's my house", True), ("Yes it is", True), ("Correct", True),
+                   ("yes but who is this?", False), ("No", False), ("What's your scam?", False),
+                   ("If you were looking online it does not look like that anymore", False),
+                   ("yes, how much?", False), ("not sure", False), ("", False)):
+    check(f"unmistakable yes: {text!r} -> {want}", classify.is_unmistakable_yes(text) == want)
 
 # ---- opt-out stops ONLY that number; the record's other line keeps going
 C, C2 = "9185550103", "9185550113"
@@ -115,7 +163,7 @@ check("opt-out leaves the other line's text queued", store.outbox_status(qc2) ==
       store.outbox_status(qc2))
 check("opt-out leaves the other line active", (store.get_conversation(C2) or {}).get("state") == "active",
       str((store.get_conversation(C2) or {}).get("state")))
-check("opt-out alert says do not text this number", len(POSTS) == 2 and "do not text it" in POSTS[1],
+check("opt-out alert says do not text this number", bool(POSTS) and "do not text it" in POSTS[-1],
       POSTS[-1] if POSTS else "")
 
 # ---- wrong number also stops only that number

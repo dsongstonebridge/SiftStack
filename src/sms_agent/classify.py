@@ -196,6 +196,27 @@ class Classification:
         }
 
 
+# An UNMISTAKABLE yes to "is <street> yours?" (Jeff, 2026-10-07). The WHOLE
+# reply has to be the confirmation: "yes, but who is this?" is not one, and a
+# bare "no" is not here at all (to that question it means wrong person).
+# Stricter than OWNER_CONFIRMED on purpose, because a match marks the number
+# CORRECT in DataSift and stops texts to every other number on the record.
+_YES_CORE = (
+    r"(?:yes|yeah|yea|yep|yup|ya|sure|correct|it is|yes it is|it sure is|sure is"
+    r"|yes ma'?am|yes sir|that'?s me|this is (?:me|she|he|her|him)"
+    r"|that'?s mine|it'?s mine|i do|we do"
+    r"|that'?s (?:my|our) (?:house|property|home|place|address))"
+)
+UNMISTAKABLE_YES = re.compile(rf"^(?:yes |yeah |yep |yup )?{_YES_CORE}$")
+
+
+def is_unmistakable_yes(text: str) -> bool:
+    """True only when the whole reply is a plain yes/that's me."""
+    t = (text or "").lower().replace("’", "'")
+    t = " ".join("".join(ch if ch.isalnum() or ch in "' " else " " for ch in t).split())
+    return bool(t) and bool(UNMISTAKABLE_YES.match(t))
+
+
 def _hit(text: str, patterns: list[str]) -> Optional[str]:
     for p in patterns:
         if re.search(p, text):

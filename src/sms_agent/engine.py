@@ -27,6 +27,26 @@ AUTO_SEND_INTENTS = {"ASKING_WHO", "NOT_INTERESTED"}
 # Intents that end the thread. No reply, no further outbound, ever.
 TERMINAL_INTENTS = {"OPT_OUT", "WRONG_NUMBER"}
 
+# STOP_ON_ANY_REPLY (Jeff, 2026-10-07): replies that settle the owner question
+# stop every number on the record; anything else stops only the line that
+# replied. OWNER_CONFIRMED is the alert label for an unmistakable yes
+# (classify.is_unmistakable_yes); the classifier itself never returns it.
+WHOLE_RECORD_INTENTS = {"OWNER_CONFIRMED", "NOT_INTERESTED", "INTERESTED", "ESCALATE"}
+# Replies that mark the replying number CORRECT in DataSift.
+MARK_CORRECT_INTENTS = {"OWNER_CONFIRMED", "NOT_INTERESTED", "INTERESTED"}
+
+
+def _alert_intent(result, body: str) -> str:
+    """The intent the reply rules act on: an unmistakable yes is promoted."""
+    if result.intent not in TERMINAL_INTENTS and result.intent != "ESCALATE" \
+            and classify.is_unmistakable_yes(body):
+        return "OWNER_CONFIRMED"
+    return result.intent
+
+
+def _settles_owner(result, body: str) -> bool:
+    return _alert_intent(result, body) in WHOLE_RECORD_INTENTS
+
 # A real person asked something and is waiting. Not a hot lead, but it cannot
 # be left in silence while the agent is below the phase that can answer.
 NEEDS_HUMAN_REPLY_INTENTS = {"ASKING_WHO"}
@@ -186,7 +206,9 @@ def handle_inbound(payload: dict) -> dict:
         # proves the line works, not that it reaches the owner).
         if config.PHASE >= 2 and record_uuid:
             crm.post_note(record_uuid, f"SMS reply from {phone}: \"{body[:250]}\"", pinned=True)
-            if result.intent == "INTERESTED":
+            # A clear yes, a no, or a positive reply means the owner answered,
+            # so the number is right (Jeff, 2026-10-07; INTERESTED since before).
+            if _alert_intent(result, body) in MARK_CORRECT_INTENTS:
                 outcome["actions"].append(
                     "phone status -> CORRECT: "
                     + _report(crm.set_phone_status(record_uuid, phone, "CORRECT")))
@@ -275,12 +297,14 @@ def _stop_on_reply(phone: str, record_uuid: str, body: str, result,
     closed line to merely paused.
     """
     acts = []
-    # Opt-out and wrong number speak for THIS LINE only (Jeff, 2026-10-03):
-    # "wrong number" is evidence the line is not the owner, and a STOP is a
-    # per-number opt-out. The terminal handlers below already suppress and
-    # close the line; the owner's other numbers keep their sequence.
-    # Anything else is a person engaging, so the whole record stops.
-    whole_record = result.intent not in TERMINAL_INTENTS
+    # A reply stops THIS LINE; the record's other numbers stop only when the
+    # reply settles who the owner is (Jeff, 2026-10-07). "What's your scam?" or
+    # "who is this?" tells us nothing about ownership, so the other numbers
+    # keep their touches until someone marks a number Correct (which the
+    # send-time check already enforces). The whole record stops on an
+    # unmistakable yes, a no, a positive reply, or a sensitive one.
+    # Opt-out and wrong number stay per-line, as since 2026-10-03.
+    whole_record = _settles_owner(result, body)
     lines = [phone]
     if whole_record:
         lines += [p for p in store.phones_for_record(record_uuid) if p != phone]
@@ -301,8 +325,12 @@ def _stop_on_reply(phone: str, record_uuid: str, body: str, result,
     # Sensitive replies already post their own, louder alert.
     if result.intent == "ESCALATE" or config.PHASE < 2:
         return acts
-    if store.mark_notified(phone, "reply"):
-        ok = escalate.reply_alert(phone, body, result.intent, context, record_uuid)
+    # A yes after an earlier unclear reply still posts once, so Diego hears
+    # that the number was marked Correct and the others stopped.
+    alert_intent = _alert_intent(result, body)
+    key = "reply-correct" if alert_intent in MARK_CORRECT_INTENTS else "reply"
+    if store.mark_notified(phone, key):
+        ok = escalate.reply_alert(phone, body, alert_intent, context, record_uuid)
         acts.append(f"posted reply alert for {config.HANDOFF_NAME}" if ok
                     else "reply alert FAILED to post")
     else:

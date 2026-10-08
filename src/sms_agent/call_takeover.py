@@ -37,6 +37,7 @@ import html
 import logging
 import re
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from . import config, store
 
@@ -185,7 +186,14 @@ def run(pages: int = 2, hours: int = 24, apply: bool = True) -> dict:
             try:
                 when = datetime.fromisoformat(created.replace("Z", "+00:00").replace(" ", "T")[:25])
                 if when.tzinfo is None:
-                    when = when.replace(tzinfo=timezone.utc)
+                    # The row names its zone; it follows the smrtPhone account
+                    # setting (UTC until 2026-10-08, America/Chicago since).
+                    raw = row.get("created_at")
+                    zone = (raw.get("timezone") if isinstance(raw, dict) else None) or "UTC"
+                    try:
+                        when = when.replace(tzinfo=ZoneInfo(zone))
+                    except Exception:  # noqa: BLE001 - unknown zone name
+                        when = when.replace(tzinfo=timezone.utc)
                 if when < cutoff:
                     continue
             except ValueError:

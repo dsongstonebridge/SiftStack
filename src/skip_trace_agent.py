@@ -1408,6 +1408,20 @@ def _write_mailing_address(subject: dict, result: dict) -> None:
     prop_street = (subject.get("property_address") or "").strip()
     current = (subject.get("current_mail_street") or prop_street).strip()
 
+    # Guard 0: probate. The mailing address on a probate record always comes
+    # from the filing or from the user, never from a placeholder - even when
+    # it equals the property, because the PR/heir really can live in the
+    # decedent's house. On 2026-10-08 Guard 1 mistook two of those for
+    # placeholders and replaced them with vendor addresses (Anita Lewis's
+    # court-filed 2264 N Xanthus; Anthony Giroux's, with a different person's
+    # Texas address). Log the vendor's address, never write it.
+    if subject.get("decedent_name") or subject.get("personal_representative"):
+        if _api.address_key(mail_street, "") != _api.address_key(current, ""):
+            logger.info("mailing address: %s is probate - keeping %r from the "
+                        "filing/user, NOT the vendor's %r", subject.get("name"),
+                        current, mail_street)
+        return
+
     # Guard 1: the record is not holding the placeholder -> a better source
     # already filled it. Leave it alone.
     if _api.address_key(current, "") != _api.address_key(prop_street, ""):

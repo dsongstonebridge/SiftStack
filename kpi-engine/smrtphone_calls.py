@@ -61,9 +61,16 @@ def _page(cookie: str, start: int, length: int) -> dict:
 def _local(row) -> datetime.datetime | None:
     c = row.get("created_at")
     s = c.get("date") if isinstance(c, dict) else c
+    # Each row names its own zone; it follows the smrtPhone account setting
+    # (UTC until 2026-10-08, America/Chicago since). Default UTC if missing.
+    zone = (c.get("timezone") if isinstance(c, dict) else None) or "UTC"
+    try:
+        src = ZoneInfo(zone)
+    except Exception:
+        src = ZoneInfo("UTC")
     try:
         return (datetime.datetime.strptime(str(s)[:19], "%Y-%m-%d %H:%M:%S")
-                .replace(tzinfo=ZoneInfo("UTC")).astimezone(TZ))
+                .replace(tzinfo=src).astimezone(TZ))
     except Exception:
         return None
 

@@ -1746,8 +1746,16 @@ many wake events that are not someone using the PC.
 
 **Testing locally** (Jeff's PC reaches DataSift and smrtPhone directly; skip `--slack`
 unless Jeff says post): `python kpi-engine/pull_kpis.py --from 2026-09-30 --to 2026-09-30`.
-Sep 30 is the regression day: Dials 142, VM 78, Reached 31 = 6 + 3 + 22, Conversations 10,
-brief 21, 2 min+ 0, Talk 16m18s, Correct 12, Wrong 26, Dead 27, Leads 0, NI 4, Follow-ups 7.
+Sep 30 is the regression day (as read 2026-10-08): Dials 142, VM 78, Reached 34 = 7 + 3 + 24,
+Conversations 11, brief 23, 2 min+ 1, Talk 18m50s, Correct 12, Wrong 26, Dead 27, Leads 0,
+NI 4, Follow-ups 7. It drifts when Sep 30 numbers get marked later (the count reads each
+record's whole history): it read Reached 31 / Talk 16m18s before. Compare old and new code
+on the same run rather than against these figures alone.
+
+**smrtPhone time zone:** Jeff set the smrtPhone account to Central on 2026-10-08, and the
+call log then returns EVERY call (old ones too) in Central, with the zone named on each row
+(`created_at.timezone`). `smrtphone_calls._local()` reads that field (default UTC), so the
+setting can change again without breaking times. Before the fix, calls read 5 hours early.
 
 **smrtPhone session expires ~Oct 31, 2026:** run `kpi-engine\smrtphone_login.bat`, then paste
 `kpi-engine\reports\SMRTPHONE_STATE_paste_me.txt` into the `SMRTPHONE_STATE` GitHub secret.

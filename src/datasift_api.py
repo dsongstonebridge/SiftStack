@@ -374,6 +374,15 @@ def _norm_street(street: str) -> str:
     for t in toks:
         m = _ORDINAL_RE.match(t)
         out.append(m.group(1) if m else _STREET_ABBR.get(t, t))
+    # Tulsa numbered avenues are written both ways round: "449 S 112th Ave E"
+    # and "449 S 112th East Ave" are the same house, and the server stores
+    # whichever it likes. Put the directional AFTER the street type so both
+    # read "449 S 112 AVE E". Only after a numbered street name, where the
+    # directional cannot be part of the name. 3 of 33 probate records read as
+    # "not found" on 2026-10-08 before this.
+    if (len(out) >= 4 and out[-3].isdigit() and out[-2] in _DIRECTIONALS
+            and out[-1] in _STREET_SUFFIXES):
+        out[-2], out[-1] = out[-1], out[-2]
     return " ".join(out)
 
 
@@ -1581,8 +1590,9 @@ def verify_phone_tags(owner_uuid: str, number_to_tags: dict[str, list[str]]) -> 
 
 
 def apply_phone_tags_verified(owner_uuid: str, number_to_tags: dict[str, list[str]], *,
-                              retry_pause: float = 15.0) -> dict:
-    """set_phone_tags() + verify_phone_tags(), with ONE automatic re-send for
+                              retry_pause: float = 15.0,
+                              second_pause: float = 40.0) -> dict:
+    """set_phone_tags() + verify_phone_tags(), with up to TWO automatic re-sends for
     numbers that came back carrying NO tags at all.
 
     set_phone_tags() has returned success and applied nothing: 4 of 77 numbers
@@ -1646,7 +1656,27 @@ def apply_phone_tags_verified(owner_uuid: str, number_to_tags: dict[str, list[st
     if again["ok"]:
         logger.info("phone tags: re-send landed - all %d number(s) verified",
                      len(number_to_tags))
-    return again
+        return again
+
+    # SECOND, SLOWER re-send. On 2026-10-08 all 4 of Naugle's numbers were
+    # still bare after the first re-send; the same mapping sent by hand after a
+    # 40s pause landed 4 of 4. Still only to numbers with NO tags at all.
+    on_record = again.get("on_record") or {}
+    still = {n: number_to_tags[n] for n in again["missing"] if not on_record.get(n)}
+    if not still:
+        return again
+    slow = max(retry_pause, second_pause)
+    logger.warning("phone tags: %d number(s) still have NO tags - waiting %.0fs, "
+                    "then re-sending a second time", len(still), slow)
+    time.sleep(slow)
+    set_phone_tags(still)
+    time.sleep(slow)
+    last = verify_phone_tags(owner_uuid, number_to_tags)
+    last.update(retried=sorted(set(empty) | set(still)), partial=partial)
+    if last["ok"]:
+        logger.info("phone tags: second re-send landed - all %d number(s) verified",
+                     len(number_to_tags))
+    return last
 
 
 # ── Filter presets ────────────────────────────────────────────────────

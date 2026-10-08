@@ -40,7 +40,9 @@ OUT_DIR = os.path.join(ROOT, "output", "petition_ocr")
 BODY_DPI = 300
 HEADER_DPI = 500
 
-CASE_RX = re.compile(r"\b[CcGg][JjI1l]\s*[-– ]\s*(20\d\d)\s*[-– ]\s*0*(\d{2,6})\b")
+# CJ (foreclosure) and PB (probate). OCR misreads CJ as GJ / C1 / Cl and PB as
+# P8. Probate stamps also space the dash ("PB- 2026-872").
+CASE_RX = re.compile(r"\b([CcGg][JjI1l]|[Pp][Bb8])\s*[-– ]\s*(20\d\d)\s*[-– ]\s*0*(\d{2,6})\b")
 MONTHS = ("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC")
 DATE_RX = re.compile(
     r"\b(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEPT?|OCT|NOV|DEC)[A-Z]*\.?\s+(\d{1,2}),?\s+(20\d\d)\b",
@@ -48,9 +50,11 @@ DATE_RX = re.compile(
 )
 
 
-def norm_case(year: str, num: str) -> str:
-    """CJ-2026-04287 and CJ-2026-4287 are the same case: drop leading zeros."""
-    return f"CJ-{year}-{int(num)}"
+def norm_case(prefix: str, year: str, num: str) -> str:
+    """CJ-2026-04287 and CJ-2026-4287 are the same case: drop leading zeros.
+    The prefix is normalized from its OCR misreadings to CJ or PB."""
+    kind = "PB" if prefix[:1].upper() == "P" else "CJ"
+    return f"{kind}-{year}-{int(num)}"
 
 
 def _ocr_task(pdf_path: str, index: int, header: bool) -> tuple:
@@ -77,7 +81,9 @@ def known_cases() -> set:
     except ImportError:
         return set()
     seen = set()
-    for path in glob.glob(os.path.join(ROOT, "output", "petition_batch*.xlsx")):
+    sheets = (glob.glob(os.path.join(ROOT, "output", "petition_batch*.xlsx"))
+              + glob.glob(os.path.join(ROOT, "output", "probate_batch*.xlsx")))
+    for path in sheets:
         try:
             ws = openpyxl.load_workbook(path, read_only=True).active
             rows = ws.iter_rows(values_only=True)

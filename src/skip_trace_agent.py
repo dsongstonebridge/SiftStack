@@ -279,6 +279,7 @@ _PROBATE_SUBJECT_FIELDS = {
     "Heir Count":              "heir_count",
     "Decision Maker":          "decision_maker",
     "DM Relationship":         "dm_relationship",
+    "Marital Status":          "marital_status",
     "Title Holder of Record":  "title_holder",
     "Insider Transfer":        "insider_transfer",
 }
@@ -1188,6 +1189,17 @@ def _same_person(a: str, b: str) -> bool:
     return short[0] in long_ and short[-1] in long_
 
 
+def _spouse_tag(marital: str) -> str | None:
+    """Wife or Husband from the filing's marital wording, else None.
+    "Married - surviving wife Hannah" -> Wife. Both words present -> None."""
+    t = (marital or "").lower()
+    wife = bool(re.search(r"\b(wife|widow)\b", t))
+    husband = bool(re.search(r"\b(husband|widower)\b", t))
+    if wife == husband:
+        return None
+    return "Wife" if wife else "Husband"
+
+
 def _primary_relationship_tag(subject: dict) -> str | None:
     """Relationship tag for the traced subject's own numbers, or None.
 
@@ -1195,7 +1207,19 @@ def _primary_relationship_tag(subject: dict) -> str | None:
     is the Decision Maker it describes: a relationship belongs to one person,
     and on anyone else's numbers it would be a permanent false label.
     """
-    rel = relationship_tag(subject.get("dm_relationship") or "")
+    dm_rel = subject.get("dm_relationship") or ""
+    rel = relationship_tag(dm_rel)
+    if rel == "Relative" and re.search(r"\bspouse\b", dm_rel.lower()):
+        # "Spouse" says nothing about which tag; it fell through to Relative
+        # on Mary Pope (2026-10-08). The filing's marital wording usually
+        # does say it ("surviving wife Hannah"). No wording, no tag: a wrong
+        # relationship tag is permanent, a missing one is not.
+        rel = _spouse_tag(subject.get("marital_status") or "")
+        if not rel:
+            logger.warning("relationship tag skipped for %s: DM Relationship says "
+                            "'Spouse' and the filing does not say wife or husband",
+                            subject.get("name"))
+            return None
     if not rel:
         return None
     dm = (subject.get("decision_maker") or "").strip()

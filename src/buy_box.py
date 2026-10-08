@@ -112,6 +112,24 @@ _UNIT_ADDRESS_RE = re.compile(
 )
 
 
+_NO_REAL_RX = re.compile(
+    r"\b(no|without)\b[^.;]{0,30}\breal\s+(property|estate)\b"
+    r"|\b(personal property only|only personal property)\b")
+
+
+def _states_no_real_property(rp: str) -> bool:
+    """True only when the filing's real-property wording is a real negative:
+    "No real property", "none", "personal property only", "leaving personal
+    property". "Not stated", "Petition is silent on real property" and any
+    text naming real property pass."""
+    rp = (rp or "").strip().lower()
+    if rp.rstrip(".") in ("no", "none", "n/a"):
+        return True
+    if _NO_REAL_RX.search(rp):
+        return True
+    return "personal property" in rp and "real" not in rp
+
+
 def check_buy_box(row: dict) -> tuple[bool, list[str]]:
     """Does this row belong in the CRM?
 
@@ -159,8 +177,11 @@ def check_buy_box(row: dict) -> tuple[bool, list[str]]:
     #    search returned zero parcels — two free sources agreeing there is no
     #    house to buy. Policy exclusion, not a data defect, so it belongs here
     #    rather than blocking the whole batch in review.
+    #    Match a real NEGATIVE, never a bare leading "no": that prefix test
+    #    rejected "Not stated..." and "None listed, but..." wording as if the
+    #    filing denied a house (Sutton and Hollingshead, 2026-10-08).
     rp = str(row.get("Real Property Stated") or "").strip().lower()
-    if rp.startswith("no") or ("personal property" in rp and "real" not in rp):
+    if _states_no_real_property(rp):
         reasons.append("the filing states NO real property - no house to buy")
 
     # 5. No property address could be resolved.

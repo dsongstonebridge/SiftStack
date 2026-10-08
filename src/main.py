@@ -2183,7 +2183,10 @@ def _create_records_for_batch(args, csv_path: Path) -> list[dict] | None:
     # billed trace. Failures are deleted from the CRM and never traced. After
     # the ledger on purpose: an excluded probate case must still count as
     # processed, or tomorrow's run creates it again.
-    from datasift_api import delete_property, find_property_by_address, get_property
+    # Probate (2026-10-08): MLS-listed is allowed, and DataSift's structure
+    # type excludes condos / mobile homes / 3+ units - see post_enrich_gate.
+    from datasift_api import (delete_property, find_property_by_address, get_property,
+                              post_message_board)
     from datasift_uploader import forget_uuid_map_entries
     from post_enrich_gate import apply_post_enrich_gate, describe as describe_gate
 
@@ -2191,9 +2194,10 @@ def _create_records_for_batch(args, csv_path: Path) -> list[dict] | None:
     template_rows, gated = apply_post_enrich_gate(
         template_rows, find_property=find_property_by_address,
         get_property=get_property, delete_property=delete_property,
-        forget_uuids=forget_uuid_map_entries)
+        forget_uuids=forget_uuid_map_entries, notice_type=notice_type,
+        post_board=post_message_board)
     run_timer.stop(_t)
-    _report_post_enrich_exclusions(gated, describe_gate())
+    _report_post_enrich_exclusions(gated, describe_gate(notice_type))
     alive = [r for r in alive if r in template_rows]
 
     return [row for row in (_trace_row(r) for r in alive) if row]

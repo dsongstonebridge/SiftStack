@@ -1284,6 +1284,14 @@ off-market reads `"Off Market"`). Equity is a snapshot: one record went
 14.81% -> 36.35% between enrichments. Not applied on the trace-only
 (`skip-trace` without `--create`) path.
 
+**Probate differs (user, 2026-10-08, "for now"):** MLS-listed is NOT excluded
+for probate (foreclosure still excludes it). Instead, probate excludes by
+DataSift's enriched `structure_type`: condos, mobile/manufactured homes, 3+
+units and non-residential use go; Single Family and Duplex pass; unknown or
+blank passes. "Residential-Vacant Land" is kept with a Message Board note,
+because DataSift called Sherman's brand-new house vacant land and the Assessor
+had already confirmed a structure. Foreclosure runs no property-type check here.
+
 **Not enforced, and do not imply otherwise: single-family vs duplex.**
 `AcctType` reads "Residential" for both and the assessor's structure detail is
 client-side from an unexposed endpoint. A duplex passes.

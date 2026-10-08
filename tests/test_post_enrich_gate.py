@@ -58,6 +58,61 @@ class CheckProperty(unittest.TestCase):
         self.assertTrue(check_property(prop("x", "50", "2024-09-26"), today=TODAY))
 
 
+def typed(st, units=None, use="Residential", **kw):
+    p = prop("t", "60.00", None, **kw)
+    p.update(structure_type=st, units=units, building_use_code=use)
+    return p
+
+
+class ProbateRules(unittest.TestCase):
+    """2026-10-08: probate allows MLS-listed, and excludes condos / mobile
+    homes / 3+ units off DataSift's structure_type. Foreclosure is unchanged."""
+
+    def check(self, p, nt="probate"):
+        return check_property(p, today=TODAY, notice_type=nt)
+
+    def test_mls_listed_allowed_for_probate_only(self):
+        listed = prop("n", "88.50", None, mls="Listed")
+        self.assertEqual(self.check(listed), [])
+        self.assertTrue(self.check(listed, "foreclosure"))
+
+    def test_live_types(self):
+        # Values read live 2026-10-08.
+        self.assertTrue(self.check(typed(
+            "Mobile/Manufactured Home (regardless of Land ownership)", 1)))     # Cape
+        self.assertEqual(self.check(typed("Single Family Residential", 1)), [])
+        self.assertEqual(self.check(typed("Duplex (2 units, any combination)", 2)), [])
+        self.assertEqual(self.check(typed("Residential-Vacant Land")), [])     # Sherman
+
+    def test_condo_units_and_non_residential(self):
+        self.assertTrue(self.check(typed("Condominium")))
+        self.assertTrue(self.check(typed("Triplex (3 units, any combination)", 3)))
+        self.assertTrue(self.check(typed("Something New", 4)))
+        self.assertTrue(self.check(typed("Office Building", use="Commercial")))
+
+    def test_type_check_is_probate_only(self):
+        self.assertEqual(self.check(typed("Condominium"), "foreclosure"), [])
+
+    def test_fails_open(self):
+        self.assertEqual(self.check(typed(None, use=None)), [])
+        self.assertEqual(self.check(typed("Some Unknown Type")), [])
+
+    def test_vacant_land_kept_with_board_note(self):
+        p = typed("Residential-Vacant Land")
+        p["owner"]["uuid"] = "own-1"
+        posts = []
+        kept, excluded = apply_post_enrich_gate(
+            [{"Property Street": "3012 S 12th St", "Property City": "Broken Arrow"}],
+            find_property=lambda *a: {"uuid": "t"}, get_property=lambda u: p,
+            delete_property=lambda u: self.fail("must not delete"),
+            today=TODAY, notice_type="probate",
+            post_board=lambda o, m: posts.append((o, m)))
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(excluded, [])
+        self.assertEqual(posts[0][0], "own-1")
+        self.assertIn("Residential-Vacant Land", posts[0][1])
+
+
 class ApplyGate(unittest.TestCase):
     def run_gate(self, props, fail_delete=()):
         rows = [{"Property Street": f"{i} Test St", "Property City": "Tulsa",

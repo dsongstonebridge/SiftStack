@@ -8,6 +8,22 @@ The user's rules (2026-09-23): he does NOT buy a property that is
 
 Such a record is deleted from the CRM and never skip traced.
 
+PROBATE IS DIFFERENT (user, 2026-10-08)
+---------------------------------------
+- **MLS is NOT a rule for probate.** A listed probate property stays. Foreclosure
+  still excludes MLS-listed records; the user said probate only, "for now".
+- **Property type IS a rule for probate**, read off DataSift's own
+  `structure_type` after enrichment: condos, mobile/manufactured homes,
+  3+ unit buildings and non-residential use are excluded ("keep condo and
+  mobile out of probate for now, i may change my mind later"). Single family
+  and duplex pass. Foreclosure does not run this check.
+- **"Vacant Land" is NOT excluded.** DataSift's data can be stale: on
+  2026-10-08 it called Sherman's brand-new house (3012 S 12th St, Broken Arrow)
+  "Residential-Vacant Land". The Assessor's improvements check already
+  confirmed a structure before creation, so that beats DataSift. The record
+  gets a Message Board note instead, so a human can look.
+- An unrecognised `structure_type` is logged and NOT excluded (fails open).
+
 Why this is a SECOND gate, separate from buy_box.py
 ---------------------------------------------------
 `buy_box.py` runs on the extracted sheet BEFORE creation, where none of these
@@ -70,6 +86,55 @@ _OFF_MARKET = frozenset({"off market", "off-market", "not listed", "sold",
                          "expired", "withdrawn", "cancelled", "canceled"})
 
 
+#: `structure_type` wording that is OUT for probate. Matched as lowercase
+#: substrings. Values seen live 2026-10-08: "Single Family Residential",
+#: "Duplex (2 units, any combination)", "Mobile/Manufactured Home (regardless
+#: of Land ownership)", "Residential-Vacant Land". The others are DataSift's
+#: likely wording for the same categories, unconfirmed.
+_PROBATE_EXCLUDED_TYPES = (
+    ("condo", "condominium"),
+    ("mobile", "mobile/manufactured home"),
+    ("manufactured", "mobile/manufactured home"),
+    ("triplex", "3+ unit building"),
+    ("quadruplex", "3+ unit building"),
+    ("fourplex", "3+ unit building"),
+    ("apartment", "3+ unit building"),
+    ("multi-family", "3+ unit building"),
+    ("multifamily", "3+ unit building"),
+    ("commercial", "commercial"),
+    ("industrial", "industrial"),
+)
+_PROBATE_OK_TYPES = ("single family", "duplex")
+_NON_RESIDENTIAL_USE = ("commercial", "industrial", "agricultur", "exempt")
+
+
+def _probate_type_reasons(prop: dict) -> list[str]:
+    st = str(prop.get("structure_type") or "").strip()
+    low = st.lower()
+    for word, label in _PROBATE_EXCLUDED_TYPES:
+        if word in low:
+            return [f"{label} (DataSift structure type = {st!r})"]
+    try:
+        units = int(prop.get("units") or 0)
+    except (TypeError, ValueError):
+        units = 0
+    if units >= 3:
+        return [f"{units} units (DataSift structure type = {st!r})"]
+    use = str(prop.get("building_use_code") or "").strip().lower()
+    if any(w in use for w in _NON_RESIDENTIAL_USE):
+        return [f"non-residential use (DataSift building use = "
+                f"{prop.get('building_use_code')!r})"]
+    if low and "vacant land" not in low and not any(w in low for w in _PROBATE_OK_TYPES):
+        logger.info("post-enrich gate: unrecognised structure type %r - not excluding on it", st)
+    return []
+
+
+def vacant_land_flag(prop: dict) -> bool:
+    """DataSift calls it vacant land. Not an exclusion (its data can be stale,
+    see the module docstring), only a reason to put a note on the board."""
+    return "vacant land" in str(prop.get("structure_type") or "").lower()
+
+
 def _years_before(d: date, years: int) -> date:
     try:
         return d.replace(year=d.year - years)
@@ -89,7 +154,8 @@ def _parse_date(v) -> date | None:
         return None
 
 
-def check_property(prop: dict, *, today: date | None = None) -> list[str]:
+def check_property(prop: dict, *, today: date | None = None,
+                   notice_type: str = "foreclosure") -> list[str]:
     """Reasons this CRM property fails the rules; empty means it passes.
 
     `prop` is a property object as `datasift_api.get_property()` returns it.
@@ -97,9 +163,15 @@ def check_property(prop: dict, *, today: date | None = None) -> list[str]:
     """
     today = today or date.today()
     reasons: list[str] = []
+    probate = notice_type == "probate"
+
+    if probate:
+        reasons += _probate_type_reasons(prop)
 
     mls = str(prop.get("mls") or "").strip().lower()
-    if mls in _ON_MARKET:
+    if probate:
+        pass                                # MLS is not a probate rule (2026-10-08)
+    elif mls in _ON_MARKET:
         reasons.append(f"MLS-listed (mls = {prop.get('mls')!r})")
     elif mls and mls not in _OFF_MARKET:
         logger.info("post-enrich gate: unrecognised mls value %r - not excluding on it",
@@ -120,6 +192,28 @@ def check_property(prop: dict, *, today: date | None = None) -> list[str]:
     return reasons
 
 
+VACANT_LAND_NOTE = (
+    "CHECK PROPERTY TYPE: DataSift calls this {st!r}. The county Assessor "
+    "showed a structure on the parcel before this record was created, and "
+    "DataSift's data can be out of date (it called a brand-new house vacant "
+    "land on 2026-10-08). Kept and traced. Confirm there is a house before "
+    "making an offer.")
+
+
+def _note_vacant_land(prop: dict, street: str, post_board) -> None:
+    st = prop.get("structure_type")
+    logger.warning("post-enrich gate: %s - DataSift says %r; kept (Assessor showed a "
+                   "structure)", street, st)
+    owner_uuid = (prop.get("owner") or {}).get("uuid")
+    if not (post_board and owner_uuid):
+        return
+    try:
+        post_board(owner_uuid, VACANT_LAND_NOTE.format(st=st))
+    except Exception as e:                       # noqa: BLE001 - a note, never a blocker
+        logger.warning("post-enrich gate: could not post the vacant-land note for %s: %s",
+                       street, e)
+
+
 def _has_been_worked(prop: dict) -> bool:
     owner = prop.get("owner") or {}
     return bool(owner.get("phones"))
@@ -127,7 +221,8 @@ def _has_been_worked(prop: dict) -> bool:
 
 def apply_post_enrich_gate(rows: list[dict], *, find_property, get_property,
                            delete_property, forget_uuids=None,
-                           today: date | None = None) -> tuple[list[dict], list[dict]]:
+                           today: date | None = None, notice_type: str = "foreclosure",
+                           post_board=None) -> tuple[list[dict], list[dict]]:
     """Split created rows into (kept, excluded), deleting excluded records.
 
     `rows` are the property-template rows just created (`Property Street`,
@@ -139,6 +234,9 @@ def apply_post_enrich_gate(rows: list[dict], *, find_property, get_property,
     `_gate_action` ("deleted", "kept in CRM - already has phones", or
     "delete FAILED: ..."), so the caller can report it. None of them is
     handed on to be traced, whatever the action.
+
+    For probate, a KEPT record DataSift calls vacant land gets a Message Board
+    note through `post_board(owner_uuid, text)` when that is given.
     """
     kept, excluded, deleted = [], [], []
     for r in rows:
@@ -157,9 +255,11 @@ def apply_post_enrich_gate(rows: list[dict], *, find_property, get_property,
             kept.append(r)
             continue
 
-        reasons = check_property(prop, today=today)
+        reasons = check_property(prop, today=today, notice_type=notice_type)
         if not reasons:
             kept.append(r)
+            if notice_type == "probate" and vacant_land_flag(prop):
+                _note_vacant_land(prop, street, post_board)
             continue
 
         uuid = prop.get("uuid") or hit.get("uuid")
@@ -183,7 +283,13 @@ def apply_post_enrich_gate(rows: list[dict], *, find_property, get_property,
     return kept, excluded
 
 
-def describe() -> str:
+def describe(notice_type: str = "foreclosure") -> str:
+    if notice_type == "probate":
+        return (f"Post-enrichment gate (probate): equity at least "
+                f"{MIN_EQUITY_PERCENT:.0f}%, not sold within the last {RECENT_SALE_YEARS} "
+                f"years, and not a condo, mobile home, 3+ units or non-residential "
+                f"(DataSift structure type). MLS-listed is allowed. Missing data never "
+                f"excludes.")
     return (f"Post-enrichment gate: not MLS-listed, equity at least "
             f"{MIN_EQUITY_PERCENT:.0f}%, not sold within the last {RECENT_SALE_YEARS} "
             f"years. Missing data never excludes.")

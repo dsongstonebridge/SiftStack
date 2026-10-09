@@ -1780,7 +1780,7 @@ the named "Hi there!" Touch 1 variant was removed from BOTH the skill and
 | `SMS_AGENT_NUMBER_HEALTH_CHECK=1` | `number_health.py`: a sending number flagged by more than `SMS_AGENT_NUMBER_HEALTH_MAX_FLAGS` (default 1) of AT&T / T-Mobile / Verizon on its latest NumberVerifier day is refused by `sender_pool.available()` (so `assign()` routes new threads elsewhere and the worker holds its sends). Unreadable, unmonitored, or data older than 4 days = HOLD. One #SMS alert per number per day. The public x-apikey API has NO flag fields; flags come from the dashboard's AppSync `getDates` (rows `flags: "att,tmo,vz"`), reached by signing in with `NUMBERVERIFIER_EMAIL`/`_PASSWORD` over Cognito USER_SRP_AUTH (password flow disabled on their client), stdlib only. The account id needs `listAccounts` paged with an owner filter: scan-then-filter, so page 1 is often empty. Internal API, can change. Cached 1h. |
 | `SMS_AGENT_IGNORE_DNC_FLAG=1` | Jeff, 2026-10-05 (supersedes the do-not-call handling above): DataSift's do-not-call registry flag is ignored entirely. Phone STATUS DNC / CORRECT_DNC / WRONG_DNC / WRONG / DEAD and the litigator tag still always block, at build and send time. |
 | `SMS_AGENT_TEXT_ALL_BEST=1` | Every qualifying number on a record is texted (Dial First/Second, textable line, good status), best first, not just one. Expanded rows go back on the front of the build queue so caps, touch history and holds apply per number. A record with a Correct number still gets only that number. 2026-10-05 FTM book: 69 records -> 118 numbers. |
-| `SMS_AGENT_FOLLOWUPS_FIRST=1` | Jeff, 2026-10-05: records already in the sequence get their next touch before anyone new gets touch 1 (`campaign.build` pass zero). That pass only continues the numbers already texted; it never opens a new number on a record mid-sequence. Without it the per-source shares cut 6 of 23 due owners out of touch 2. |
+| `SMS_AGENT_FOLLOWUPS_FIRST=1` | Jeff, 2026-10-05: records already in the sequence get their next touch before anyone new gets touch 1 (`campaign.build` pass zero). Since 2026-10-09 that pass also gives touch 1 to a never-texted good number on the record (see "every good number gets 4 touches" below). Without it the per-source shares cut 6 of 23 due owners out of touch 2. |
 | (always on) No Answer never trumps Correct | Jeff, 2026-10-05: a no-answer call disposition overwrites a CORRECT phone status in DataSift. `seed.correct_phones` replays `owner.phone.status.updated` from the activity log, so a number that went CORRECT -> NO_ANSWER still counts as Correct; WRONG/DEAD/DNC still override. |
 | (always on) one number per record | Jeff, 2026-10-05: every phone on one record is texted from the SAME smrtPhone number. `seed.schedule()` reuses the number already texting any of the record's phones (`store.record_from_number`), else the one picked earlier in the batch. Before this, 534 E Pine Pl got three texts from three numbers within 13 seconds. |
 | (always on) relative's name on a relative's number | Jeff, 2026-10-05: a number tagged Wife/Husband/Son/Daughter/Grandchild/Relative is greeted by THAT person's first name (`seed.relation_addressee`): a spouse from the record's `secondary_owners`, else a board note ("wife's name is Linda", "Linda (wife)"); none found = no-name greeting, never the primary owner's name. |
@@ -1831,6 +1831,13 @@ and after (`git stash`), not by the count.
 lands as a literal backspace byte and silently matches nothing. Write regex
 files with the Write tool, or build the string with `chr(92)`, and assert on
 known inputs.
+
+**Status (2026-10-09): PAUSED by Jeff.** On 10/8 two workers overlapped and 11 numbers got the same
+text twice (fixed, see "never overlap, never repeat"). The task "SMS agent weekdays" is DISABLED
+and nothing sends until Jeff says resume (`Enable-ScheduledTask` then `Start-ScheduledTask`).
+Ready to Call is out of `SMS_AGENT_CAMPAIGN_SOURCES` until Mon 10/12, when calls and texts start
+together; restore it in full (no `|continue`) only on Jeff's yes. Daily rule (Jeff): touch N
+yesterday -> N+1 today; never texted -> touch 1 unless he holds that group.
 
 **Status (2026-10-07): LIVE.** Windows task "SMS agent weekdays" starts
 `cli.py work --loop` at 8:00 (11h limit; it only sends while the PC is awake,

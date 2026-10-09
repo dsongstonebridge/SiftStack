@@ -1884,6 +1884,27 @@ batches, not a cleanup tool for records already traced. Dana Miller no longer fa
 from 14.81% to 36.35%. Watkins passed the 2-year window (sold 2024-09-20) and
 would fail the 3-year one; she is already traced and stays.
 
+**VALUE-SPREAD STOP-AND-ASK, every foreclosure batch (2026-10-09,
+`src/spread_review.py`).** After the post-enrichment gate, before any trace:
+spread = DataSift `estimate_value` (the SiftMap value) minus the petition's
+`Unpaid Principal Balance`, first mortgage only (junior liens and seconds stay
+on the board, never in the math). Over $100,000 goes on. $100,000 or less, or
+either number missing ("CAN'T CALCULATE"), is HELD on a NUMBERED list the user
+answers like "keep 1,3,4 drop 2,5". Not asked: MLS-listed (never traced),
+Owner Alive = No, probate. The equity-% and 3-year rules still run first.
+- **The batch is traced as ONE unit.** `--commit` refuses every billed step
+  while any listed record is unanswered. Pass the answers on the same command:
+  `--commit --spread-answers "keep 1,3 drop 2"`. Answers on a dry run change
+  nothing. Keep -> traced with the batch. Drop -> that ONE record is deleted,
+  only if the address still resolves to the uuid captured for that row right
+  after creation and its owner has no phones; otherwise left untouched and
+  reported.
+- Numbers persist in `output/.spread_review.json` (keyed like the created-rows
+  ledger), so the dry run's numbers are the ones to answer. Ledger status
+  `review` -> `trace` (keep) or `excluded` (drop).
+- Preview on the 10/6 records in the CRM: 4 of 6 would have been asked
+  (spreads $43,768 to $95,856), 2 passed. Tests: `tests/test_spread_review.py`.
+
 **Checks BEFORE creation (2026-10-09, `src/foreclosure_checks.py`, built for
 the pre-July backfill).** Free and read-only; probate does not run them.
 - **Already in the CRM -> skipped entirely.** No create, notes, board, tag or

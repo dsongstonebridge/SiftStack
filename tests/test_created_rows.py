@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import created_rows  # noqa: E402
 import main  # noqa: E402
 import processed_cases  # noqa: E402
+import spread_review  # noqa: E402
 
 
 def _args(**kw):
@@ -80,10 +81,13 @@ class ReRunTests(unittest.TestCase):
             p = mock.patch.object(target, "LEDGER_PATH", self.dir / name)
             p.start()
             self.addCleanup(p.stop)
+        p = mock.patch.object(spread_review, "STORE_PATH", self.dir / "spread.json")
+        p.start()
+        self.addCleanup(p.stop)
         self.uploads: list[list[str]] = []
 
     def _run(self, rows, *, findings=(), gate_out=(), args=None, probate_lookup=None,
-             listed=()):
+             listed=(), thin=()):
         """One `--create`. `gate_out` = last names the post-enrichment gate removes."""
         rows = [dict(r) for r in rows]          # a fresh read of the file each run
         built: list[list[dict]] = []
@@ -107,6 +111,11 @@ class ReRunTests(unittest.TestCase):
             for r in kept:
                 if r["Last Name"] in listed:
                     r["_mls_listed"] = True
+                if r["Last Name"] in thin:
+                    r["_spread_review"] = {"value": 150000.0, "balance": 90000.0,
+                                           "spread": 60000.0, "ok": False,
+                                           "note": "spread is $100,000 or less",
+                                           "uuid": "U"}  # what the lookup stub returns
             out = [{**r, "_gate_reasons": ["x"], "_gate_uuid": "u", "_gate_action": "deleted"}
                    for r in rs if r["Last Name"] in gate_out]
             return kept, out

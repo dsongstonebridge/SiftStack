@@ -21,6 +21,10 @@ Statuses:
   trace     created and passed every gate -> traced on a re-run
   no_trace  created but Owner Alive = No   -> never traced
   excluded  created, then removed by the post-enrichment gate -> never traced
+  listed    created, MLS-listed: status `listed`, never traced
+  review    created, value spread $100k or less (or not calculable): held
+            until the user answers keep/drop (spread_review.py); keep ->
+            trace, drop -> excluded
 
 Rows held for review or rejected by the buy box are NOT recorded: they were
 never created, so a re-run sends them through the full chain again (which is
@@ -88,6 +92,18 @@ def split(rows: list[dict], notice_type: str, *,
         else:
             fresh.append(r)
     return fresh, done
+
+
+def set_status(key: str, status: str, *, path: Optional[Path] = None) -> None:
+    """Change one recorded row's status (a spread-review answer)."""
+    path = Path(path or LEDGER_PATH)
+    ledger = load(path)
+    if key not in ledger:
+        raise KeyError(key)
+    ledger[key]["status"] = status
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(ledger, indent=2, sort_keys=True, default=str), encoding="utf-8")
+    tmp.replace(path)
 
 
 def record(entries: list[tuple[dict, str, Optional[dict]]], notice_type: str, *,

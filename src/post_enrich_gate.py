@@ -328,6 +328,13 @@ def apply_post_enrich_gate(rows: list[dict], *, find_property, get_property,
             if notice_type != "probate" and mls_listed(prop):
                 r["_mls_listed"] = True
                 r["_mls_error"] = _flag_mls(prop, street, set_status, post_board, today)
+            elif notice_type != "probate":
+                # Value-spread rule (2026-10-09): flagged here, decided by the
+                # user before anything is traced. See spread_review.py.
+                from spread_review import value_spread
+                info = value_spread(prop, r)
+                if not info["ok"]:
+                    r["_spread_review"] = {**info, "uuid": prop.get("uuid") or hit.get("uuid")}
             continue
 
         uuid = prop.get("uuid") or hit.get("uuid")

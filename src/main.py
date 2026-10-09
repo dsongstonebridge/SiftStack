@@ -2059,21 +2059,126 @@ def _create_records_for_batch(args, csv_path: Path) -> list[dict] | None:
             excluded = {id(r) for r in outcome["excluded"]}
             no_trace = {id(r) for r in outcome["no_trace"]}
             listed = {id(r) for r in outcome.get("listed", [])}
+            review_items = []
             for r in outcome["created"]:
                 status = ("excluded" if id(r) in excluded
                           else "listed" if id(r) in listed
-                          else "no_trace" if id(r) in no_trace else "trace")
-                tr = _trace_row(r) if status == "trace" else None
-                if tr:
+                          else "no_trace" if id(r) in no_trace
+                          else "review" if r.get("_spread_review") else "trace")
+                tr = _trace_row(r) if status in ("trace", "review") else None
+                if tr and status == "trace":
                     trace_rows.append(tr)
-                entries.append((originals.get(id(r), r), status, tr))
+                orig = originals.get(id(r), r)
+                entries.append((orig, status, tr))
+                key = created_rows.row_key(orig, notice_type)
+                if status == "review" and key:
+                    review_items.append((key, {
+                        **r["_spread_review"],
+                        "street": r.get("Property Street") or "",
+                        "label": f"{r.get('First Name', '')} {r.get('Last Name', '')}".strip()
+                                 + (f" | {r.get('Case Number')}" if r.get("Case Number") else ""),
+                    }))
             n = created_rows.record(entries, notice_type)
+            if review_items:
+                import spread_review
+                spread_review.add(review_items)
             logging.info("created-rows ledger: recorded %d row(s); re-running this "
                          "command with --commit will trace them without re-creating", n)
 
     trace_rows.extend(e["trace_row"] for _, e in done
                       if e.get("status") == "trace" and e.get("trace_row"))
+
+    if notice_type != "probate":
+        batch_keys = [k for k in (created_rows.row_key(o, notice_type)
+                                  for o in list(originals.values()) + [r for r, _ in done])
+                      if k]
+        trace_rows = _resolve_spread_reviews(args, batch_keys, trace_rows)
+        if trace_rows is None:
+            return None
     return trace_rows or None
+
+
+def _resolve_spread_reviews(args, batch_keys: list[str], trace_rows: list[dict]):
+    """The value-spread stop-and-ask (spread_review.py). Applies the user's
+    `--spread-answers` on a --commit run, then:
+      - nothing left open      -> returns trace_rows plus every kept row
+      - still open, --commit   -> prints the numbered list, returns None:
+                                  NOTHING in the batch is traced (one unit)
+      - still open, dry run    -> prints the list, returns trace_rows so the
+                                  dry run can show its estimate."""
+    import created_rows
+    import spread_review
+    from datasift_api import delete_property, find_property_by_address, get_property
+    from datasift_uploader import forget_uuid_map_entries
+
+    commit = bool(getattr(args, "commit", False))
+    answers_text = getattr(args, "spread_answers", None)
+    open_items = spread_review.pending(batch_keys)
+
+    if open_items and answers_text:
+        by_num = {e["num"]: (k, e) for k, e in open_items}
+        try:
+            answers = spread_review.parse_answers(answers_text, set(by_num))
+        except ValueError as e:
+            logging.error("--spread-answers %r: %s. Nothing traced.", answers_text, e)
+            _print_spread_list(open_items)
+            return None
+        if not commit:
+            logging.warning("--spread-answers is applied on the --commit run only; "
+                            "this dry run changes nothing. Would do: %s",
+                            ", ".join(f"#{n} {a}" for n, a in sorted(answers.items())))
+        else:
+            ledger = created_rows.load()
+            for num, answer in sorted(answers.items()):
+                key, info = by_num[num]
+                if answer == "keep":
+                    created_rows.set_status(key, "trace")
+                    tr = (ledger.get(key) or {}).get("trace_row")
+                    if tr:
+                        trace_rows.append(tr)
+                    spread_review.record_answer(key, "keep", "traced with the batch")
+                    logging.info("  #%d KEEP  %s - traced with the batch", num, info["label"])
+                else:
+                    outcome = spread_review.safe_delete(
+                        info, get_property=get_property, delete_property=delete_property,
+                        find_property=lambda s: find_property_by_address(s, "", "",
+                                                                         strict=True))
+                    if outcome == "deleted" and info.get("uuid"):
+                        forget_uuid_map_entries([info["uuid"]])
+                    created_rows.set_status(key, "excluded")
+                    spread_review.record_answer(key, "drop", outcome)
+                    log = logging.info if outcome in ("deleted", "already gone from the CRM") \
+                        else logging.warning
+                    log("  #%d DROP  %s - %s", num, info["label"], outcome)
+            open_items = spread_review.pending(batch_keys)
+
+    if not open_items:
+        return trace_rows
+
+    _print_spread_list(open_items)
+    if commit:
+        logging.error("NOTHING TRACED: %d record(s) above need your keep/drop answer first. "
+                      "The whole batch is traced as one unit once they are answered. Re-run "
+                      "with --spread-answers \"keep 1,3 drop 2\" (same command, --commit).",
+                      len(open_items))
+        return None
+    logging.warning("Dry run: the estimate below covers only the records that passed; the "
+                    "%d above are held until you answer.", len(open_items))
+    return trace_rows
+
+
+def _print_spread_list(open_items) -> None:
+    import spread_review
+    logging.warning("")
+    logging.warning("=== VALUE SPREAD $%s OR LESS - YOUR CALL (%d) ===",
+                    f"{spread_review.SPREAD_MIN:,}", len(open_items))
+    logging.warning("  SiftMap estimated value minus the petition's unpaid principal "
+                    "balance (first mortgage only).")
+    for _, e in open_items:
+        logging.warning("  %d. %s | %s", e["num"], e.get("label") or "?", e.get("street") or "?")
+        logging.warning("       %s", spread_review.describe(e))
+    logging.warning("  Answer like: keep 1,3 drop 2   (drop deletes only that record)")
+    logging.warning("")
 
 
 def _report_already_created(done: list[tuple[dict, dict]]) -> None:
@@ -2086,7 +2191,8 @@ def _report_already_created(done: list[tuple[dict, dict]]) -> None:
     what = {"trace": "goes straight to the trace",
             "no_trace": "Owner Alive = No, never traced",
             "excluded": "removed by the post-enrichment gate, never traced",
-            "listed": "MLS-listed, status listed, never traced"}
+            "listed": "MLS-listed, status listed, never traced",
+            "review": "value spread under review - see the numbered list"}
     for _, e in done:
         logging.info("  %s | created %s | %s", e.get("label") or "?",
                      e.get("recorded") or "?", what.get(e.get("status"), e.get("status")))
@@ -2388,6 +2494,7 @@ def _create_fresh_rows(args, template_rows: list[dict], notice_type: str) -> dic
         "no_trace": [r for r in created
                      if id(r) in kept_ids and id(r) in {id(d) for d in deceased}],
         "listed": [r for r in created if id(r) in listed_ids],
+        "review": [r for r in created if id(r) in kept_ids and r.get("_spread_review")],
     }
 
 
@@ -3358,6 +3465,14 @@ def cli_main() -> None:
               "(tag 'Tracerfy Skipped' or DataSift skiptraced). Off by default: a "
               "repeat bills twice and stamps 'Pre-existing' beside every number's "
               "true source tag, permanently."),
+    )
+    parser.add_argument(
+        "--spread-answers", default=None, metavar="TEXT",
+        help=("skip-trace --create --commit, foreclosure: your answers to the "
+              "numbered value-spread list, e.g. \"keep 1,3,4 drop 2,5\". keep = "
+              "traced with the batch; drop = that record is deleted from the CRM "
+              "(only if it is provably the one this batch created). Nothing in "
+              "the batch is traced until every listed record is answered."),
     )
     parser.add_argument(
         "--backfill", action="store_true",

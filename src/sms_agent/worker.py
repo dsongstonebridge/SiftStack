@@ -192,6 +192,21 @@ def drain_outbox(limit: int = 25) -> dict:
             held += 1
             continue
 
+        # Never the same text to the same number twice (Jeff, 2026-10-09: on 10/8
+        # 11 numbers got a touch twice). Checked against what actually went out.
+        if store.already_sent_text(phone, row["body"]):
+            store.mark_outbox(row["id"], "cancelled", "this exact text already went to this number")
+            log.warning("cancelled outbox %s -> %s: same text already sent", row["id"], phone)
+            skipped += 1
+            continue
+
+        # Claim the row in one statement. If another process got there first,
+        # it is theirs to send; we do nothing.
+        if not store.claim_outbox(row["id"]):
+            log.warning("outbox %s already claimed by another sender, skipping", row["id"])
+            skipped += 1
+            continue
+
         if config.DRY_RUN:
             log.info("DRY_RUN send %s -> %s: %s", from_number, phone, row["body"][:100])
             store.mark_outbox(row["id"], "sent", "dry run")
@@ -433,15 +448,43 @@ def _reconcile_pass(result: dict, with_reconcile: bool) -> None:
                 log.exception("call takeover pass failed")
 
 
+STOP_HOUR = 19  # local; sends end at 18:00, replies get one more hour
+
+
+def _stop_time(started: datetime) -> datetime:
+    """7 PM business time on the day the worker started. Started after 7 PM
+    (a manual evening run): 7 AM the next morning, before the 8 AM build."""
+    from datetime import timedelta
+    from zoneinfo import ZoneInfo
+
+    tz = ZoneInfo(config.CAMPAIGN_TZ)
+    local = started.astimezone(tz)
+    stop = local.replace(hour=STOP_HOUR, minute=0, second=0, microsecond=0)
+    if local >= stop:
+        stop = (local + timedelta(days=1)).replace(hour=7, minute=0, second=0, microsecond=0)
+    return stop.astimezone(timezone.utc)
+
+
 def run_forever(interval: int = 20) -> None:
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
     store.init()
+    stuck = store.recover_interrupted_sends()
+    if stuck:
+        log.warning("%d outbox row(s) were mid-send when the last worker stopped;"
+                    " marked failed, not resent", stuck)
     log.info(
         "worker up | phase=%s dry_run=%s pool=%s", config.PHASE, config.DRY_RUN, len(sender_pool.pool())
     )
+    stop_at = _stop_time(datetime.now(timezone.utc))
+    log.info("worker will stop itself at %s", stop_at.isoformat(timespec="minutes"))
     while True:
+        if datetime.now(timezone.utc) >= stop_at:
+            # Jeff, 2026-10-09: a worker must never run into the next day on
+            # yesterday's settings. The 8 AM task starts a fresh one.
+            log.info("end of day: worker stopping itself")
+            return
         try:
             result = run_once()
             if any(result.values()):

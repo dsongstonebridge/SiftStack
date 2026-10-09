@@ -786,6 +786,42 @@ def due_outbox(limit: int = 25) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def claim_outbox(row_id: int) -> bool:
+    """Take a queued row for sending. True only for the one caller that flips it.
+
+    queued -> sending in one statement, so two processes can never both send the
+    same row (the 10/8 double sends). mark_outbox() moves it on afterwards.
+    """
+    with tx() as c:
+        cur = c.execute("UPDATE outbox SET status='sending' WHERE id=? AND status='queued'",
+                        (row_id,))
+        return cur.rowcount == 1
+
+
+def recover_interrupted_sends() -> int:
+    """Rows left in 'sending' by a worker that died mid-send. The text may or may
+    not have gone out, so they are FAILED, never retried: a missed touch is
+    cheaper than the same text twice."""
+    with tx() as c:
+        cur = c.execute(
+            "UPDATE outbox SET status='failed', error='interrupted mid-send; check smrtPhone"
+            " before resending' WHERE status='sending'")
+        return cur.rowcount
+
+
+def already_sent_text(phone: str, body: str) -> bool:
+    """Has this exact text already gone out to this number?"""
+    row = _conn().execute(
+        "SELECT 1 FROM messages WHERE phone=? AND direction='out' AND body=? LIMIT 1",
+        (phone, body)).fetchone()
+    if row:
+        return True
+    row = _conn().execute(
+        "SELECT 1 FROM outbox WHERE phone=? AND body=? AND status='sent' LIMIT 1",
+        (phone, body)).fetchone()
+    return row is not None
+
+
 def mark_outbox(row_id: int, status: str, error: str = "") -> None:
     with tx() as c:
         c.execute(

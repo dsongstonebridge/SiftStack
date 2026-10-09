@@ -94,6 +94,15 @@ def cmd_serve(args) -> int:
 def cmd_work(args) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
     store.init()
+    # One worker at a time, loop or single pass (Jeff, 2026-10-09).
+    from . import instance_lock
+
+    if not instance_lock.acquire():
+        msg = (f"another SMS worker is already running (pid {instance_lock.holder_pid()});"
+               " not starting a second one")
+        logging.getLogger(__name__).warning(msg)
+        print(msg)
+        return 0
     if args.loop:
         worker.run_forever(interval=args.interval)
         return 0

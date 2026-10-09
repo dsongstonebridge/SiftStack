@@ -72,6 +72,9 @@ class Source:
     title: str
     share: float
     deep: bool = False
+    # Jeff, 2026-10-09: "continue" = finish sequences already started from this
+    # source, but start nobody new (no touch 1) until he says so.
+    continue_only: bool = False
 
 
 SOURCES = [
@@ -92,10 +95,15 @@ def _sources_from_env(raw: str) -> list:
     out = []
     for part in [p.strip() for p in raw.split(";") if p.strip()]:
         bits = [b.strip() for b in part.split("|")]
-        if len(bits) not in (2, 3) or not bits[0]:
+        if len(bits) < 2 or not bits[0]:
             raise ValueError(f"bad SMS_AGENT_CAMPAIGN_SOURCES entry: {part!r}")
-        deep = len(bits) == 3 and bits[2].lower() in ("deep", "1", "true")
-        out.append(Source(bits[0], float(bits[1]), deep=deep))
+        flags = {b.lower() for b in bits[2:]}
+        unknown = flags - {"deep", "1", "true", "continue", ""}
+        if unknown:
+            raise ValueError(f"bad SMS_AGENT_CAMPAIGN_SOURCES flag {sorted(unknown)} in {part!r}")
+        deep = bool(flags & {"deep", "1", "true"})
+        out.append(Source(bits[0], float(bits[1]), deep=deep,
+                          continue_only="continue" in flags))
     return out
 
 
@@ -175,6 +183,16 @@ def prior_touches(sms_log_rows: Optional[list] = None) -> dict[str, dict]:
     return history
 
 
+def _local_date(dt: datetime) -> date:
+    """The business-day date (Central), not the UTC date. "Yesterday" means
+    yesterday in Tulsa, so a text near midnight UTC is not counted a day early."""
+    from zoneinfo import ZoneInfo
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(ZoneInfo(config.CAMPAIGN_TZ)).date()
+
+
 def next_touch(entry: Optional[dict], min_days: int, today: date) -> tuple[Optional[int], str]:
     """Which touch this person is due, and why not if they are not.
 
@@ -198,7 +216,7 @@ def next_touch(entry: Optional[dict], min_days: int, today: date) -> tuple[Optio
     last = (entry or {}).get("last") or ""
     if last:
         try:
-            when = datetime.fromisoformat(last.replace("Z", "+00:00")).date()
+            when = _local_date(datetime.fromisoformat(last.replace("Z", "+00:00")))
         except ValueError:
             when = None
         if when and (today - when).days < min_days:
@@ -238,7 +256,7 @@ def build(sender_fallback: str = "", log_pages: int = 6,
     from . import reconcile
 
     min_days = config.TOUCH_GAP_DAYS if min_days is None else min_days
-    today = today or datetime.now(timezone.utc).date()
+    today = today or _local_date(datetime.now(timezone.utc))
 
     try:
         sms_rows = reconcile.fetch_log(pages=log_pages)
@@ -356,6 +374,11 @@ def build(sender_fallback: str = "", log_pages: int = 6,
                     plan.skipped_completed += 1
                 else:
                     plan.skipped_waiting += 1
+                continue
+            if touch == 1 and src.continue_only:
+                why = "new starts held for this source (continue only)"
+                stage["holds"][why] = stage["holds"].get(why, 0) + 1
+                plan.holds[why] = plan.holds.get(why, 0) + 1
                 continue
             if followups_only and touch == 1:
                 # Pass zero continues a record's sequence on the numbers that

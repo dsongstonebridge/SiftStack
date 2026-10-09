@@ -91,6 +91,9 @@ def from_csv(path: Path) -> list[dict]:
 
 # Phone dispositions that mean "never text this number again".
 SKIP_PHONE_STATUSES = {"DNC", "CORRECT_DNC", "WRONG_DNC", "WRONG", "DEAD"}
+# Record (lead) statuses that stop a send, normalised to lowercase with spaces.
+STOP_LEAD_STATUSES = {"not interested", "dead", "dead lead", "wrong number", "do not contact",
+                      "dnc", "sold", "under contract", "closed"}
 
 # Only the two tiers Trestle scored as most likely to reach the owner.
 ALLOWED_DIAL_TIERS = {"Dial First", "Dial Second"}
@@ -143,6 +146,13 @@ def phone_still_textable(record_uuid: str, phone: str) -> tuple[Optional[bool], 
     status = (obj.get("status") or "").upper()
     if status in SKIP_PHONE_STATUSES:
         return False, f"number now marked {status}"
+    # Jeff 2026-10-08: the record's LEAD status too, read from the same fresh copy.
+    # A lead moved to not interested / sold / under contract since the build must not get a text.
+    rec = crm.get_record(record_uuid) or {}
+    lead = rec.get("status")
+    lead = (lead.get("title") or lead.get("name") or "") if isinstance(lead, dict) else (lead or "")
+    if str(lead).strip().lower().replace("_", " ") in STOP_LEAD_STATUSES:
+        return False, f"lead status now {lead}"
     if config.CORRECT_NUMBER_FIRST:
         verdict = _correct_number_verdict(record_uuid, phone, obj)
         if verdict is not None:
@@ -1208,7 +1218,7 @@ def queue(candidates: list[Candidate], touch: int, new_deal: bool = False) -> di
     pending = {
         store.clean_phone(r["phone"])
         for r in store._conn().execute(
-            "SELECT phone FROM outbox WHERE status IN ('held','queued')"
+            "SELECT phone FROM outbox WHERE status IN ('held','queued','sending')"
         )
     }
     # Schedule first: spacing, rotation and per-number rest are decided for the

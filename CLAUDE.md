@@ -1895,8 +1895,9 @@ the pre-July backfill).** Free and read-only; probate does not run them.
   control new.
   Runs on every foreclosure batch.
 - **Assessor ownership check: BACKFILL ONLY, `--backfill`.** User rule: daily
-  (recent) runs skip it; **whenever the user says the batch is a backfill of
-  old foreclosures, add `--backfill` to the `skip-trace --create` command**
+  (recent) runs skip it; **whenever the user calls the batch a "backfill", a
+  "backpull", or "old foreclosures" (any of the three), add `--backfill` to the
+  `skip-trace --create` command**
   (dry run and `--commit` alike). OSCN dockets on old cases often don't say
   whether it went to sheriff sale or changed hands, so every row's parcel is
   read off the Tulsa Assessor and the row is HELD (not created) when: the

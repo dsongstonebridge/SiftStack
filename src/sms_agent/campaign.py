@@ -225,6 +225,39 @@ def next_touch(entry: Optional[dict], min_days: int, today: date) -> tuple[Optio
     return done + 1, ""
 
 
+SNAPSHOT_KEY = "untexted_good_numbers_2026_10_09"
+
+
+def untexted_snapshot() -> set:
+    """Good numbers that sat untexted on mid-sequence records on 2026-10-09.
+    They never get touch 1; every number that becomes good after that does."""
+    import json
+
+    raw = store.get_meta(SNAPSHOT_KEY)
+    return set(json.loads(raw)) if raw else set()
+
+
+def take_untexted_snapshot(titles: list) -> int:
+    """One-off: record today's untexted good numbers on records already in a
+    sequence. Reads only the records in the given presets."""
+    import json
+
+    hist = prior_touches([])
+    # A record counts as started if ANY of its numbers was ever texted, even
+    # one that has since gone bad.
+    started = {(store.lookup_phone(p) or {}).get("record_uuid") for p in hist}
+    found = set()
+    for title in titles:
+        rows, _ = seed.from_preset(title, keep_unresolved=True, stats={})
+        for r in rows:
+            nums = [store.clean_phone(g.get("phone"))
+                    for g in seed.all_textable_rows(dict(r), set())]
+            if r.get("uuid") in started or any(hist.get(n) for n in nums):
+                found |= {n for n in nums if n and not hist.get(n)}
+    store.set_meta(SNAPSHOT_KEY, json.dumps(sorted(found)))
+    return len(found)
+
+
 @dataclass
 class Plan:
     candidates: list = field(default_factory=list)
@@ -297,6 +330,7 @@ def build(sender_fallback: str = "", log_pages: int = 6,
         }
 
     followups_only = False
+    grandfathered = untexted_snapshot()
 
     def take(src: Source, quota: int) -> int:
         """Vet this source's rows until `quota` candidates are ready."""
@@ -380,9 +414,11 @@ def build(sender_fallback: str = "", log_pages: int = 6,
                 stage["holds"][why] = stage["holds"].get(why, 0) + 1
                 plan.holds[why] = plan.holds.get(why, 0) + 1
                 continue
-            if followups_only and touch == 1:
-                # Pass zero continues a record's sequence on the numbers that
-                # are in it; it never opens a new number mid-sequence.
+            if followups_only and touch == 1 and phone in grandfathered:
+                # Jeff, 2026-10-09: every good number that has never been texted
+                # gets touch 1, even on a record already mid-sequence. The
+                # numbers that were already skipped that way on 10/9 are left
+                # alone ("no need to go back and fix it").
                 continue
 
             built = seed.build([row], touch=touch, sender_fallback=sender_fallback)

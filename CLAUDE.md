@@ -1271,8 +1271,12 @@ the dry-run gate protects spend, not the CRM. Fails OPEN on missing data.
 Rejections are reported, never silently dropped.
 
 **Second gate, after enrichment (`src/post_enrich_gate.py`, 2026-09-25).** The
-user does not buy a property that is **MLS-listed, under 15% equity, or sold
-within the last 2 years** (3 until 2026-09-25). Those facts come from DataSift itself
+user does not buy a property that is **under 15% equity, or sold recently:
+within 3 years for foreclosure, 2 for probate** (foreclosure went 3 -> 2 on
+2026-09-25 and back to 3 on 2026-10-09, for all foreclosures). **MLS-listed is
+no longer an exclusion (2026-10-09):** a listed foreclosure is kept, traced,
+tagged `MLS Listed` (a tag, never a status), gets a Message Board post, and
+stays in the calling presets. Those facts come from DataSift itself
 (`mls`, `equity_percent`, `last_sold` — populated at create time), so this runs
 in `_create_records_for_batch()` after `upload_to_datasift()` and before any
 trace: failures are DELETED from the CRM, dropped from the uuid map, never
@@ -1284,8 +1288,8 @@ off-market reads `"Off Market"`). Equity is a snapshot: one record went
 14.81% -> 36.35% between enrichments. Not applied on the trace-only
 (`skip-trace` without `--create`) path.
 
-**Probate differs (user, 2026-10-08, "for now"):** MLS-listed is NOT excluded
-for probate (foreclosure still excludes it). Instead, probate excludes by
+**Probate differs (user, 2026-10-08, "for now"):** MLS is not checked for
+probate at all (no exclusion, no tag). Instead, probate excludes by
 DataSift's enriched `structure_type`: condos, mobile/manufactured homes, 3+
 units and non-residential use go; Single Family and Duplex pass; unknown or
 blank passes. "Residential-Vacant Land" is kept with a Message Board note,
@@ -1864,9 +1868,10 @@ rows out of that CSV yourself, or they get traced anyway.
 
 **The post-enrichment gate (2026-09-25) runs inside `--create`, so it
 applies to the dry run too.** Right after create + enrich it reads each record's
-`mls`, `equity_percent` and `last_sold`, and **deletes** any that is MLS-listed,
-under 15% equity, or sold within 2 years (see "Second gate, after enrichment"
-in the probate buy-box section for the full rules). The run log's `FAILS THE
+`mls`, `equity_percent` and `last_sold`, and **deletes** any that is under 15%
+equity or sold within 3 years; an MLS-listed one is kept and tagged
+`MLS Listed` (see "Second gate, after enrichment" in the probate buy-box
+section for the full rules). The run log's `FAILS THE
 BUY RULES AFTER ENRICHMENT` banner lists them. Those rows stay in the
 `datasift_ready_*.csv`, but the trace-only second step cannot bill them:
 `resolve_subjects()` finds no record and lists them as unresolved. On the
@@ -1874,8 +1879,27 @@ BUY RULES AFTER ENRICHMENT` banner lists them. Those rows stay in the
 still fail (Quick, Vivas, Fry, Alexander). **The user decided to KEEP them in
 the CRM (2026-09-25). Do not propose deleting them.** The gate is for new
 batches, not a cleanup tool for records already traced. Dana Miller no longer fails: a re-enrich moved her equity
-from 14.81% to 36.35%. Watkins no longer fails either: she sold 2024-09-20, just
-outside the 2-year window, and has 25.18% equity.
+from 14.81% to 36.35%. Watkins passed the 2-year window (sold 2024-09-20) and
+would fail the 3-year one; she is already traced and stays.
+
+**Two checks BEFORE creation, every foreclosure batch (2026-10-09,
+`src/foreclosure_checks.py`, built for the pre-July backpull).** Both free and
+read-only; probate does not run them.
+- **Already in the CRM -> skipped entirely.** No create, notes, board, tag or
+  trace. `find_property_by_address(street, strict=True)` with no city (petition
+  and CRM cities differ); a FAILED lookup holds the row rather than reading as
+  "not there". Re-checked after SiftMap rewords a street. A record the gate
+  deleted earlier reads as new, correctly. Live-checked on the 10/6 batch: the
+  6 kept records all caught, the 8 gate-deleted ones read new, gibberish
+  control new.
+- **County owner of record is not on the petition -> held for review.** The
+  Tulsa Assessor (address search is a loose word match, so the house number,
+  street and direction must agree and exactly one parcel survive) is compared
+  by SURNAME against Last Name, Co-Borrower Last Name, Co-Defendants, Owner
+  Status and Decedent Name. A mismatch usually means it sold since the filing.
+  Held rows go to `output/foreclosure_owner_review_<ts>.csv`; `Owner Confirmed`
+  = Yes in the batch sheet releases one. Fails open (no or 2+ parcels).
+  Tests: `tests/test_foreclosure_checks.py`.
 
 Each record ends up in the CRM, API-enriched, with grouped petition detail in
 Notes *and* Message Board, double skip traced, every number scored with a dial
@@ -1951,7 +1975,7 @@ petition PDF (scanned)
   -> wait_for_properties()           poll until indexed; retry ONLY the missing
   -> add_notes + post_message_board  full petition detail, both surfaces
   -> add_tags                        Courthouse Data, foreclosure, FTM
-  -> enrich + post_enrich_gate       DELETE MLS-listed / equity<15% / sold<2yr
+  -> enrich + post_enrich_gate       DELETE equity<15% / sold<3yr; MLS = tag
   -> tracerfy_skip_tracer            source 1   ~$0.02/record
   -> datasift submit_skip_trace      source 2   ~$0.12/owner, estimate-gated
   -> phone_validator.call_trestle    score ALL numbers  $0.015 each

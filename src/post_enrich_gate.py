@@ -2,11 +2,20 @@
 
 The user's rules (2026-09-23): he does NOT buy a property that is
 
-  1. **listed on the MLS**,
-  2. carrying **less than 15% equity**, or
-  3. **sold within the last 2 years** (was 3 until 2026-09-25; user widened the net).
+  1. carrying **less than 15% equity**, or
+  2. **sold recently**: within the last 3 years for foreclosure (user,
+     2026-10-09, all foreclosures from then on), 2 years for probate. The
+     foreclosure window was 3 until 2026-09-25, then 2, then back to 3.
 
 Such a record is deleted from the CRM and never skip traced.
+
+MLS-LISTED IS A FLAG, NOT AN EXCLUSION (user, 2026-10-09)
+--------------------------------------------------------
+Until 2026-10-09 a foreclosure that DataSift showed as listed was deleted.
+Now it is kept and traced like any other, gets the property tag
+`MLS Listed` (a TAG, never a status) and a Message Board post saying so, and
+stays in the calling presets. Applies to every foreclosure run, daily and the
+pre-July backpull alike. Probate never checked MLS and still does not flag it.
 
 PROBATE IS DIFFERENT (user, 2026-10-08)
 ---------------------------------------
@@ -75,7 +84,15 @@ from datetime import date, datetime
 logger = logging.getLogger(__name__)
 
 MIN_EQUITY_PERCENT = 15.0
-RECENT_SALE_YEARS = 2
+#: Sold within this many years = excluded. Foreclosure 3 (user, 2026-10-09),
+#: probate 2 (unchanged; scoped to foreclosure on purpose).
+RECENT_SALE_YEARS = {"foreclosure": 3, "probate": 2}
+
+MLS_TAG = "MLS Listed"
+
+
+def recent_sale_years(notice_type: str = "foreclosure") -> int:
+    return RECENT_SALE_YEARS.get(notice_type, RECENT_SALE_YEARS["foreclosure"])
 
 #: `mls` values that mean on the market. Only "listed" has been SEEN live
 #: (2026-09-25); the rest are the standard MLS statuses, excluded on the same
@@ -168,14 +185,8 @@ def check_property(prop: dict, *, today: date | None = None,
     if probate:
         reasons += _probate_type_reasons(prop)
 
-    mls = str(prop.get("mls") or "").strip().lower()
-    if probate:
-        pass                                # MLS is not a probate rule (2026-10-08)
-    elif mls in _ON_MARKET:
-        reasons.append(f"MLS-listed (mls = {prop.get('mls')!r})")
-    elif mls and mls not in _OFF_MARKET:
-        logger.info("post-enrich gate: unrecognised mls value %r - not excluding on it",
-                    prop.get("mls"))
+    # MLS is never an exclusion any more: foreclosure flags it (mls_listed()),
+    # probate ignores it.
 
     equity = prop.get("equity_percent")
     try:
@@ -185,11 +196,49 @@ def check_property(prop: dict, *, today: date | None = None,
     if eq is not None and eq < MIN_EQUITY_PERCENT:
         reasons.append(f"equity {eq:.2f}% is under {MIN_EQUITY_PERCENT:.0f}%")
 
+    years = recent_sale_years(notice_type)
     sold = _parse_date(prop.get("last_sold"))
-    if sold and sold > _years_before(today, RECENT_SALE_YEARS):
-        reasons.append(f"sold {sold.isoformat()}, within the last {RECENT_SALE_YEARS} years")
+    if sold and sold > _years_before(today, years):
+        reasons.append(f"sold {sold.isoformat()}, within the last {years} years")
 
     return reasons
+
+
+def mls_listed(prop: dict) -> bool:
+    """DataSift shows the property on the market. An unrecognised value is
+    logged and treated as not listed."""
+    mls = str(prop.get("mls") or "").strip().lower()
+    if mls in _ON_MARKET:
+        return True
+    if mls and mls not in _OFF_MARKET:
+        logger.info("post-enrich gate: unrecognised mls value %r - not flagged as listed",
+                    prop.get("mls"))
+    return False
+
+
+MLS_NOTE = (
+    "MLS LISTED: DataSift shows this property as {mls!r} on the MLS as of {day}. "
+    "Kept and traced. The owner may already be working with an agent, so ask "
+    "about the listing on the first call.")
+
+
+def _flag_mls(prop: dict, street: str, add_tags, post_board, today: date) -> None:
+    uuid = prop.get("uuid")
+    owner_uuid = (prop.get("owner") or {}).get("uuid")
+    logger.warning("post-enrich gate: %s is MLS-listed (mls = %r) - kept, tagged %r",
+                   street, prop.get("mls"), MLS_TAG)
+    if add_tags and uuid:
+        try:
+            add_tags(uuid, [MLS_TAG])
+        except Exception as e:                   # noqa: BLE001 - a flag, never a blocker
+            logger.warning("post-enrich gate: could not tag %s %r: %s", street, MLS_TAG, e)
+    if post_board and owner_uuid:
+        try:
+            post_board(owner_uuid, MLS_NOTE.format(mls=prop.get("mls"),
+                                                   day=today.isoformat()))
+        except Exception as e:                   # noqa: BLE001
+            logger.warning("post-enrich gate: could not post the MLS note for %s: %s",
+                           street, e)
 
 
 VACANT_LAND_NOTE = (
@@ -222,7 +271,7 @@ def _has_been_worked(prop: dict) -> bool:
 def apply_post_enrich_gate(rows: list[dict], *, find_property, get_property,
                            delete_property, forget_uuids=None,
                            today: date | None = None, notice_type: str = "foreclosure",
-                           post_board=None) -> tuple[list[dict], list[dict]]:
+                           post_board=None, add_tags=None) -> tuple[list[dict], list[dict]]:
     """Split created rows into (kept, excluded), deleting excluded records.
 
     `rows` are the property-template rows just created (`Property Street`,
@@ -237,7 +286,12 @@ def apply_post_enrich_gate(rows: list[dict], *, find_property, get_property,
 
     For probate, a KEPT record DataSift calls vacant land gets a Message Board
     note through `post_board(owner_uuid, text)` when that is given.
+
+    For foreclosure, a KEPT record DataSift shows as MLS-listed gets the
+    `MLS Listed` tag through `add_tags(uuid, [title])` and a board post, and
+    the row carries `_mls_listed = True` so the caller can report it.
     """
+    today = today or date.today()
     kept, excluded, deleted = [], [], []
     for r in rows:
         street = str(r.get("Property Street") or r.get("Property Street Address") or "").strip()
@@ -260,6 +314,9 @@ def apply_post_enrich_gate(rows: list[dict], *, find_property, get_property,
             kept.append(r)
             if notice_type == "probate" and vacant_land_flag(prop):
                 _note_vacant_land(prop, street, post_board)
+            if notice_type != "probate" and mls_listed(prop):
+                r["_mls_listed"] = True
+                _flag_mls(prop, street, add_tags, post_board, today)
             continue
 
         uuid = prop.get("uuid") or hit.get("uuid")
@@ -286,10 +343,10 @@ def apply_post_enrich_gate(rows: list[dict], *, find_property, get_property,
 def describe(notice_type: str = "foreclosure") -> str:
     if notice_type == "probate":
         return (f"Post-enrichment gate (probate): equity at least "
-                f"{MIN_EQUITY_PERCENT:.0f}%, not sold within the last {RECENT_SALE_YEARS} "
+                f"{MIN_EQUITY_PERCENT:.0f}%, not sold within the last {recent_sale_years('probate')} "
                 f"years, and not a condo, mobile home, 3+ units or non-residential "
                 f"(DataSift structure type). MLS-listed is allowed. Missing data never "
                 f"excludes.")
-    return (f"Post-enrichment gate: not MLS-listed, equity at least "
-            f"{MIN_EQUITY_PERCENT:.0f}%, not sold within the last {RECENT_SALE_YEARS} "
-            f"years. Missing data never excludes.")
+    return (f"Post-enrichment gate: equity at least {MIN_EQUITY_PERCENT:.0f}%, not sold "
+            f"within the last {recent_sale_years(notice_type)} years. MLS-listed is "
+            f"kept and tagged {MLS_TAG!r}. Missing data never excludes.")

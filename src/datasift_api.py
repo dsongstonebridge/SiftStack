@@ -436,7 +436,8 @@ def _bare_street(normalized: str) -> str:
     return _strip_suffix(_strip_dir(normalized))
 
 
-def find_property_by_address(street: str, city: str = "", state: str = "") -> dict | None:
+def find_property_by_address(street: str, city: str = "", state: str = "", *,
+                             strict: bool = False) -> dict | None:
     """Resolve one property by address, or None. Read-only — unlike the
     duplicate-400 trick, it never creates anything on a miss.
 
@@ -448,6 +449,10 @@ def find_property_by_address(street: str, city: str = "", state: str = "") -> di
 
     Checks both `property_type` buckets: "clean" first, then "incomplete",
     since a record whose address failed validation is invisible to the former.
+
+    `strict=True` re-raises a failed search instead of returning None. Use it
+    wherever "not found" lets something happen that a duplicate must never
+    get (the foreclosure CRM duplicate check): a failed search is not a miss.
     """
     if not street or not street.split():
         return None
@@ -459,6 +464,8 @@ def find_property_by_address(street: str, city: str = "", state: str = "") -> di
             results = search_by_address(house, property_type=ptype, limit=50)
         except DataSiftAPIError as e:
             logger.warning("search_by_address failed for %r: %s", house, e)
+            if strict:
+                raise
             return None
 
         def city_ok(addr):

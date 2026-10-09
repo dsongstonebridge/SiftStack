@@ -2086,6 +2086,77 @@ def _report_already_created(done: list[tuple[dict, dict]]) -> None:
     logging.info("")
 
 
+def _crm_duplicate_check(rows: list[dict]):
+    from datasift_api import find_property_by_address
+    from foreclosure_checks import crm_duplicate_check
+    return crm_duplicate_check(
+        rows, find_property=lambda street: find_property_by_address(street, "", "",
+                                                                   strict=True))
+
+
+def _report_crm_duplicates(dupes: list[dict], failed: list[dict]) -> None:
+    if dupes:
+        logging.warning("")
+        logging.warning("=== ALREADY IN THE CRM - SKIPPED ENTIRELY (%d) ===", len(dupes))
+        logging.warning("  Not created, no notes, no board post, no tag, never traced.")
+        for r in dupes:
+            logging.warning("  %s %s | %s | %s", r.get("Case Number") or "",
+                            r.get("Last Name") or "", r.get("Property Street") or "?",
+                            r["_dup_reason"])
+        logging.warning("")
+    if failed:
+        logging.warning("")
+        logging.warning("=== CRM DUPLICATE CHECK FAILED - HELD, NOT CREATED (%d) ===",
+                        len(failed))
+        for r in failed:
+            logging.warning("  %s | %s", r.get("Property Street") or "?", r["_dup_reason"])
+        logging.warning("  Re-run the same command to check them again.")
+        logging.warning("")
+
+
+def _foreclosure_precreate_checks(rows: list[dict], run_timer) -> list[dict]:
+    """Foreclosure only, before anything is created (user, 2026-10-09):
+    skip every row already in the CRM, and hold every row whose county owner
+    of record is not a party to the petition. See foreclosure_checks.py."""
+    from foreclosure_checks import owner_of_record_check, write_owner_review
+    from siftmap_address import parse_street
+    from tulsa_assessor import search_assessor
+
+    _t = run_timer.start("CRM duplicate check")
+    rows, dupes, failed = _crm_duplicate_check(rows)
+    run_timer.stop(_t)
+    _report_crm_duplicates(dupes, failed)
+    if not rows:
+        logging.error("Every row was already in the CRM (or could not be checked) - "
+                      "nothing to create.")
+        return []
+
+    _t = run_timer.start("owner of record check (Assessor)")
+    rows, held, unchecked = owner_of_record_check(rows, search=search_assessor,
+                                                  parse_street=parse_street)
+    run_timer.stop(_t)
+    if held:
+        sheet = write_owner_review(held, Path("output"))
+        logging.warning("")
+        logging.warning("=== OWNER OF RECORD IS NOT ON THE PETITION - HELD FOR REVIEW (%d) ===",
+                        len(held))
+        for r in held:
+            logging.warning("  %s %s %s | %s | county owner: %s",
+                            r.get("Case Number") or "", r.get("First Name") or "",
+                            r.get("Last Name") or "", r.get("Property Street") or "?",
+                            r["_owner_of_record"])
+        logging.warning("  Likely sold since the filing. Review %s; set Owner Confirmed = Yes "
+                        "in the batch sheet to create one anyway.", sheet)
+        logging.warning("")
+    if unchecked:
+        logging.info("Owner of record not checked for %d row(s) (kept): %s", len(unchecked),
+                     "; ".join(f"{r.get('Property Street')} ({r['_owner_note']})"
+                               for r in unchecked))
+    if not rows:
+        logging.error("Every remaining row is held for owner review - nothing to create.")
+    return rows
+
+
 def _create_fresh_rows(args, template_rows: list[dict], notice_type: str) -> dict | None:
     """The creating half of `_create_records_for_batch`: checks, gates, create,
     enrich, post-enrichment gate. Returns {"created", "no_trace", "excluded"}
@@ -2130,6 +2201,11 @@ def _create_fresh_rows(args, template_rows: list[dict], notice_type: str) -> dic
         _report_already_processed(repeats)
         if not template_rows:
             logging.error("Every row was already in the CRM - nothing to create.")
+            return None
+
+    if notice_type != "probate":
+        template_rows = _foreclosure_precreate_checks(template_rows, run_timer)
+        if not template_rows:
             return None
 
     from buy_box import apply_buy_box, describe as describe_buy_box
@@ -2199,8 +2275,24 @@ def _create_fresh_rows(args, template_rows: list[dict], notice_type: str) -> dic
     # the post-enrichment gate has nothing to screen. Free; never blocks a row.
     from siftmap_address import align_rows_to_siftmap
     _t = run_timer.start("SiftMap address wording")
-    align_rows_to_siftmap(template_rows)
+    aligned = align_rows_to_siftmap(template_rows)
     run_timer.stop(_t)
+
+    # A street SiftMap reworded is checked against the CRM again in its new
+    # wording, so a record stored that way is still caught as a duplicate.
+    if notice_type != "probate" and aligned.get("changed"):
+        reworded = {new for _, new in aligned["changed"]}
+        again = [r for r in template_rows if r.get("Property Street") in reworded]
+        if again:
+            keep, dupes, failed = _crm_duplicate_check(again)
+            _report_crm_duplicates(dupes, failed)
+            drop = {id(r) for r in again} - {id(r) for r in keep}
+            if drop:
+                template_rows = [r for r in template_rows if id(r) not in drop]
+                deceased = [r for r in deceased if id(r) not in drop]
+            if not template_rows:
+                logging.error("Every row was already in the CRM - nothing to create.")
+                return None
 
     # No trace results yet, by design -- see the docstring.
     datasift_csv = build_datasift_csv_from_template(
@@ -2238,15 +2330,15 @@ def _create_fresh_rows(args, template_rows: list[dict], notice_type: str) -> dic
             recorded = processed_cases.record_row(r, uuid=uuid)
             logging.info("ledger: recorded %s", ", ".join(recorded) or "(no case number)")
 
-    # ── POST-ENRICHMENT GATE: MLS-listed / equity < 15% / sold < 3 years ──
+    # ── POST-ENRICHMENT GATE: equity < 15% / sold recently; MLS = tag ────
     # Runs after create + enrich (the data comes from DataSift) and before any
     # billed trace. Failures are deleted from the CRM and never traced. After
     # the ledger on purpose: an excluded probate case must still count as
     # processed, or tomorrow's run creates it again.
     # Probate (2026-10-08): MLS-listed is allowed, and DataSift's structure
     # type excludes condos / mobile homes / 3+ units - see post_enrich_gate.
-    from datasift_api import (delete_property, find_property_by_address, get_property,
-                              post_message_board)
+    from datasift_api import (add_tags, delete_property, find_property_by_address,
+                              get_property, post_message_board)
     from datasift_uploader import forget_uuid_map_entries
     from post_enrich_gate import apply_post_enrich_gate, describe as describe_gate
 
@@ -2256,9 +2348,18 @@ def _create_fresh_rows(args, template_rows: list[dict], notice_type: str) -> dic
         template_rows, find_property=find_property_by_address,
         get_property=get_property, delete_property=delete_property,
         forget_uuids=forget_uuid_map_entries, notice_type=notice_type,
-        post_board=post_message_board)
+        post_board=post_message_board, add_tags=add_tags)
     run_timer.stop(_t)
     _report_post_enrich_exclusions(gated, describe_gate(notice_type))
+    listed = [r for r in template_rows if r.get("_mls_listed")]
+    if listed:
+        logging.warning("")
+        logging.warning("=== MLS-LISTED - KEPT, TAGGED 'MLS Listed', BOARD POST (%d) ===",
+                        len(listed))
+        for r in listed:
+            logging.warning("  %s %s | %s", r.get("First Name") or "",
+                            r.get("Last Name") or "", r.get("Property Street") or "?")
+        logging.warning("")
 
     # Identity, not equality: the gate returns kept rows as the same dicts and
     # excluded rows as copies, so "created but not kept" is what it excluded.

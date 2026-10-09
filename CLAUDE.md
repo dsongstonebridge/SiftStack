@@ -1273,10 +1273,12 @@ Rejections are reported, never silently dropped.
 **Second gate, after enrichment (`src/post_enrich_gate.py`, 2026-09-25).** The
 user does not buy a property that is **under 15% equity, or sold recently:
 within 3 years for foreclosure, 2 for probate** (foreclosure went 3 -> 2 on
-2026-09-25 and back to 3 on 2026-10-09, for all foreclosures). **MLS-listed is
-no longer an exclusion (2026-10-09):** a listed foreclosure is kept, traced,
-tagged `MLS Listed` (a tag, never a status), gets a Message Board post, and
-stays in the calling presets. Those facts come from DataSift itself
+2026-09-25 and back to 3 on 2026-10-09, for all foreclosures). **MLS-listed
+foreclosures are no longer deleted (2026-10-09):** the record stays, its lead
+status is set to `listed` (PATCH `status`, read back), it gets a Message Board
+post, and it is NEVER skip traced, so the user can work it with the listing
+agent. Every FTM call and mail preset already excludes status `listed`, so it
+stays out of the call queues with no preset change. Those facts come from DataSift itself
 (`mls`, `equity_percent`, `last_sold` — populated at create time), so this runs
 in `_create_records_for_batch()` after `upload_to_datasift()` and before any
 trace: failures are DELETED from the CRM, dropped from the uuid map, never
@@ -1869,8 +1871,8 @@ rows out of that CSV yourself, or they get traced anyway.
 **The post-enrichment gate (2026-09-25) runs inside `--create`, so it
 applies to the dry run too.** Right after create + enrich it reads each record's
 `mls`, `equity_percent` and `last_sold`, and **deletes** any that is under 15%
-equity or sold within 3 years; an MLS-listed one is kept and tagged
-`MLS Listed` (see "Second gate, after enrichment" in the probate buy-box
+equity or sold within 3 years; an MLS-listed one is kept, set to status
+`listed`, and never traced (see "Second gate, after enrichment" in the probate buy-box
 section for the full rules). The run log's `FAILS THE
 BUY RULES AFTER ENRICHMENT` banner lists them. Those rows stay in the
 `datasift_ready_*.csv`, but the trace-only second step cannot bill them:
@@ -1975,7 +1977,7 @@ petition PDF (scanned)
   -> wait_for_properties()           poll until indexed; retry ONLY the missing
   -> add_notes + post_message_board  full petition detail, both surfaces
   -> add_tags                        Courthouse Data, foreclosure, FTM
-  -> enrich + post_enrich_gate       DELETE equity<15% / sold<3yr; MLS = tag
+  -> enrich + post_enrich_gate       DELETE equity<15% / sold<3yr; MLS = status listed, no trace
   -> tracerfy_skip_tracer            source 1   ~$0.02/record
   -> datasift submit_skip_trace      source 2   ~$0.12/owner, estimate-gated
   -> phone_validator.call_trestle    score ALL numbers  $0.015 each

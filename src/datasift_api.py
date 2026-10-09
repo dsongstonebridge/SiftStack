@@ -874,6 +874,24 @@ def add_tags(property_uuid: str, tags: list[str]) -> dict:
     return result
 
 
+def set_property_status(property_uuid: str, status: str) -> dict:
+    """Set a property's lead status by its TITLE as the account lists it
+    (`GET /api/internal/status/`, e.g. "listed"), then read it back.
+    Same PATCH the SMS agent uses live (crm_standalone.update_status).
+    Raises DataSiftAPIError if the read-back does not show it."""
+    result = _request("PATCH", f"{CORE_BASE}/api/internal/property/{property_uuid}/",
+                      json_body={"status": status})
+    if _DRY_RUN:
+        return result
+    got = get_property(property_uuid).get("status")
+    if isinstance(got, dict):
+        got = got.get("title") or got.get("value") or got.get("name")
+    if str(got or "").strip().lower() != status.strip().lower():
+        raise DataSiftAPIError(f"status {status!r} did not land on {property_uuid} "
+                               f"(reads {got!r})")
+    return result
+
+
 def add_lists(property_uuid: str, lists: list[str]) -> dict:
     return _request("POST", f"{CORE_BASE}/api/internal/property/{property_uuid}/add-lists/",
                      json_body={"lists": lists})

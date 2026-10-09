@@ -9,13 +9,17 @@ The user's rules (2026-09-23): he does NOT buy a property that is
 
 Such a record is deleted from the CRM and never skip traced.
 
-MLS-LISTED IS A FLAG, NOT AN EXCLUSION (user, 2026-10-09)
---------------------------------------------------------
+MLS-LISTED: KEPT, STATUS "listed", NEVER TRACED (user, 2026-10-09)
+------------------------------------------------------------------
 Until 2026-10-09 a foreclosure that DataSift showed as listed was deleted.
-Now it is kept and traced like any other, gets the property tag
-`MLS Listed` (a TAG, never a status) and a Message Board post saying so, and
-stays in the calling presets. Applies to every foreclosure run, daily and the
-pre-July backpull alike. Probate never checked MLS and still does not flag it.
+Now it stays in the CRM so the user can follow up with the listing agent:
+its lead status is set to `listed`, it gets a Message Board post, and it is
+NEVER skip traced (no Tracerfy, DataSift trace or Trestle spend). Every FTM
+call and mail preset already excludes the `listed` status (read live
+2026-10-09), so it stays out of the calling queues with no preset change.
+(Earlier the same day the rule was briefly "tag MLS Listed, keep calling";
+superseded.) Applies to every foreclosure run, daily and the pre-July
+backpull alike. Probate never checked MLS and still does not.
 
 PROBATE IS DIFFERENT (user, 2026-10-08)
 ---------------------------------------
@@ -88,7 +92,8 @@ MIN_EQUITY_PERCENT = 15.0
 #: probate 2 (unchanged; scoped to foreclosure on purpose).
 RECENT_SALE_YEARS = {"foreclosure": 3, "probate": 2}
 
-MLS_TAG = "MLS Listed"
+#: Lead status a listed foreclosure gets. The account's own status TITLE.
+MLS_STATUS = "listed"
 
 
 def recent_sale_years(notice_type: str = "foreclosure") -> int:
@@ -218,20 +223,24 @@ def mls_listed(prop: dict) -> bool:
 
 MLS_NOTE = (
     "MLS LISTED: DataSift shows this property as {mls!r} on the MLS as of {day}. "
-    "Kept and traced. The owner may already be working with an agent, so ask "
-    "about the listing on the first call.")
+    "Status set to Listed. Not skip traced and kept out of the FTM call presets. "
+    "Follow up with the listing agent.")
 
 
-def _flag_mls(prop: dict, street: str, add_tags, post_board, today: date) -> None:
+def _flag_mls(prop: dict, street: str, set_status, post_board, today: date) -> str:
+    """Set status `listed` and post the board note. Returns "" or the error."""
     uuid = prop.get("uuid")
     owner_uuid = (prop.get("owner") or {}).get("uuid")
-    logger.warning("post-enrich gate: %s is MLS-listed (mls = %r) - kept, tagged %r",
-                   street, prop.get("mls"), MLS_TAG)
-    if add_tags and uuid:
+    logger.warning("post-enrich gate: %s is MLS-listed (mls = %r) - kept, status %r, "
+                   "not traced", street, prop.get("mls"), MLS_STATUS)
+    err = ""
+    if set_status and uuid:
         try:
-            add_tags(uuid, [MLS_TAG])
-        except Exception as e:                   # noqa: BLE001 - a flag, never a blocker
-            logger.warning("post-enrich gate: could not tag %s %r: %s", street, MLS_TAG, e)
+            set_status(uuid, MLS_STATUS)
+        except Exception as e:                   # noqa: BLE001 - still never traced
+            err = f"status not set: {e}"
+            logger.error("post-enrich gate: could not set %s to %r: %s", street,
+                         MLS_STATUS, e)
     if post_board and owner_uuid:
         try:
             post_board(owner_uuid, MLS_NOTE.format(mls=prop.get("mls"),
@@ -239,6 +248,7 @@ def _flag_mls(prop: dict, street: str, add_tags, post_board, today: date) -> Non
         except Exception as e:                   # noqa: BLE001
             logger.warning("post-enrich gate: could not post the MLS note for %s: %s",
                            street, e)
+    return err
 
 
 VACANT_LAND_NOTE = (
@@ -271,7 +281,7 @@ def _has_been_worked(prop: dict) -> bool:
 def apply_post_enrich_gate(rows: list[dict], *, find_property, get_property,
                            delete_property, forget_uuids=None,
                            today: date | None = None, notice_type: str = "foreclosure",
-                           post_board=None, add_tags=None) -> tuple[list[dict], list[dict]]:
+                           post_board=None, set_status=None) -> tuple[list[dict], list[dict]]:
     """Split created rows into (kept, excluded), deleting excluded records.
 
     `rows` are the property-template rows just created (`Property Street`,
@@ -287,9 +297,10 @@ def apply_post_enrich_gate(rows: list[dict], *, find_property, get_property,
     For probate, a KEPT record DataSift calls vacant land gets a Message Board
     note through `post_board(owner_uuid, text)` when that is given.
 
-    For foreclosure, a KEPT record DataSift shows as MLS-listed gets the
-    `MLS Listed` tag through `add_tags(uuid, [title])` and a board post, and
-    the row carries `_mls_listed = True` so the caller can report it.
+    For foreclosure, a record that passes but DataSift shows as MLS-listed
+    gets status `listed` through `set_status(uuid, title)` and a board post,
+    and is returned in `kept` carrying `_mls_listed = True`. The CALLER must
+    keep it out of the trace (main.py does).
     """
     today = today or date.today()
     kept, excluded, deleted = [], [], []
@@ -316,7 +327,7 @@ def apply_post_enrich_gate(rows: list[dict], *, find_property, get_property,
                 _note_vacant_land(prop, street, post_board)
             if notice_type != "probate" and mls_listed(prop):
                 r["_mls_listed"] = True
-                _flag_mls(prop, street, add_tags, post_board, today)
+                r["_mls_error"] = _flag_mls(prop, street, set_status, post_board, today)
             continue
 
         uuid = prop.get("uuid") or hit.get("uuid")
@@ -349,4 +360,5 @@ def describe(notice_type: str = "foreclosure") -> str:
                 f"excludes.")
     return (f"Post-enrichment gate: equity at least {MIN_EQUITY_PERCENT:.0f}%, not sold "
             f"within the last {recent_sale_years(notice_type)} years. MLS-listed is "
-            f"kept and tagged {MLS_TAG!r}. Missing data never excludes.")
+            f"kept with status {MLS_STATUS!r} and never traced. Missing data never "
+            f"excludes.")

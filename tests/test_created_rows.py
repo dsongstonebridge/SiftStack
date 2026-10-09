@@ -82,7 +82,8 @@ class ReRunTests(unittest.TestCase):
             self.addCleanup(p.stop)
         self.uploads: list[list[str]] = []
 
-    def _run(self, rows, *, findings=(), gate_out=(), args=None, probate_lookup=None):
+    def _run(self, rows, *, findings=(), gate_out=(), args=None, probate_lookup=None,
+             listed=()):
         """One `--create`. `gate_out` = last names the post-enrichment gate removes."""
         rows = [dict(r) for r in rows]          # a fresh read of the file each run
         built: list[list[dict]] = []
@@ -103,6 +104,9 @@ class ReRunTests(unittest.TestCase):
 
         def fake_gate(rs, **kw):
             kept = [r for r in rs if r["Last Name"] not in gate_out]
+            for r in kept:
+                if r["Last Name"] in listed:
+                    r["_mls_listed"] = True
             out = [{**r, "_gate_reasons": ["x"], "_gate_uuid": "u", "_gate_action": "deleted"}
                    for r in rs if r["Last Name"] in gate_out]
             return kept, out
@@ -137,6 +141,17 @@ class ReRunTests(unittest.TestCase):
         ledger = created_rows.load()
         statuses = sorted(e["status"] for e in ledger.values())
         self.assertEqual(statuses, ["excluded", "no_trace", "trace"])
+
+    def test_mls_listed_is_created_but_never_traced(self):
+        rows = [_row(1), _row(2)]
+        out = self._run(rows, listed=("Owner2",))
+        self.assertEqual([r["last"] for r in out], ["Owner1"])
+        self.assertEqual(self.uploads, [["Owner1", "Owner2"]])
+        self.assertEqual(sorted(e["status"] for e in created_rows.load().values()),
+                         ["listed", "trace"])
+        again = self._run(rows, listed=("Owner2",))
+        self.assertEqual([r["last"] for r in again], ["Owner1"])
+        self.assertEqual(len(self.uploads), 1)
 
     def test_rerun_creates_nothing_and_posts_nothing(self):
         rows = [_row(1), _row(2, **{"Owner Alive": "No"}), _row(3)]

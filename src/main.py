@@ -2053,8 +2053,10 @@ def _create_records_for_batch(args, csv_path: Path) -> list[dict] | None:
             entries = []
             excluded = {id(r) for r in outcome["excluded"]}
             no_trace = {id(r) for r in outcome["no_trace"]}
+            listed = {id(r) for r in outcome.get("listed", [])}
             for r in outcome["created"]:
                 status = ("excluded" if id(r) in excluded
+                          else "listed" if id(r) in listed
                           else "no_trace" if id(r) in no_trace else "trace")
                 tr = _trace_row(r) if status == "trace" else None
                 if tr:
@@ -2078,7 +2080,8 @@ def _report_already_created(done: list[tuple[dict, dict]]) -> None:
                  "notes and board not re-posted ===", len(done))
     what = {"trace": "goes straight to the trace",
             "no_trace": "Owner Alive = No, never traced",
-            "excluded": "removed by the post-enrichment gate, never traced"}
+            "excluded": "removed by the post-enrichment gate, never traced",
+            "listed": "MLS-listed, status listed, never traced"}
     for _, e in done:
         logging.info("  %s | created %s | %s", e.get("label") or "?",
                      e.get("recorded") or "?", what.get(e.get("status"), e.get("status")))
@@ -2330,15 +2333,15 @@ def _create_fresh_rows(args, template_rows: list[dict], notice_type: str) -> dic
             recorded = processed_cases.record_row(r, uuid=uuid)
             logging.info("ledger: recorded %s", ", ".join(recorded) or "(no case number)")
 
-    # ── POST-ENRICHMENT GATE: equity < 15% / sold recently; MLS = tag ────
+    # ── POST-ENRICHMENT GATE: equity < 15% / sold recently; MLS = status ─
     # Runs after create + enrich (the data comes from DataSift) and before any
     # billed trace. Failures are deleted from the CRM and never traced. After
     # the ledger on purpose: an excluded probate case must still count as
     # processed, or tomorrow's run creates it again.
     # Probate (2026-10-08): MLS-listed is allowed, and DataSift's structure
     # type excludes condos / mobile homes / 3+ units - see post_enrich_gate.
-    from datasift_api import (add_tags, delete_property, find_property_by_address,
-                              get_property, post_message_board)
+    from datasift_api import (delete_property, find_property_by_address, get_property,
+                              post_message_board, set_property_status)
     from datasift_uploader import forget_uuid_map_entries
     from post_enrich_gate import apply_post_enrich_gate, describe as describe_gate
 
@@ -2348,27 +2351,30 @@ def _create_fresh_rows(args, template_rows: list[dict], notice_type: str) -> dic
         template_rows, find_property=find_property_by_address,
         get_property=get_property, delete_property=delete_property,
         forget_uuids=forget_uuid_map_entries, notice_type=notice_type,
-        post_board=post_message_board, add_tags=add_tags)
+        post_board=post_message_board, set_status=set_property_status)
     run_timer.stop(_t)
     _report_post_enrich_exclusions(gated, describe_gate(notice_type))
     listed = [r for r in template_rows if r.get("_mls_listed")]
     if listed:
         logging.warning("")
-        logging.warning("=== MLS-LISTED - KEPT, TAGGED 'MLS Listed', BOARD POST (%d) ===",
+        logging.warning("=== MLS-LISTED - KEPT, STATUS 'listed', NOT TRACED (%d) ===",
                         len(listed))
         for r in listed:
-            logging.warning("  %s %s | %s", r.get("First Name") or "",
-                            r.get("Last Name") or "", r.get("Property Street") or "?")
+            logging.warning("  %s %s | %s%s", r.get("First Name") or "",
+                            r.get("Last Name") or "", r.get("Property Street") or "?",
+                            f" | {r['_mls_error']}" if r.get("_mls_error") else "")
         logging.warning("")
 
     # Identity, not equality: the gate returns kept rows as the same dicts and
     # excluded rows as copies, so "created but not kept" is what it excluded.
     kept_ids = {id(r) for r in template_rows}
+    listed_ids = {id(r) for r in listed}
     return {
         "created": created,
         "excluded": [r for r in created if id(r) not in kept_ids],
         "no_trace": [r for r in created
                      if id(r) in kept_ids and id(r) in {id(d) for d in deceased}],
+        "listed": [r for r in created if id(r) in listed_ids],
     }
 
 

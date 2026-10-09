@@ -13,7 +13,7 @@ from datetime import date
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from post_enrich_gate import (MLS_TAG, apply_post_enrich_gate, check_property,  # noqa: E402
+from post_enrich_gate import (MLS_STATUS, apply_post_enrich_gate, check_property,  # noqa: E402
                               mls_listed)
 
 TODAY = date(2026, 9, 25)
@@ -188,16 +188,17 @@ class MlsFlag(unittest.TestCase):
             delete_property=lambda u: self.fail("must not delete"),
             today=TODAY, notice_type=nt,
             post_board=lambda o, m: posts.append((o, m)),
-            add_tags=lambda u, t: tags.append((u, t)))
+            set_status=lambda u, t: tags.append((u, t)))
         return kept, excluded, tags, posts
 
-    def test_listed_foreclosure_kept_tagged_and_posted(self):
+    def test_listed_foreclosure_kept_status_listed_and_posted(self):
         kept, excluded, tags, posts = self.run_one(prop("n", "88.50", None, mls="Listed"))
         self.assertEqual(len(kept), 1)
         self.assertTrue(kept[0]["_mls_listed"])
         self.assertEqual(excluded, [])
-        self.assertEqual(tags, [("n", [MLS_TAG])])
-        self.assertEqual(MLS_TAG, "MLS Listed")
+        self.assertEqual(tags, [("n", MLS_STATUS)])
+        self.assertEqual(MLS_STATUS, "listed")
+        self.assertEqual(kept[0]["_mls_error"], "")
         self.assertEqual(posts[0][0], "own-1")
         self.assertIn("MLS LISTED", posts[0][1])
 
@@ -216,6 +217,22 @@ class MlsFlag(unittest.TestCase):
     def test_probate_is_never_flagged(self):
         _, _, tags, posts = self.run_one(prop("n", "88.50", None, mls="Listed"), "probate")
         self.assertEqual((tags, posts), ([], []))
+
+
+class MlsStatusFailure(unittest.TestCase):
+    def test_failed_status_is_reported_and_row_still_flagged(self):
+        p = prop("n", "88.50", None, mls="Listed")
+        p["owner"]["uuid"] = "own-1"
+
+        def boom(u, t):
+            raise RuntimeError("400")
+        kept, _ = apply_post_enrich_gate(
+            [{"Property Street": "1 A St", "Property City": "Tulsa"}],
+            find_property=lambda *a: {"uuid": "n"}, get_property=lambda u: p,
+            delete_property=lambda u: self.fail("must not delete"),
+            today=TODAY, post_board=lambda o, m: None, set_status=boom)
+        self.assertTrue(kept[0]["_mls_listed"])
+        self.assertIn("400", kept[0]["_mls_error"])
 
 
 if __name__ == "__main__":

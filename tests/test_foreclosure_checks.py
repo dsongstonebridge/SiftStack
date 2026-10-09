@@ -120,5 +120,77 @@ class OwnerOfRecord(unittest.TestCase):
         self.assertEqual((len(go), held, len(unchecked)), (1, [], 1))
 
 
+class BackfillOwnership(unittest.TestCase):
+    """--backfill: owner of record + deeds since filing, unchecked = held."""
+
+    def check(self, rows, search, history=(), hold_unchecked=True):
+        with mock.patch.object(fc.time, "sleep"):
+            return fc.owner_of_record_check(
+                rows, search=search, parse_street=parse_street,
+                sales_history=lambda acct: list(history), hold_unchecked=hold_unchecked)
+
+    SEARCH = staticmethod(assessor(("R1", "100 E MAIN ST", "SMITH, PAT")))
+
+    def test_sheriff_deed_after_filing_is_held(self):
+        r = row("100 E Main St", **{"Date Foreclosure Filed": "03/14/2025"})
+        go, held, _ = self.check([r], self.SEARCH, history=[
+            {"sale_date": "11/2/2025", "grantor": "SMITH, PAT", "deed_type": "Sheriff's Deed",
+             "grantee": "LAKEVIEW LOAN SERVICING LLC", "sale_price": 150000},
+            {"sale_date": "6/1/2015", "grantor": "JONES, A", "grantee": "SMITH, PAT",
+             "deed_type": "Warranty Deed", "sale_price": 120000}])
+        self.assertEqual(go, [])
+        self.assertIn("Sheriff's Deed", held[0]["_hold_reason"])
+        self.assertNotIn("2015", held[0]["_hold_reason"])
+
+    def test_only_older_deeds_goes_on(self):
+        from datetime import datetime
+        r = row("100 E Main St", **{"Date Foreclosure Filed": datetime(2025, 3, 14)})
+        go, held, _ = self.check([r], self.SEARCH, history=[
+            {"sale_date": "6/1/2015", "grantor": "JONES, A", "grantee": "SMITH, PAT"}])
+        self.assertEqual((len(go), held), (1, []))
+
+    def test_deed_on_the_filing_day_counts(self):
+        r = row("100 E Main St", **{"Date Foreclosure Filed": "2025-03-14"})
+        _, held, _ = self.check([r], self.SEARCH, history=[
+            {"sale_date": "3/14/2025", "grantor": "SMITH, PAT", "grantee": "X LLC"}])
+        self.assertEqual(len(held), 1)
+
+    def test_street_type_breaks_a_tie(self):
+        # Live 2026-10-09: two parcels at 3431 S 116th, a Place and an Avenue.
+        search = assessor(
+            ("R74905942000600", "3431 S 116 PL E", "GUZMAN, ABIMAEL CORREA & JOHANNA SALAZAR CEDENO"),
+            ("R74905942000710", "3431 S 116 AV E", "MCCLENDON PROPERTIES LLC 116TH STREET SERIES"))
+        go, held, _ = self.check([row("3431 S 116th Place", last="Correa Guzman")], search)
+        self.assertEqual((len(go), held), (1, []))
+        _, held, _ = self.check([row("3431 S 116th E Ave", last="Correa Guzman")], search)
+        self.assertIn("not on the petition", held[0]["_hold_reason"])
+
+    def test_unchecked_is_held_in_backfill(self):
+        go, held, unchecked = self.check([row("100 E Main St")], assessor())
+        self.assertEqual((go, len(held), len(unchecked)), ([], 1, 1))
+        self.assertIn("could not check", held[0]["_hold_reason"])
+
+    def test_owner_mismatch_reason(self):
+        _, held, _ = self.check([row("100 E Main St", last="Jones")], self.SEARCH)
+        self.assertIn("not on the petition", held[0]["_hold_reason"])
+
+
+class OnlyOnBackfill(unittest.TestCase):
+    def test_daily_run_never_touches_the_assessor(self):
+        import main
+        with mock.patch("main._crm_duplicate_check", side_effect=lambda rs: (rs, [], [])),              mock.patch("tulsa_assessor.search_assessor",
+                        side_effect=AssertionError("daily must not hit the Assessor")):
+            out = main._foreclosure_precreate_checks([row("100 E Main St")], mock.Mock())
+        self.assertEqual(len(out), 1)
+
+    def test_backfill_runs_it(self):
+        import main
+        with mock.patch("main._crm_duplicate_check", side_effect=lambda rs: (rs, [], [])),              mock.patch("tulsa_assessor.search_assessor", return_value=[]) as s,              mock.patch.object(fc.time, "sleep"),              mock.patch("foreclosure_checks.write_owner_review", return_value="r.csv"):
+            out = main._foreclosure_precreate_checks([row("100 E Main St")], mock.Mock(),
+                                                     backfill=True)
+        self.assertTrue(s.called)
+        self.assertEqual(out, [])
+
+
 if __name__ == "__main__":
     unittest.main()

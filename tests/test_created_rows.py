@@ -123,7 +123,7 @@ class ReRunTests(unittest.TestCase):
             mock.patch("post_enrich_gate.apply_post_enrich_gate", side_effect=fake_gate),
             mock.patch("datasift_api.find_property_by_address", return_value={"uuid": "U"}),
             mock.patch("main._enrich_probate_rows", side_effect=probate_lookup or (lambda rs: rs)),
-            mock.patch("main._foreclosure_precreate_checks", side_effect=lambda rs, t: rs),
+            mock.patch("main._foreclosure_precreate_checks", side_effect=lambda rs, t, **kw: rs),
             mock.patch("processed_cases.crm_check_rows", side_effect=lambda rs, f, g: (rs, [])),
         ]
         for p in patches:

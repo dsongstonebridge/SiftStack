@@ -2117,13 +2117,16 @@ def _report_crm_duplicates(dupes: list[dict], failed: list[dict]) -> None:
         logging.warning("")
 
 
-def _foreclosure_precreate_checks(rows: list[dict], run_timer) -> list[dict]:
+def _foreclosure_precreate_checks(rows: list[dict], run_timer, *,
+                                  backfill: bool = False) -> list[dict]:
     """Foreclosure only, before anything is created (user, 2026-10-09):
-    skip every row already in the CRM, and hold every row whose county owner
-    of record is not a party to the petition. See foreclosure_checks.py."""
+    skip every row already in the CRM (every batch). With `--backfill`, also
+    run the Assessor ownership check on every row: hold it when the owner of
+    record is not a party to the petition, a deed was recorded since the
+    filing, or the parcel cannot be checked. See foreclosure_checks.py."""
     from foreclosure_checks import owner_of_record_check, write_owner_review
     from siftmap_address import parse_street
-    from tulsa_assessor import search_assessor
+    from tulsa_assessor import get_parcel_sales_history, search_assessor
 
     _t = run_timer.start("CRM duplicate check")
     rows, dupes, failed = _crm_duplicate_check(rows)
@@ -2134,29 +2137,33 @@ def _foreclosure_precreate_checks(rows: list[dict], run_timer) -> list[dict]:
                       "nothing to create.")
         return []
 
-    _t = run_timer.start("owner of record check (Assessor)")
-    rows, held, unchecked = owner_of_record_check(rows, search=search_assessor,
-                                                  parse_street=parse_street)
+    if not backfill:
+        return rows
+
+    logging.info("BACKFILL: Assessor ownership check on %d row(s) (owner of record + "
+                 "deeds since filing)", len(rows))
+    _t = run_timer.start("Assessor ownership check (backfill)")
+    rows, held, unchecked = owner_of_record_check(
+        rows, search=search_assessor, parse_street=parse_street,
+        sales_history=get_parcel_sales_history, hold_unchecked=True)
     run_timer.stop(_t)
     if held:
         sheet = write_owner_review(held, Path("output"))
         logging.warning("")
-        logging.warning("=== OWNER OF RECORD IS NOT ON THE PETITION - HELD FOR REVIEW (%d) ===",
+        logging.warning("=== ASSESSOR OWNERSHIP CHECK - HELD FOR REVIEW, NOT CREATED (%d) ===",
                         len(held))
         for r in held:
-            logging.warning("  %s %s %s | %s | county owner: %s",
-                            r.get("Case Number") or "", r.get("First Name") or "",
-                            r.get("Last Name") or "", r.get("Property Street") or "?",
-                            r["_owner_of_record"])
-        logging.warning("  Likely sold since the filing. Review %s; set Owner Confirmed = Yes "
-                        "in the batch sheet to create one anyway.", sheet)
+            logging.warning("  %s %s %s | %s", r.get("Case Number") or "",
+                            r.get("First Name") or "", r.get("Last Name") or "",
+                            r.get("Property Street") or "?")
+            logging.warning("      %s%s", r["_hold_reason"],
+                            f" | county owner: {r['_owner_of_record']}"
+                            if r.get("_owner_of_record") else "")
+        logging.warning("  Review %s; set Owner Confirmed = Yes in the batch sheet to "
+                        "create one anyway.", sheet)
         logging.warning("")
-    if unchecked:
-        logging.info("Owner of record not checked for %d row(s) (kept): %s", len(unchecked),
-                     "; ".join(f"{r.get('Property Street')} ({r['_owner_note']})"
-                               for r in unchecked))
     if not rows:
-        logging.error("Every remaining row is held for owner review - nothing to create.")
+        logging.error("Every remaining row is held for ownership review - nothing to create.")
     return rows
 
 
@@ -2207,7 +2214,8 @@ def _create_fresh_rows(args, template_rows: list[dict], notice_type: str) -> dic
             return None
 
     if notice_type != "probate":
-        template_rows = _foreclosure_precreate_checks(template_rows, run_timer)
+        template_rows = _foreclosure_precreate_checks(
+            template_rows, run_timer, backfill=getattr(args, "backfill", False))
         if not template_rows:
             return None
 
@@ -3345,6 +3353,15 @@ def cli_main() -> None:
               "(tag 'Tracerfy Skipped' or DataSift skiptraced). Off by default: a "
               "repeat bills twice and stamps 'Pre-existing' beside every number's "
               "true source tag, permanently."),
+    )
+    parser.add_argument(
+        "--backfill", action="store_true",
+        help=("skip-trace --create, foreclosure: this batch is a BACKFILL of old "
+              "filings. Adds the Tulsa Assessor ownership check before anything "
+              "is created: a row is held for review when the owner of record is "
+              "not on the petition, a deed was recorded since the filing date "
+              "(e.g. sheriff's deed), or the parcel cannot be pinned down. Free. "
+              "Not used on daily (recent) runs."),
     )
     parser.add_argument(
         "--recreate", action="store_true",

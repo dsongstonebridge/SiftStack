@@ -65,7 +65,7 @@ class PerRowGateTests(unittest.TestCase):
             return "fake.csv"
 
         with mock.patch("main._read_property_template", return_value=self.rows), \
-             mock.patch("main._foreclosure_precreate_checks", side_effect=lambda rs, t: rs), \
+             mock.patch("main._foreclosure_precreate_checks", side_effect=lambda rs, t, **kw: rs), \
              mock.patch("siftmap_address.align_rows_to_siftmap", return_value={}), \
              mock.patch("buy_box.apply_buy_box", return_value=(self.rows, [])), \
              mock.patch("batch_review.review_batch", return_value=findings), \

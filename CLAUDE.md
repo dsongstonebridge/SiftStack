@@ -1884,9 +1884,8 @@ batches, not a cleanup tool for records already traced. Dana Miller no longer fa
 from 14.81% to 36.35%. Watkins passed the 2-year window (sold 2024-09-20) and
 would fail the 3-year one; she is already traced and stays.
 
-**Two checks BEFORE creation, every foreclosure batch (2026-10-09,
-`src/foreclosure_checks.py`, built for the pre-July backpull).** Both free and
-read-only; probate does not run them.
+**Checks BEFORE creation (2026-10-09, `src/foreclosure_checks.py`, built for
+the pre-July backfill).** Free and read-only; probate does not run them.
 - **Already in the CRM -> skipped entirely.** No create, notes, board, tag or
   trace. `find_property_by_address(street, strict=True)` with no city (petition
   and CRM cities differ); a FAILED lookup holds the row rather than reading as
@@ -1894,13 +1893,23 @@ read-only; probate does not run them.
   deleted earlier reads as new, correctly. Live-checked on the 10/6 batch: the
   6 kept records all caught, the 8 gate-deleted ones read new, gibberish
   control new.
-- **County owner of record is not on the petition -> held for review.** The
-  Tulsa Assessor (address search is a loose word match, so the house number,
-  street and direction must agree and exactly one parcel survive) is compared
-  by SURNAME against Last Name, Co-Borrower Last Name, Co-Defendants, Owner
-  Status and Decedent Name. A mismatch usually means it sold since the filing.
-  Held rows go to `output/foreclosure_owner_review_<ts>.csv`; `Owner Confirmed`
-  = Yes in the batch sheet releases one. Fails open (no or 2+ parcels).
+  Runs on every foreclosure batch.
+- **Assessor ownership check: BACKFILL ONLY, `--backfill`.** User rule: daily
+  (recent) runs skip it; **whenever the user says the batch is a backfill of
+  old foreclosures, add `--backfill` to the `skip-trace --create` command**
+  (dry run and `--commit` alike). OSCN dockets on old cases often don't say
+  whether it went to sheriff sale or changed hands, so every row's parcel is
+  read off the Tulsa Assessor and the row is HELD (not created) when: the
+  owner of record shares no SURNAME with Last Name / Co-Borrower Last Name /
+  Co-Defendants / Owner Status / Decedent Name; the parcel's Sales/Documents
+  table has a deed dated on or after `Date Foreclosure Filed`; or the parcel
+  can't be pinned down (the address search is a loose word match, so house
+  number, street and direction must agree and one parcel survive, street type
+  breaking ties like 116th Pl vs 116th Av). Held rows go to
+  `output/foreclosure_owner_review_<ts>.csv` with a Why Held column;
+  `Owner Confirmed` = Yes in the batch sheet releases one. Live-checked on the
+  10/6 batch: 14 of 14 matched their defendants, no deeds since filing, and a
+  filed-in-2000 control flagged deeds on all 12 parcels with history.
   Tests: `tests/test_foreclosure_checks.py`.
 
 Each record ends up in the CRM, API-enriched, with grouped petition detail in

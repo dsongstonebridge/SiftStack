@@ -72,5 +72,32 @@ check("8 AM start stops at 7 PM same day", st == datetime(2026, 10, 10, 0, 0, tz
 st = worker._stop_time(datetime(2026, 10, 10, 1, 0, tzinfo=timezone.utc))  # 8 PM CDT
 check("evening start stops 7 AM next day", st == datetime(2026, 10, 10, 12, 0, tzinfo=timezone.utc))
 
+# --- delivery check (Jeff, 2026-10-09) ----------------------------------------
+from sms_agent import delivery, escalate  # noqa: E402
+
+posted = []
+escalate.alert = lambda title, detail="", **k: posted.append((title, detail)) or True
+def fake_rows(*_a, **_k):
+    rows = [{"id": 1000 + i, "direction": "outbound", "fromNum": "+19180000000",
+             "toNum": f"+1918555{1000 + i}", "delivery_status": "undelivered", "delivery_code": "30007",
+             "content": f"Hey Name{i}! I hope I&#039;m not being a bother. I&#039;m interested in {100 + i} S Main St"}
+            for i in range(3)]
+    rows.append({"id": 2000, "direction": "outbound", "fromNum": "+19180000000", "toNum": "+19185552000",
+                 "delivery_status": "undelivered", "delivery_code": "30006", "content": "Hi there"})
+    rows.append({"id": 3000, "direction": "outbound", "fromNum": "+19180000000", "toNum": "+19185553000",
+                 "delivery_status": "delivered", "delivery_code": None, "content": "Hi"})
+    return rows
+delivery._fetch = fake_rows
+r1 = delivery.run()
+check("undelivered texts recorded (delivered ignored)", r1.get("new_failures") == 4)
+check("one #SMS post listing them", len(posted) == 1 and "4 text(s) NOT delivered" in posted[0][1])
+check("same wording with different names counts together, alarm fires",
+      "WORDING BLOCKED AS SPAM 3x" in posted[0][1])
+check("carrier says landline -> do-not-text list", bool(store.is_suppressed("9185552000")))
+r2 = delivery.run()
+check("same failures are not reported twice", r2.get("new_failures") == 0 and len(posted) == 1)
+check("retired spam wording is gone from the touch pools",
+      not any("not being a bother" in t for pool in campaign.touches.POOLS for lst in pool for t in lst))
+
 print("FAILURES:", fails)
 sys.exit(1 if fails else 0)

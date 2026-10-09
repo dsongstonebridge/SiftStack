@@ -431,6 +431,19 @@ def _reconcile_pass(result: dict, with_reconcile: bool) -> None:
             except Exception:  # noqa: BLE001 - never let the backstop stop the loop
                 log.exception("reconcile pass failed")
 
+            # Did the texts actually arrive? (Jeff, 2026-10-09: a wording carriers
+            # blocked as spam went out for days while every report said "sent".)
+            try:
+                from . import delivery
+
+                dl = delivery.run(pages=2)
+                if dl.get("new_failures"):
+                    result["undelivered"] = dl["new_failures"]
+                elif dl.get("error"):
+                    log.warning("delivery check failed: %s", dl["error"])
+            except Exception:  # noqa: BLE001 - never let the backstop stop the loop
+                log.exception("delivery pass failed")
+
             # The dialer is how this team mostly works, and a connected call
             # emits no SMS event at all. Same cadence, same session, same
             # failure mode if it is missing: an automated text landing hours

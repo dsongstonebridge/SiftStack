@@ -92,7 +92,7 @@ No-name versions:
 ### Touch 3: soft ask (send before call attempt 3)
 
 - Hi {first}, {sender} again about {addr}. If it's yours, have you ever thought about selling it? No pressure at all, just curious!
-- Hey {first}! I hope I'm not being a bother. I'm interested in {addr} and would love to ask you a couple quick questions. Would a short call work?
+<!-- REMOVED 2026-10-09: "I hope I'm not being a bother ... Would a short call work?" was blocked by carriers as spam (30007) 16 of 19 times. -->
 - Hi {first}, this is {sender}. I work with homeowners in {city} and I'd love to chat about {addr} for a minute or two. Would you be open to that?
 - Hey {first}, me again! If you've ever considered an offer on {addr}, I'd love to be the one you talk to first. Can I give you a quick call?
 

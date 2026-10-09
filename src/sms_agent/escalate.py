@@ -25,7 +25,7 @@ log = logging.getLogger(__name__)
 # The only alert kinds allowed to reach the channel. A live seller, and the
 # daily campaign summary that was explicitly asked for. Everything else is
 # bookkeeping and belongs in the digest.
-ALWAYS_POST = {"handoff", "campaign", "sensitive"}
+ALWAYS_POST = {"handoff", "campaign", "sensitive", "delivery"}  # delivery: Jeff 2026-10-09
 
 RECORD_URL = "https://app.reisift.io/records/properties/{uuid}/details"
 

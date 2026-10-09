@@ -1964,6 +1964,11 @@ def _trace_row(r: dict) -> dict | None:
     }
     co_first = (r.get("Co-Borrower First Name") or r.get("co_borrower_first") or "").strip()
     co_last = (r.get("Co-Borrower Last Name") or r.get("co_borrower_last") or "").strip()
+    from datasift_formatter import is_known_judge
+    if co_first and co_last and is_known_judge(f"{co_first} {co_last}"):
+        logger.warning("Co-borrower %s %s is the assigned judge, not a party - "
+                       "not traced (%s)", co_first, co_last, street)
+        co_first = co_last = ""
     if co_first and co_last:
         row["co_borrower_first"] = co_first
         row["co_borrower_last"] = co_last

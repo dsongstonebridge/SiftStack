@@ -39,7 +39,7 @@ decision on a foreclosure lead. Pull these too:
 | Case Number | From the caption near the file-stamp. |
 | Court County | The district court county named in the caption. |
 | Plaintiff | The lender/servicer bringing the action, from the caption. |
-| Co-Defendants | Every other named defendant besides the borrower and the generic "Spouse of"/"Occupants" entries. |
+| Co-Defendants | Every other named defendant besides the borrower and the generic "Spouse of"/"Occupants" entries. **Never include the assigned judge.** Tulsa County stamps the judge's name in the caption, usually right after "Defendants." or beside the last defendant and just above "PETITION FOR FORECLOSURE" (e.g. "TRACY L. PRIDDY", Civil Docket A). It is not a party: it appears on every case on that docket, so a name that repeats across unrelated petitions in that spot is the judge. Only names in the defendant list itself count. |
 | Original Lender | The payee the note was delivered to in paragraph 3 — often NOT the plaintiff, because the loan was assigned. |
 | Initial Interest Rate | The rate in paragraph 3 at origination, distinct from the current rate in the "there is now due" paragraph. Record both; a large gap between them is itself a signal. |
 | Original Monthly Payment | The "payable in monthly installments of $X" figure in paragraph 3. |

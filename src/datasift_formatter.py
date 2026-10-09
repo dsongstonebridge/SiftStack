@@ -1164,6 +1164,35 @@ _NOTES_SECTION_SETS: dict[str, tuple[str, list[tuple[str, list[str]]]]] = {
 _PETITION_INFO_FIELDS = [f for _, fields in _PETITION_SECTIONS for f in fields]
 
 
+#: Judges whose name the court stamps in the petition caption, right beside the
+#: defendant list. OCR flattens the stamp onto the "Defendants." line, so it has
+#: been read as a co-defendant (Tracy L. Priddy, Civil Docket A, on the
+#: 2026-08-27 and 2026-08-31 boards). Stored as (first, last), lowercase; middle
+#: initials are ignored. Add a name here when another judge turns up.
+KNOWN_JUDGES = {("tracy", "priddy")}
+
+
+def is_known_judge(name: str) -> bool:
+    """True when `name` is a judge in KNOWN_JUDGES (first + last token match,
+    any middle initial, any case, "LAST, FIRST" order accepted)."""
+    raw = (name or "").strip().lower()
+    if "," in raw:
+        last, _, first = raw.partition(",")
+        raw = f"{first} {last}"
+    tokens = [t.strip(".") for t in raw.replace(".", ". ").split() if t.strip(".")]
+    if len(tokens) < 2:
+        return False
+    return (tokens[0], tokens[-1]) in KNOWN_JUDGES
+
+
+def _drop_judges(value) -> str:
+    """Remove judge names from a ';'-separated Co-Defendants value."""
+    if value is None:
+        return ""
+    parts = [p.strip() for p in str(value).split(";")]
+    return "; ".join(p for p in parts if p and not is_known_judge(p))
+
+
 def _format_petition_notes(rec: dict, notice_type: str = "foreclosure") -> str:
     """Format a source document's extra columns (if present in this row) into a
     single Notes-appendable string. Returns "" if none of those columns are
@@ -1214,6 +1243,7 @@ def _format_petition_notes(rec: dict, notice_type: str = "foreclosure") -> str:
         "Original Monthly Payment": _fmt_currency,
         "Interest Rate": _fmt_rate,
         "Initial Interest Rate": _fmt_rate,
+        "Co-Defendants": _drop_judges,
     }
 
     doc_heading, doc_sections = _NOTES_SECTION_SETS.get(

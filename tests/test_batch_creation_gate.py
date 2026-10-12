@@ -75,7 +75,7 @@ class PerRowGateTests(unittest.TestCase):
                         side_effect=fake_build_csv), \
              mock.patch("datasift_uploader.upload_to_datasift", side_effect=fake_upload), \
              mock.patch("post_enrich_gate.apply_post_enrich_gate",
-                        side_effect=lambda rows, **kw: (rows, [])):
+                        side_effect=lambda rows, **kw: (rows, [])),              mock.patch("main._skip_preexisting_owners", side_effect=lambda rs, since: (rs, [], [])):
             return main._create_records_for_batch(_args(), Path("fake_input.csv"))
 
     def test_no_blocks_creates_every_row(self):

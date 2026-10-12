@@ -2059,13 +2059,17 @@ def _create_records_for_batch(args, csv_path: Path) -> list[dict] | None:
             excluded = {id(r) for r in outcome["excluded"]}
             no_trace = {id(r) for r in outcome["no_trace"]}
             listed = {id(r) for r in outcome.get("listed", [])}
+            owner_dup = {id(r) for r in outcome.get("owner_dup", [])}
+            owner_review = {id(r) for r in outcome.get("owner_review", [])}
             review_items = []
             for r in outcome["created"]:
-                status = ("excluded" if id(r) in excluded
+                status = ("owner_dup" if id(r) in owner_dup
+                          else "owner_review" if id(r) in owner_review
+                          else "excluded" if id(r) in excluded
                           else "listed" if id(r) in listed
                           else "no_trace" if id(r) in no_trace
                           else "review" if r.get("_spread_review") else "trace")
-                tr = _trace_row(r) if status in ("trace", "review") else None
+                tr = _trace_row(r) if status in ("trace", "review", "owner_review") else None
                 if tr and status == "trace":
                     trace_rows.append(tr)
                 orig = originals.get(id(r), r)
@@ -2085,6 +2089,15 @@ def _create_records_for_batch(args, csv_path: Path) -> list[dict] | None:
             logging.info("created-rows ledger: recorded %d row(s); re-running this "
                          "command with --commit will trace them without re-creating", n)
 
+    for r, e in done:
+        if (e.get("status") == "owner_review"
+                and str(r.get("Not A Duplicate") or "").strip().lower() in ("yes", "y", "true", "1")):
+            key = created_rows.row_key(r, notice_type)
+            if key:
+                created_rows.set_status(key, "trace")
+                e["status"] = "trace"
+                logging.info("Not A Duplicate = Yes: %s %s released to the trace",
+                             r.get("First Name") or "", r.get("Last Name") or "")
     trace_rows.extend(e["trace_row"] for _, e in done
                       if e.get("status") == "trace" and e.get("trace_row"))
 
@@ -2192,7 +2205,9 @@ def _report_already_created(done: list[tuple[dict, dict]]) -> None:
             "no_trace": "Owner Alive = No, never traced",
             "excluded": "removed by the post-enrichment gate, never traced",
             "listed": "MLS-listed, status listed, never traced",
-            "review": "value spread under review - see the numbered list"}
+            "review": "value spread under review - see the numbered list",
+            "owner_dup": "owner already in the CRM - skipped, property deleted",
+            "owner_review": "owner already in the CRM - held; set Not A Duplicate = Yes to trace"}
     for _, e in done:
         logging.info("  %s | created %s | %s", e.get("label") or "?",
                      e.get("recorded") or "?", what.get(e.get("status"), e.get("status")))
@@ -2333,7 +2348,7 @@ def _create_fresh_rows(args, template_rows: list[dict], notice_type: str) -> dic
     from buy_box import apply_buy_box, describe as describe_buy_box
     from batch_review import BLOCK, review_batch, print_review, write_review_sheet
 
-    template_rows, rejected = apply_buy_box(template_rows)
+    template_rows, rejected = apply_buy_box(template_rows, notice_type=notice_type)
     if rejected:
         logging.warning("")
         logging.warning("=== OUTSIDE THE BUY BOX - NOT UPLOADED (%d) ===", len(rejected))
@@ -2424,6 +2439,8 @@ def _create_fresh_rows(args, template_rows: list[dict], notice_type: str) -> dic
 
     # skip_trace=False: run_pipeline owns the DataSift trace, scoped and
     # estimate-gated. Enrich is API-scoped as of 2026-08-26, so no browser.
+    from datetime import timezone as _tz
+    upload_started = datetime.now(_tz.utc)
     upload_result = _asyncio.run(upload_to_datasift(
         csv_path=datasift_csv, enrich=True, skip_trace=False,
         mode="add", list_name=list_name, batch_tag="FTM",
@@ -2465,6 +2482,14 @@ def _create_fresh_rows(args, template_rows: list[dict], notice_type: str) -> dic
     from post_enrich_gate import apply_post_enrich_gate, describe as describe_gate
 
     created = list(template_rows)
+    owner_dup: list[dict] = []
+    owner_review: list[dict] = []
+    if notice_type != "probate":
+        _t = run_timer.start("owner already in the CRM")
+        template_rows, owner_dup, owner_review = _skip_preexisting_owners(
+            template_rows, upload_started)
+        run_timer.stop(_t)
+        _report_preexisting_owners(owner_dup, owner_review)
     _t = run_timer.start("post-enrichment gate")
     template_rows, gated = apply_post_enrich_gate(
         template_rows, find_property=find_property_by_address,
@@ -2488,14 +2513,101 @@ def _create_fresh_rows(args, template_rows: list[dict], notice_type: str) -> dic
     # excluded rows as copies, so "created but not kept" is what it excluded.
     kept_ids = {id(r) for r in template_rows}
     listed_ids = {id(r) for r in listed}
+    owner_ids = {id(r) for r in owner_dup + owner_review}
     return {
         "created": created,
-        "excluded": [r for r in created if id(r) not in kept_ids],
+        "owner_dup": owner_dup,
+        "owner_review": owner_review,
+        "excluded": [r for r in created if id(r) not in kept_ids and id(r) not in owner_ids],
         "no_trace": [r for r in created
                      if id(r) in kept_ids and id(r) in {id(d) for d in deceased}],
         "listed": [r for r in created if id(r) in listed_ids],
         "review": [r for r in created if id(r) in kept_ids and r.get("_spread_review")],
     }
+
+
+def _skip_preexisting_owners(rows: list[dict], since) -> tuple[list[dict], list[dict], list[dict]]:
+    """Owner already in the CRM (user, 2026-10-12) - see foreclosure_checks.py
+    check 3. Runs on records THIS run just created, before anything billed.
+    Returns (go_on, skipped, held). A record that cannot be read is held, never
+    passed: an unchecked owner is how 2026-10-12's four got through."""
+    from datasift_api import (address_key, delete_message_board_post, delete_property,
+                              find_property_by_address, get_message_board, get_property)
+    from datasift_uploader import forget_uuid_map_entries
+    from foreclosure_checks import preexisting_owner_verdict
+
+    go_on, skipped, held = [], [], []
+    for r in rows:
+        street = str(r.get("Property Street") or "")
+        try:
+            # Address alone, like the duplicate check: the stored city can
+            # differ from the petition's (Coutee's lookup missed on 'Tulsa').
+            hit = find_property_by_address(street, "", "", strict=True)
+            record = get_property(hit["uuid"]) if hit else None
+        except Exception as e:                       # noqa: BLE001 - fail CLOSED
+            r["_owner_reason"] = f"could not read the new record: {e}"
+            held.append(r)
+            continue
+        if not record:
+            r["_owner_reason"] = "the new record was not found to check"
+            held.append(r)
+            continue
+        verdict, why = preexisting_owner_verdict(r, record, address_key=address_key)
+        if not verdict:
+            go_on.append(r)
+            continue
+        r["_owner_reason"], r["_owner_uuid"] = why, record.get("uuid")
+        if verdict == "hold":
+            held.append(r)
+            continue
+        # SKIP: take back only what this run added, then the property itself.
+        owner_uuid = (record.get("owner") or {}).get("uuid")
+        removed, notes = 0, []
+        try:
+            for post in get_message_board(owner_uuid) if owner_uuid else []:
+                try:
+                    stamp = datetime.fromisoformat(str(post.get("created") or "").replace("Z", "+00:00"))
+                except ValueError:
+                    continue
+                if (stamp >= since and post.get("uuid")
+                        and str(post.get("message") or "").lstrip().startswith("FORECLOSURE PETITION")):
+                    delete_message_board_post(owner_uuid, post["uuid"])
+                    removed += 1
+        except Exception as e:                       # noqa: BLE001 - reported
+            notes.append(f"board post not removed: {e}")
+        try:
+            delete_property(record["uuid"])
+            forget_uuid_map_entries([record["uuid"]])
+            action = "property just created was deleted"
+        except Exception as e:                       # noqa: BLE001 - reported
+            action = f"DELETE FAILED, record still in the CRM: {e}"
+        r["_owner_action"] = "; ".join([action, f"{removed} petition post(s) removed "
+                                        "from the old owner's board"] + notes)
+        skipped.append(r)
+    return go_on, skipped, held
+
+
+def _report_preexisting_owners(skipped: list[dict], held: list[dict]) -> None:
+    if skipped:
+        logging.warning("")
+        logging.warning("=== OWNER ALREADY IN THE CRM - SKIPPED (%d) ===", len(skipped))
+        for r in skipped:
+            logging.warning("  %s %s %s | %s | %s", r.get("Case Number") or "",
+                            r.get("First Name") or "", r.get("Last Name") or "",
+                            r.get("Property Street") or "?", r["_owner_reason"])
+            logging.warning("      %s (%s)", r.get("_owner_action") or "",
+                            r.get("_owner_uuid") or "no uuid")
+        logging.warning("")
+    if held:
+        logging.warning("")
+        logging.warning("=== OWNER ALREADY IN THE CRM - HELD, NOT TRACED (%d) ===", len(held))
+        for r in held:
+            logging.warning("  %s %s %s | %s | %s", r.get("Case Number") or "",
+                            r.get("First Name") or "", r.get("Last Name") or "",
+                            r.get("Property Street") or "?", r["_owner_reason"])
+        logging.warning("  Set Not A Duplicate = Yes in the batch sheet and re-run the "
+                        "same command to trace one.")
+        logging.warning("")
 
 
 def _report_post_enrich_exclusions(gated: list[dict], criteria: str) -> None:

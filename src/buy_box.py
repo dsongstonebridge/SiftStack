@@ -21,8 +21,10 @@ Enforced, from free county data available before creation:
    8/8 on a real Tulsa batch. Bare land is out.
 2. **It is residential.** The assessor's `AcctType` separates Residential from
    Commercial / Agricultural / Industrial.
-3. **It is not a condominium** (added 2026-09-04, after the user deleted a
-   condo that reached the CRM). Neither criterion above catches one: a condo
+3. **It is not a condominium - PROBATE ONLY since 2026-10-12.** Foreclosure
+   condos/townhomes that pass every other rule now stay (user, 2026-10-12);
+   probate still rejects them. (Added 2026-09-04, after the user deleted a
+   condo that reached the CRM.) Neither criterion above catches one: a condo
    has a structure, and `AcctType` reads "Residential" for it exactly as for a
    house. Caught instead from the petition itself — a unit-ownership legal
    description, or a trailing unit designator in the street address — so it
@@ -77,6 +79,14 @@ import re
 
 logger = logging.getLogger(__name__)
 
+
+def _allow_condos(notice_type: str | None) -> bool:
+    """Foreclosure condos/townhomes stay when they pass every other rule
+    (user, 2026-10-12: "if a condo passes our buy box in every way, it can
+    stay"). Probate still rejects them, as does its post-enrichment gate
+    (2026-10-08), so a call with no notice type keeps the old rejection."""
+    return (notice_type or "").strip().lower() == "foreclosure"
+
 #: Assessor account types that can hold a single-family home.
 _RESIDENTIAL_TYPES = frozenset({"residential"})
 
@@ -130,7 +140,7 @@ def _states_no_real_property(rp: str) -> bool:
     return "personal property" in rp and "real" not in rp
 
 
-def check_buy_box(row: dict) -> tuple[bool, list[str]]:
+def check_buy_box(row: dict, *, notice_type: str | None = None) -> tuple[bool, list[str]]:
     """Does this row belong in the CRM?
 
     Returns (passes, reasons). `reasons` explains a rejection, and is empty on
@@ -160,12 +170,15 @@ def check_buy_box(row: dict) -> tuple[bool, list[str]]:
     #    earlier than the assessor lookup above, and it catches what AcctType
     #    cannot: a condo is "Residential" to the assessor exactly like a house.
     legal = str(row.get("Legal Description") or row.get("legal_description") or "")
-    if legal and _CONDO_LEGAL_RE.search(legal):  # noqa: E501 - see _CONDO_LEGAL_RE on why not a bare keyword
+    street = str(row.get("Property Street") or row.get("street") or "").strip()
+    if _allow_condos(notice_type):
+        if (legal and _CONDO_LEGAL_RE.search(legal)) or (street and _UNIT_ADDRESS_RE.search(street)):
+            logger.info("buy box: foreclosure condo/townhome kept (passes the other rules): %s", street)
+    elif legal and _CONDO_LEGAL_RE.search(legal):  # noqa: E501 - see _CONDO_LEGAL_RE on why not a bare keyword
         reasons.append("condominium - legal description is a unit-ownership "
                        "estate, not a single-family lot")
 
-    street = str(row.get("Property Street") or row.get("street") or "").strip()
-    if street and _UNIT_ADDRESS_RE.search(street):
+    if not _allow_condos(notice_type) and street and _UNIT_ADDRESS_RE.search(street):
         reasons.append(f"address carries a unit designator ({street!r}) - "
                        "not a whole single-family house")
 
@@ -198,7 +211,7 @@ def check_buy_box(row: dict) -> tuple[bool, list[str]]:
     return (not reasons), reasons
 
 
-def apply_buy_box(rows: list[dict]) -> tuple[list[dict], list[dict]]:
+def apply_buy_box(rows: list[dict], *, notice_type: str | None = None) -> tuple[list[dict], list[dict]]:
     """Split rows into (kept, rejected). Every rejection carries `_buy_box_reasons`.
 
     Rejected rows are RETURNED, not discarded — the caller is expected to report
@@ -207,7 +220,7 @@ def apply_buy_box(rows: list[dict]) -> tuple[list[dict], list[dict]]:
     """
     kept, rejected = [], []
     for r in rows:
-        ok, reasons = check_buy_box(r)
+        ok, reasons = check_buy_box(r, notice_type=notice_type)
         if ok:
             kept.append(r)
         else:
@@ -221,7 +234,7 @@ def apply_buy_box(rows: list[dict]) -> tuple[list[dict], list[dict]]:
 def describe() -> str:
     """One-line summary of the active criteria, for run logs and reports."""
     return ("Buy box: single-family preferred - must have a structure (no bare "
-            "land), a residential account type, and must NOT be a condominium "
-            "(unit-ownership legal description, or a unit designator in the "
-            "street address). A duplex is acceptable and passes on purpose; "
-            "only condos are rejected on property type.")
+            "land) and a residential account type. Probate must NOT be a "
+            "condominium (unit-ownership legal description, or a unit "
+            "designator in the street address); a foreclosure condo or townhome "
+            "that passes every other rule is kept. A duplex passes on purpose.")

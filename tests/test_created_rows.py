@@ -122,7 +122,7 @@ class ReRunTests(unittest.TestCase):
 
         patches = [
             mock.patch("main._read_property_template", return_value=rows),
-            mock.patch("buy_box.apply_buy_box", side_effect=lambda rs: (rs, [])),
+            mock.patch("buy_box.apply_buy_box", side_effect=lambda rs, **k: (rs, [])),
             mock.patch("batch_review.review_batch", return_value=list(findings)),
             mock.patch("batch_review.write_review_sheet", return_value="REVIEW.csv"),
             mock.patch("batch_review.print_review", return_value=False),
@@ -130,6 +130,7 @@ class ReRunTests(unittest.TestCase):
             mock.patch("datasift_formatter.build_datasift_csv_from_template", side_effect=fake_build),
             mock.patch("datasift_uploader.upload_to_datasift", side_effect=fake_upload),
             mock.patch("post_enrich_gate.apply_post_enrich_gate", side_effect=fake_gate),
+            mock.patch("main._skip_preexisting_owners", side_effect=lambda rs, since: (rs, [], [])),
             mock.patch("datasift_api.find_property_by_address", return_value={"uuid": "U"}),
             mock.patch("main._enrich_probate_rows", side_effect=probate_lookup or (lambda rs: rs)),
             mock.patch("main._foreclosure_precreate_checks", side_effect=lambda rs, t, **kw: rs),

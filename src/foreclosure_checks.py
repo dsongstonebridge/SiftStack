@@ -33,6 +33,24 @@ or not `--commit` is passed.
    Held rows go to `output/foreclosure_owner_review_<ts>.csv`. Setting the
    row's `Owner Confirmed` column to `Yes` releases it on the next run.
    Daily (recent) foreclosures do NOT run this check.
+
+3. OWNER ALREADY IN THE CRM -> SKIPPED OR HELD (user, 2026-10-12)
+   Check 1 only sees PROPERTIES. When an earlier property was deleted, its
+   owner record (and that owner's phones) stays in DataSift with no property,
+   and creating a property for the same person silently REATTACHES it. That is
+   how Kinkead, Czapansky, Carter and Huerta came in on 2026-10-12. DataSift
+   has no owner search (the owner list ignores every filter and returns all
+   ~700 owners), so this runs per record right AFTER creation, before anything
+   is billed: we create records with no phones, so a brand-new record whose
+   owner already has phones or is already marked traced has a pre-existing
+   owner. Then:
+     - same name AND the owner's address is the property -> SKIP: the property
+       we just made is deleted and our petition post removed from the old
+       owner's board, so the CRM is back exactly as it was (the old owner and
+       its phones are untouched);
+     - otherwise -> HELD: kept, never traced, until the batch sheet's
+       `Not A Duplicate` column says Yes and the same command is re-run.
+   Every batch, foreclosure only. Probate is out of scope.
 """
 
 from __future__ import annotations
@@ -239,6 +257,21 @@ def owner_matches(owner: str, row: dict) -> bool:
     return bool(owner_surnames(owner) & petition_names(row))
 
 
+def hyphenated_near_match(owner: str, row: dict) -> str:
+    """The county surname when it is HYPHENATED and one half of it is a
+    petition name ("GRIFFIN-COUTEE" vs Coutee), else "".
+
+    Deliberately NOT a match (user, 2026-10-12: keep asking me rather than
+    passing it automatically). A hyphenated name can be the same person or a
+    different one, so the row is still held; this only makes the reason say
+    why, so the review takes seconds."""
+    names = petition_names(row)
+    for sur in owner_surnames(owner):
+        if "-" in sur and any(part in names for part in sur.split("-") if part):
+            return sur
+    return ""
+
+
 def owner_of_record_check(rows: list[dict], *, search, parse_street, sales_history=None,
                           hold_unchecked: bool = False,
                           pause: float = 2.0) -> tuple[list[dict], list[dict], list[dict]]:
@@ -272,8 +305,12 @@ def owner_of_record_check(rows: list[dict], *, search, parse_street, sales_histo
                 go_on.append(r)
             continue
         if not owner_matches(owner, r):
+            hy = hyphenated_near_match(owner, r)
+            why = (f"hyphenated surname {hy} on the county record only partly matches "
+                   "the petition - confirm it is the same person"
+                   if hy else "owner of record is not on the petition")
             held.append({**r, "_owner_of_record": owner, "_owner_note": note,
-                         "_hold_reason": "owner of record is not on the petition"})
+                         "_hold_reason": why})
             continue
         if sales_history and account:
             try:
@@ -309,3 +346,51 @@ def write_owner_review(held: list[dict], out_dir: Path) -> Path | None:
                         "Assessor Parcel": r.get("_owner_note", ""),
                         "Why Held": r.get("_hold_reason", "")})
     return path
+
+
+# ── 3. Owner already in the CRM (checked right after creation) ───────────
+
+def _norm_name(v) -> str:
+    return "".join(ch for ch in str(v or "").upper() if ch.isalnum())
+
+
+def owner_was_preexisting(owner: dict) -> bool:
+    """True when a JUST-CREATED record's owner already carries phones or a
+    trace. We create records with no phones, so either one means DataSift
+    reattached an owner that was already in the account."""
+    owner = owner or {}
+    if owner.get("phones") or owner.get("skiptraced"):
+        return True
+    try:
+        return int(owner.get("skiptrace_attempts") or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def preexisting_owner_verdict(row: dict, record: dict, *, address_key) -> tuple[str, str]:
+    """("skip" | "hold" | "", reason) for one just-created record.
+
+    "" when the owner is new, or the row says `Not A Duplicate` = Yes.
+    "skip" when the owner pre-existed, the name matches the petition and the
+    owner's address is the property. "hold" for any other pre-existing owner.
+    `address_key(street, city)` is datasift_api.address_key."""
+    owner = (record or {}).get("owner") or {}
+    if not owner_was_preexisting(owner) or _yes(row.get("Not A Duplicate")):
+        return "", ""
+    phones = len(owner.get("phones") or [])
+    who = f"{owner.get('first_name') or ''} {owner.get('last_name') or ''}".strip() or "?"
+    first_r, last_r = _norm_name(row.get("First Name")), _norm_name(row.get("Last Name"))
+    first_o, last_o = _norm_name(owner.get("first_name")), _norm_name(owner.get("last_name"))
+    same_name = bool(last_r) and last_r == last_o and bool(first_r) and (
+        first_r == first_o or first_o.startswith(first_r) or first_r.startswith(first_o))
+    o_street = str((owner.get("address") or {}).get("street") or "")
+    p_street = str(((record or {}).get("address") or {}).get("street") or "")
+    streets = {address_key(x, "") for x in (p_street, row.get("Property Street")) if x}
+    same_addr = bool(o_street) and address_key(o_street, "") in streets
+    what = (f"owner {who} was already in the CRM ({phones} phone(s)"
+            f"{', already traced' if owner.get('skiptraced') else ''})")
+    if same_name and same_addr:
+        return "skip", f"{what}, same name, lives at the property"
+    if not same_name:
+        return "hold", f"{what} under a different name than the petition"
+    return "hold", f"{what}, but the owner's address is {o_street or 'blank'}, not the property"

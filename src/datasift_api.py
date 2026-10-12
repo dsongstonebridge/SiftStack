@@ -916,6 +916,12 @@ def get_message_board(owner_uuid: str) -> list[dict]:
     return _page_items(body)
 
 
+def delete_message_board_post(owner_uuid: str, message_uuid: str) -> None:
+    """Delete ONE Message Board post by its exact uuid. Destructive: only ever
+    called on a post this run made (see main._skip_preexisting_owners)."""
+    _request("DELETE", f"{CORE_BASE}/api/internal/owner/{owner_uuid}/message/{message_uuid}/")
+
+
 # ── Custom fields ─────────────────────────────────────────────────────
 
 _custom_field_cache: dict[str, dict] = {}

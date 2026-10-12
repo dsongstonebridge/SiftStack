@@ -1270,6 +1270,14 @@ Runs on the extracted sheet BEFORE creation, because
 the dry-run gate protects spend, not the CRM. Fails OPEN on missing data.
 Rejections are reported, never silently dropped.
 
+**Condos: foreclosure keeps them, probate rejects them (user, 2026-10-12).**
+"If a condo passes our buy box in every way, it can stay." `check_buy_box(row,
+notice_type=...)`: a foreclosure condo or townhome (unit-ownership legal
+description or a unit designator in the street) passes when every other rule
+passes; probate, and any call with no notice type, still rejects it, as does
+probate's post-enrichment structure-type check. The one-run
+`SIFTSTACK_ALLOW_CONDOS` switch used on 2026-10-12 is gone.
+
 **Second gate, after enrichment (`src/post_enrich_gate.py`, 2026-09-25).** The
 user does not buy a property that is **under 15% equity, or sold recently:
 within 3 years for foreclosure, 2 for probate** (foreclosure went 3 -> 2 on
@@ -1945,7 +1953,33 @@ the pre-July backfill).** Free and read-only; probate does not run them.
   `Owner Confirmed` = Yes in the batch sheet releases one. Live-checked on the
   10/6 batch: 14 of 14 matched their defendants, no deeds since filing, and a
   filed-in-2000 control flagged deeds on all 12 parcels with history.
+  **A hyphenated county surname that only partly matches ("GRIFFIN-COUTEE" vs
+  Coutee) is HELD and asked about, never passed automatically** (user,
+  2026-10-12: keep asking). The Why Held column says "hyphenated surname ...
+  only partly matches the petition - confirm it is the same person".
   Tests: `tests/test_foreclosure_checks.py`.
+
+**Owner already in the CRM -> skipped or held (2026-10-12, every foreclosure
+batch, after creation).** The property duplicate check cannot see an owner
+with no property: when a property is deleted, its owner record and phones stay
+in DataSift, and creating a property for the same person silently REATTACHES
+that owner. That is how Kinkead, Czapansky, Carter and Huerta came in on
+2026-10-12 as "new" records already carrying phones and dial tiers (tiers with
+no source tag: an old pre-2026-08-26 run). **DataSift has no owner search**: the
+owner list ignores every filter tried (`search`, `last_name`, `name`, `q`,
+POST-as-GET body) and returns all ~700 owners, and paging it each batch would
+be an account-wide read the user declined. So `main._skip_preexisting_owners()`
+checks each record THIS run just created, before anything billed: records are
+created with no phones, so an owner with phones or a trace on it pre-existed.
+- Same first + last name AND the owner's address is the property -> **SKIP**:
+  our petition post (made this run) is deleted from the old owner's board, the
+  property we just made is deleted, ledger status `owner_dup`. The CRM is back
+  as it was; the old owner and phones are untouched.
+- Any other pre-existing owner, or a record that cannot be read -> **HELD**:
+  kept, never traced, ledger status `owner_review`. `Not A Duplicate` = Yes in
+  the batch sheet + the same command again releases it to the trace.
+Read-only check on 2026-10-12's four: all four would have been skipped.
+Probate does not run it. Tests: `tests/test_preexisting_owner.py`.
 
 Each record ends up in the CRM, API-enriched, with grouped petition detail in
 Notes *and* Message Board, double skip traced, every number scored with a dial

@@ -132,7 +132,7 @@ def review_batch(rows: list[dict], *, notice_type: str = "probate") -> list[dict
         # inferred from whether an address exists —
         # `tulsa_assessor.get_parcel_improvements()` supplies that flag.
         # Rejections are reported, never silently dropped.
-        ok, why = check_buy_box(r)
+        ok, why = check_buy_box(r, notice_type=notice_type)
         if not ok:
             _flag(findings, i, EXCLUDE, "Buy Box",
                   "; ".join(why) + " - NOT uploaded to the CRM, but it IS an "

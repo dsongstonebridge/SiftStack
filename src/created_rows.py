@@ -25,6 +25,10 @@ Statuses:
   review    created, value spread $100k or less (or not calculable): held
             until the user answers keep/drop (spread_review.py); keep ->
             trace, drop -> excluded
+  owner_dup     created, but its owner was already in the CRM under the same
+                name at the property: the new property was deleted, never traced
+  owner_review  created, owner already in the CRM otherwise: kept, never
+                traced until the row says `Not A Duplicate` = Yes on a re-run
 
 Rows held for review or rejected by the buy box are NOT recorded: they were
 never created, so a re-run sends them through the full chain again (which is

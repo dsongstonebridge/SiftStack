@@ -192,5 +192,54 @@ class OnlyOnBackfill(unittest.TestCase):
         self.assertEqual(out, [])
 
 
+class HyphenatedSurnameStillAsks(unittest.TestCase):
+    """User, 2026-10-12 (Coutee): a hyphenated county surname that only partly
+    matches the petition is HELD and asked about, never passed automatically."""
+
+    def test_hyphenated_partial_match_is_held_with_a_clear_reason(self):
+        search = assessor(("R1", "8604 S FAWNWOOD CT", "GRIFFIN-COUTEE, LLYDIA"))
+        with mock.patch.object(fc.time, "sleep"):
+            go, held, _ = fc.owner_of_record_check(
+                [row("8604 S Fawnwood Ct", last="Coutee")], search=search,
+                parse_street=parse_street)
+        self.assertEqual(go, [])
+        self.assertIn("hyphenated surname GRIFFIN-COUTEE", held[0]["_hold_reason"])
+
+    def test_owner_confirmed_still_releases_it(self):
+        search = assessor(("R1", "8604 S FAWNWOOD CT", "GRIFFIN-COUTEE, LLYDIA"))
+        go, held, _ = fc.owner_of_record_check(
+            [row("8604 S Fawnwood Ct", last="Coutee", **{"Owner Confirmed": "Yes"})],
+            search=search, parse_street=parse_street)
+        self.assertEqual((len(go), held), (1, []))
+
+    def test_unrelated_owner_keeps_the_plain_reason(self):
+        self.assertEqual(fc.hyphenated_near_match("JONES-WEBB, PAT", row("x", last="Coutee")), "")
+
+
+class CondosByNoticeType(unittest.TestCase):
+    """User, 2026-10-12: a foreclosure condo/townhome that passes every other
+    rule stays. Probate still rejects condos (its 2026-10-08 rule)."""
+
+    CONDO = {"Property Street": "7375 S Yale Ave # D", "AcctType": "Residential",
+             "Legal Description": "UNIT D, BUILDING 4, AN UNDIVIDED 2.5% INTEREST IN COMMON ELEMENTS"}
+
+    def test_foreclosure_keeps_a_condo(self):
+        import buy_box
+        self.assertEqual(buy_box.check_buy_box(self.CONDO, notice_type="foreclosure"), (True, []))
+
+    def test_probate_and_untyped_still_reject(self):
+        import buy_box
+        for nt in ("probate", None):
+            ok, why = buy_box.check_buy_box(self.CONDO, notice_type=nt)
+            self.assertFalse(ok)
+            self.assertTrue(any("condominium" in w or "unit designator" in w for w in why))
+
+    def test_foreclosure_condo_still_fails_other_rules(self):
+        import buy_box
+        ok, why = buy_box.check_buy_box({**self.CONDO, "Vacant Lot": "Yes"}, notice_type="foreclosure")
+        self.assertFalse(ok)
+        self.assertEqual(len(why), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

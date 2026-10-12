@@ -229,7 +229,11 @@ def _message(new: list[dict]) -> str:
         meaning = CODE_MEANING.get(it["code"], f"code {it['code'] or 'none'}")
         lines.append(f"- {who} ({it['phone'][-4:]}) from ...{it['from_number'][-4:]}: {meaning}"
                      f" | {it['wording']}")
-    hot = {w: n for w, n in blocked_wordings().items() if n >= WORDING_ALARM}
+    # Only wordings still in the touch pools: a retired one (or a text typed by
+    # hand) labels as "other:" and cannot be retired again, so naming it on
+    # every alert read as if it were still being sent (Jeff, 2026-10-12).
+    hot = {w: n for w, n in blocked_wordings().items()
+           if n >= WORDING_ALARM and not w.startswith("other:")}
     for w, n in sorted(hot.items(), key=lambda x: -x[1]):
         lines.append(f"WORDING BLOCKED AS SPAM {n}x in {WORDING_DAYS} days, retire it: {w}")
     suppressed = [it for it in new if it["code"] in NEVER_TEXTABLE]

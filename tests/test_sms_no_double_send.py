@@ -80,7 +80,7 @@ escalate.alert = lambda title, detail="", **k: posted.append((title, detail)) or
 def fake_rows(*_a, **_k):
     rows = [{"id": 1000 + i, "direction": "outbound", "fromNum": "+19180000000",
              "toNum": f"+1918555{1000 + i}", "delivery_status": "undelivered", "delivery_code": "30007",
-             "content": f"Hey Name{i}! I hope I&#039;m not being a bother. I&#039;m interested in {100 + i} S Main St"}
+             "content": f"Hey Name{i}, me again! If you&#039;ve ever considered an offer on {100 + i} S Main St, I&#039;d love to be the one you talk to first. Can I give you a quick call?"}
             for i in range(3)]
     rows.append({"id": 2000, "direction": "outbound", "fromNum": "+19180000000", "toNum": "+19185552000",
                  "delivery_status": "undelivered", "delivery_code": "30006", "content": "Hi there"})

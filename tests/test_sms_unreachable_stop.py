@@ -86,5 +86,15 @@ check("no clean number = nobody new starts", sender_pool.daily_number(pool) == "
 config.NEW_START_MAX_FLAGS = -1
 check("limit off = old behaviour", sender_pool.daily_number(pool) in pool)
 
+# a retired wording ("other:") is never named in the alarm line
+with store.tx() as c:
+    for i in range(10, 14):
+        c.execute("INSERT INTO delivery_failures(log_id, phone, code, body, wording, seen_at)"
+                  " VALUES (?,?,?,?,?,?)", (i, "9185550009", "30007", "x",
+                                            "other: retired wording", store.now()))
+msg = delivery._message([{"phone": "9185550009", "from_number": "+19180000140",
+                          "code": "30003", "wording": "touch 1"}])
+check("retired wording not named in the alert", "retired wording" not in msg)
+
 print(f"\n{len(FAILS)} failure(s)")
 sys.exit(1 if FAILS else 0)

@@ -1021,7 +1021,9 @@ def schedule(candidates: list[Candidate]) -> list[tuple[Candidate, str, str]]:
         # three of Diego's numbers text the same thing within 13 seconds. So
         # after the phone's own thread, the record's number wins: one already
         # used on any of its phones, else the one picked earlier in this batch.
-        existing = (store.get_conversation(cand.phone) or {}).get("from_number") or ""
+        # Only a number that actually TEXTED this phone is sticky (Jeff,
+        # 2026-10-12); a staged-but-never-sent assignment is not.
+        existing = store.phone_sent_from(cand.phone)
         rec = cand.record_uuid or ""
         rec_number = (by_record.get(rec) or store.record_from_number(rec)) if rec else ""
         if existing in numbers:

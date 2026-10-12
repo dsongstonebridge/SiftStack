@@ -535,6 +535,10 @@ solo = {n for c, n, _ in plan if c.record_uuid == "rec-solo"}
 check("all phones on one record share one number", len(multi) == 1, str(multi))
 check("a different record still rotates", solo and not (solo & multi), f"{solo} vs {multi}")
 store.ensure_conversation("9185550301", from_number="+19180000003", record_uuid="rec-earlier")
+store.map_phone("9185550301", record_uuid="rec-earlier")
+with store.tx() as _c:  # a REAL send pins the record (2026-10-12)
+    _c.execute("INSERT INTO sends(from_number, phone, sent_at) VALUES (?,?,?)",
+               ("+19180000003", "9185550301", "2026-01-01T15:00:00+00:00"))
 plan = seed.schedule([seed.Candidate(phone="9185550302", record_uuid="rec-earlier", sender="Diego")])
 check("new phone reuses the number already texting its record", plan[0][1] == "+19180000003",
       plan[0][1])
@@ -553,7 +557,13 @@ plan = seed.schedule([seed.Candidate(phone=p, record_uuid=r, sender="Diego") for
 check("every new record starts on the day's cleanest number",
       {n for _, n, _ in plan} == {"+19180000001"}, str({n for _, n, _ in plan}))
 store.ensure_conversation("9185550611", from_number="+19180000003", record_uuid="rec-old")
-plan = seed.schedule([seed.Candidate(phone="9185550612", record_uuid="rec-old", sender="Diego")])
+# Only a REAL send pins a record (2026-10-12); one from yesterday, so pacing is not in play.
+store.ensure_conversation("9185550621", from_number="+19180000003", record_uuid="rec-kept")
+store.map_phone("9185550621", record_uuid="rec-kept")
+with store.tx() as _c:
+    _c.execute("INSERT INTO sends(from_number, phone, sent_at) VALUES (?,?,?)",
+               ("+19180000003", "9185550621", "2026-01-01T15:00:00+00:00"))
+plan = seed.schedule([seed.Candidate(phone="9185550622", record_uuid="rec-kept", sender="Diego")])
 check("record already texted keeps its number even if it is flagged now",
       plan[0][1] == "+19180000003", plan[0][1])
 check("day's number gets the daily-number cap",

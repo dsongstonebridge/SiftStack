@@ -291,14 +291,28 @@ def record_from_number(record_uuid: str) -> str:
     """The sending number already used for ANY phone on this record.
 
     Jeff, 2026-10-05: every phone on one record is texted from the same
-    smrtPhone number. Oldest conversation wins so the answer is stable.
+    smrtPhone number. Oldest send wins so the answer is stable.
+
+    Only a number that ACTUALLY sent counts (Jeff, 2026-10-12). A conversation
+    row is written at staging time, so a batch staged and never sent (Ready to
+    Call, 10/8) used to pin its phones to that day's number for good: 91 touch
+    1s came back on a number that had since been carrier-flagged.
     """
     if not record_uuid:
         return ""
     row = _conn().execute(
-        "SELECT from_number FROM conversations WHERE record_uuid=? "
-        "AND COALESCE(from_number,'')!='' ORDER BY created_at LIMIT 1",
+        "SELECT s.from_number FROM sends s JOIN phone_map p ON p.phone = s.phone "
+        "WHERE p.record_uuid=? ORDER BY s.sent_at LIMIT 1",
         (record_uuid,),
+    ).fetchone()
+    return row[0] if row else ""
+
+
+def phone_sent_from(phone: str) -> str:
+    """The number that first actually texted this phone, or "" if none ever did."""
+    row = _conn().execute(
+        "SELECT from_number FROM sends WHERE phone=? ORDER BY sent_at LIMIT 1",
+        (clean_phone(phone),),
     ).fetchone()
     return row[0] if row else ""
 

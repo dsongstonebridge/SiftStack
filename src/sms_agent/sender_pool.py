@@ -254,7 +254,7 @@ def daily_number(numbers: list[str]) -> str:
     """
     key = _daily_key()
     chosen = store.get_meta(key)
-    if chosen in numbers and available_health(chosen):
+    if chosen in numbers and available_health(chosen) and _clean_enough(chosen):
         return chosen
     from datetime import timedelta
     since = (datetime.now(timezone.utc) - timedelta(days=7)).date().isoformat()
@@ -266,6 +266,8 @@ def daily_number(numbers: list[str]) -> str:
         if config.NUMBER_HEALTH_CHECK:
             from . import number_health
             flags = number_health.flag_count(n) or 0
+        if not _clean_enough(n):
+            continue
         ranked.append((flags, store.sends_since(n, since), n))
     if not ranked:
         log.warning("no healthy number to start new records on today")
@@ -275,6 +277,16 @@ def daily_number(numbers: list[str]) -> str:
     log.info("today's number for new records: ...%s (flags %s, 7-day sends %s)",
              pick[-4:], min(ranked)[0], min(ranked)[1])
     return pick
+
+
+def _clean_enough(number: str) -> bool:
+    """NEW_START_MAX_FLAGS gate for touch 1 (Jeff, 2026-10-12). Unknown = no."""
+    limit = getattr(config, "NEW_START_MAX_FLAGS", -1)
+    if limit < 0:
+        return True
+    from . import number_health
+    flags = number_health.flag_count(number)
+    return flags is not None and flags <= limit
 
 
 def available_health(from_number: str) -> bool:

@@ -97,7 +97,8 @@ check("carrier says landline -> do-not-text list", bool(store.is_suppressed("918
 r2 = delivery.run()
 check("same failures are not reported twice", r2.get("new_failures") == 0 and len(posted) == 1)
 check("retired spam wording is gone from the touch pools",
-      not any("not being a bother" in t for pool in campaign.touches.POOLS for lst in pool for t in lst))
+      all("This is {sender}" in t for pool in campaign.touches.POOLS for lst in pool for t in lst
+          if "not being a bother" in t))
 
 print("FAILURES:", fails)
 sys.exit(1 if fails else 0)

@@ -44,6 +44,11 @@ CODE_MEANING = {
     "30008": "unknown carrier error",
 }
 NEVER_TEXTABLE = {"30005", "30006"}
+# 30003 can be a phone that is only switched off, so one is not proof. Two on
+# the same number means texts cannot reach it: stop TEXTING it and post a board
+# note. Never do-not-call: Jeff keeps calling these (2026-10-12).
+UNREACHABLE_CODE = "30003"
+UNREACHABLE_LIMIT = 2
 SPAM_CODE = "30007"
 WORDING_ALARM = 3       # spam blocks of one wording within WORDING_DAYS
 WORDING_DAYS = 7
@@ -168,6 +173,54 @@ def blocked_wordings() -> dict[str, int]:
     return {w: n for w, n in rows}
 
 
+def unreachable_phones(phones: set[str] | None = None) -> list[str]:
+    """Numbers with UNREACHABLE_LIMIT or more 30003 failures (all, or just `phones`)."""
+    with store.tx() as c:
+        c.execute(SCHEMA)
+        rows = c.execute(
+            "SELECT phone FROM delivery_failures WHERE code=? AND phone<>''"
+            " GROUP BY phone HAVING count(*)>=?", (UNREACHABLE_CODE, UNREACHABLE_LIMIT)).fetchall()
+    found = [r[0] for r in rows]
+    return [p for p in found if phones is None or p in phones]
+
+
+def unreachable_note(phone: str) -> str:
+    p = store.clean_phone(phone)
+    pretty = f"({p[:3]}) {p[3:6]}-{p[6:]}" if len(p) == 10 else phone
+    return (f"Texts to {pretty} are not going through: the carrier reported the phone "
+            f"unreachable / out of service on {UNREACHABLE_LIMIT}+ texts. The SMS agent "
+            "stopped texting this number. Calling is NOT affected, keep calling it.")
+
+
+def stop_unreachable(phone: str) -> dict:
+    """Stop TEXTING a number the carrier keeps calling unreachable (30003).
+
+    Jeff, 2026-10-12: never mark it do-not-call in DataSift, he still calls it.
+    The stop is the agent's own local do-not-text list; the record gets one
+    Message Board note saying the texts are not going through. The note posts
+    once per phone; under DRY_RUN, or if the post fails, it retries next pass.
+    """
+    from . import crm
+
+    store.suppress(phone, f"carrier {UNREACHABLE_CODE} x{UNREACHABLE_LIMIT}+: texts unreachable")
+    store.cancel_queued(phone, f"carrier {UNREACHABLE_CODE} repeatedly, texts unreachable")
+    key = f"unreachable-note:{store.clean_phone(phone)}"
+    if store.get_meta(key):
+        return {"note": "already posted"}
+    record_uuid = (store.lookup_phone(phone) or {}).get("record_uuid") or ""
+    if not record_uuid:
+        return {"note": "no record for this number"}
+    if config.DRY_RUN:
+        log.info("DRY_RUN board note on %s: %s", record_uuid, unreachable_note(phone))
+        return {"note": "dry run"}
+    res = crm.post_note(record_uuid, unreachable_note(phone))
+    if isinstance(res, dict) and res.get("error"):
+        log.warning("unreachable note on %s failed: %s", record_uuid, res["error"])
+        return {"note": "failed", "error": res["error"]}
+    store.set_meta(key, store.now())
+    return {"note": "posted", "record": record_uuid}
+
+
 def _message(new: list[dict]) -> str:
     lines = [f"{len(new)} text(s) NOT delivered:"]
     for it in new:
@@ -183,6 +236,11 @@ def _message(new: list[dict]) -> str:
     if suppressed:
         lines.append(f"{len(suppressed)} number(s) can never take a text and were added to the"
                      " do-not-text list.")
+    dead = unreachable_phones({it["phone"] for it in new if it["code"] == UNREACHABLE_CODE})
+    if dead:
+        lines.append(f"{len(dead)} number(s) unreachable {UNREACHABLE_LIMIT}+ times, texts stopped (calls"
+                     " not affected) and a board note posted: "
+                     + ", ".join("..." + p[-4:] for p in dead))
     return "\n".join(lines)
 
 
@@ -197,6 +255,9 @@ def run(pages: int = 2) -> dict:
         if it["code"] in NEVER_TEXTABLE and it["phone"]:
             store.suppress(it["phone"], f"carrier {it['code']}: {CODE_MEANING[it['code']]}")
             store.cancel_queued(it["phone"], f"carrier {it['code']}, cannot take sms")
+    for phone in unreachable_phones({it["phone"] for it in new
+                                     if it["code"] == UNREACHABLE_CODE and it["phone"]}):
+        stop_unreachable(phone)
     if new:
         from . import escalate
 

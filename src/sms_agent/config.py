@@ -215,6 +215,10 @@ FOLLOWUPS_FIRST = _env("SMS_AGENT_FOLLOWUPS_FIRST", "0") in ("1", "true", "True"
 # That day's number gets DAILY_NUMBER_CAP instead of the per-number cap.
 ONE_NUMBER_PER_DAY = _env("SMS_AGENT_ONE_NUMBER_PER_DAY", "0") in ("1", "true", "True")
 DAILY_NUMBER_CAP = int(_env("SMS_AGENT_DAILY_NUMBER_CAP", "50"))
+# Jeff, 2026-10-12: touch 1 (a NEW record) only starts on a number with at most
+# this many carrier flags. 0 = only a fully clean number; if none is clean,
+# nobody new starts that day (follow-ups still go). -1 = no limit (upstream).
+NEW_START_MAX_FLAGS = int(_env("SMS_AGENT_NEW_START_MAX_FLAGS", "-1"))
 
 # Tulsa fork (Jeff, 2026-10-05): DataSift's do-not-call flag belongs to ONE
 # number, not the owner. Upstream drops the whole record when the search row's

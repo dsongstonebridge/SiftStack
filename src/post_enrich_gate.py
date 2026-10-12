@@ -2,7 +2,9 @@
 
 The user's rules (2026-09-23): he does NOT buy a property that is
 
-  1. carrying **less than 15% equity**, or
+  1. carrying **less than 15% equity** (PROBATE ONLY since 2026-10-12: the user
+     dropped it for foreclosure because the value-spread stop-and-ask already
+     covers it), or
   2. **sold recently**: within the last 3 years for foreclosure (user,
      2026-10-09, all foreclosures from then on), 2 years for probate. The
      foreclosure window was 3 until 2026-09-25, then 2, then back to 3.
@@ -193,13 +195,17 @@ def check_property(prop: dict, *, today: date | None = None,
     # MLS is never an exclusion any more: foreclosure flags it (mls_listed()),
     # probate ignores it.
 
-    equity = prop.get("equity_percent")
-    try:
-        eq = float(equity) if equity not in (None, "") else None
-    except (TypeError, ValueError):
-        eq = None
-    if eq is not None and eq < MIN_EQUITY_PERCENT:
-        reasons.append(f"equity {eq:.2f}% is under {MIN_EQUITY_PERCENT:.0f}%")
+    # Equity is a PROBATE rule only. Foreclosure dropped it 2026-10-12: the
+    # value-spread stop-and-ask (SiftMap value minus the petition's unpaid
+    # principal) already covers it, so the user decides those, not this gate.
+    if probate:
+        equity = prop.get("equity_percent")
+        try:
+            eq = float(equity) if equity not in (None, "") else None
+        except (TypeError, ValueError):
+            eq = None
+        if eq is not None and eq < MIN_EQUITY_PERCENT:
+            reasons.append(f"equity {eq:.2f}% is under {MIN_EQUITY_PERCENT:.0f}%")
 
     years = recent_sale_years(notice_type)
     sold = _parse_date(prop.get("last_sold"))
@@ -365,7 +371,8 @@ def describe(notice_type: str = "foreclosure") -> str:
                 f"years, and not a condo, mobile home, 3+ units or non-residential "
                 f"(DataSift structure type). MLS-listed is allowed. Missing data never "
                 f"excludes.")
-    return (f"Post-enrichment gate: equity at least {MIN_EQUITY_PERCENT:.0f}%, not sold "
-            f"within the last {recent_sale_years(notice_type)} years. MLS-listed is "
+    return (f"Post-enrichment gate: not sold within the last "
+            f"{recent_sale_years(notice_type)} years (equity is left to the value-spread "
+            f"list). MLS-listed is "
             f"kept with status {MLS_STATUS!r} and never traced. Missing data never "
             f"excludes.")

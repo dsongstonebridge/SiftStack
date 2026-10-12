@@ -37,12 +37,18 @@ LIVE = {
 class CheckProperty(unittest.TestCase):
     def test_live_batch(self):
         fails = {k for k, p in LIVE.items() if check_property(p, today=TODAY)}
-        # Watkins (sold 2024-09-20) passed under the 2-year window and fails
-        # under the 3-year one that foreclosure uses from 2026-10-09.
-        self.assertEqual(fails, {"Quick", "Vivas", "Fry", "Alexander", "Watkins"})
-        # Probate keeps the 2-year window, so Watkins would pass there.
-        self.assertEqual(check_property(LIVE["Watkins"], today=TODAY,
-                                        notice_type="probate"), [])
+        # Foreclosure: only the 3-year sale window (equity dropped 2026-10-12,
+        # the value-spread list covers it). Fry and Alexander now pass.
+        self.assertEqual(fails, {"Quick", "Vivas", "Watkins"})
+        # Probate still checks equity and keeps the 2-year window.
+        probate = {k for k, p in LIVE.items()
+                   if check_property(p, today=TODAY, notice_type="probate")}
+        self.assertEqual(probate, {"Quick", "Vivas", "Fry", "Alexander"})
+
+    def test_equity_is_not_a_foreclosure_rule(self):
+        low = prop("x", "-11.60", None)
+        self.assertEqual(check_property(low, today=TODAY), [])
+        self.assertTrue(check_property(low, today=TODAY, notice_type="probate"))
 
     def test_mls_listed_is_never_a_reason(self):
         # 2026-10-09: listed foreclosures are kept and flagged, not excluded.
@@ -59,8 +65,10 @@ class CheckProperty(unittest.TestCase):
                                         today=TODAY), [])
 
     def test_boundaries(self):
-        self.assertEqual(check_property(prop("x", "15.00"), today=TODAY), [])
-        self.assertTrue(check_property(prop("x", "14.99"), today=TODAY))
+        self.assertEqual(check_property(prop("x", "15.00"), today=TODAY,
+                                        notice_type="probate"), [])
+        self.assertTrue(check_property(prop("x", "14.99"), today=TODAY,
+                                       notice_type="probate"))
         # foreclosure: exactly 3 years ago is outside the window; one day later is inside
         self.assertEqual(check_property(prop("x", "50", "2023-09-25"), today=TODAY), [])
         self.assertTrue(check_property(prop("x", "50", "2023-09-26"), today=TODAY))
@@ -152,13 +160,13 @@ class ApplyGate(unittest.TestCase):
 
     def test_deletes_failures_and_forgets_them(self):
         kept, excluded, deleted, forgotten = self.run_gate(LIVE)
-        self.assertEqual([r["Last Name"] for r in kept], ["Miller"])
-        self.assertEqual(sorted(deleted), ["a", "f", "q", "v", "w"])
+        self.assertEqual([r["Last Name"] for r in kept], ["Fry", "Alexander", "Miller"])
+        self.assertEqual(sorted(deleted), ["q", "v", "w"])
         self.assertEqual(sorted(forgotten), sorted(deleted))
         self.assertTrue(all(e["_gate_action"] == "deleted" for e in excluded))
 
     def test_never_deletes_a_worked_record(self):
-        props = {"Old": prop("o", "5.00", phones=["9185550100"])}
+        props = {"Old": prop("o", "50.00", "2025-06-01", phones=["9185550100"])}
         kept, excluded, deleted, forgotten = self.run_gate(props)
         self.assertEqual(kept, [])                 # still not traced
         self.assertEqual(deleted, [])
@@ -209,7 +217,7 @@ class MlsFlag(unittest.TestCase):
         self.assertEqual((tags, posts), ([], []))
 
     def test_listed_but_failing_is_still_deleted_untagged(self):
-        kept, excluded, tags, posts = self.run_one(prop("n", "5.00", None, mls="Listed"))
+        kept, excluded, tags, posts = self.run_one(prop("n", "50.00", "2025-06-01", mls="Listed"))
         self.assertEqual(kept, [])
         self.assertEqual(len(excluded), 1)
         self.assertEqual((tags, posts), ([], []))

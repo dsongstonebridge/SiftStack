@@ -1782,6 +1782,19 @@ DataSift.ai (formerly REISift) is the CRM where scraped records land for niche s
 "Do the daily foreclosure run" / "process the new petitions" is a standing,
 self-contained request — don't ask which folder or which command:
 
+**RUN EVERY FORECLOSURE COMMAND FROM `C:\Users\dsong\SiftStack-foreclosure`,
+NEVER from `C:\Users\dsong\SiftStack-probate`** (Jeff, 2026-10-12, said many
+times). This covers daily runs, backpulls/backfills and foreclosure code. The
+probate folder is for probate only. The OneDrive folder is the SMS agent's, on
+`sms-agent-diego`. The foreclosure folder is a git worktree DETACHED at `main`,
+because git refuses to check `main` out in two folders and probate holds it. It
+shares `output/`, `logs/`, `.claude/` (junctions) and `.env`, the cookie files
+and `smrtphone_state.json` (hardlinks) with the other folders.
+- Before a run: `git checkout --detach main` there, to pick up main's latest code.
+- To commit a change: commit there, then `git push origin HEAD:main` (origin
+  only, never upstream). Then run `git pull --ff-only` in the probate folder,
+  which syncs its `main` and runs nothing.
+
 1. New scanned petition PDFs land in `Desktop\Foreclosure pdfs`. **No text
    layer** — OCR at 300dpi (`image_utils.ocr_page`, psm 4) for the body, and a
    higher-res page-1 crop (400-600dpi, psm 6/11) for the stamped case number

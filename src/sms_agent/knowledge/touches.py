@@ -37,9 +37,9 @@ TOUCH2_NONAME = [
 ]
 TOUCH3 = [
     "Hi {first}, {sender} again about {addr}. If it's yours, have you ever thought about selling it? No pressure at all, just curious!",
-    # Blocked as spam (30007) 16 of 19 times WITHOUT a sender name (retired 2026-10-09). Restored
-    # 2026-10-12 (Jeff) with "This is {sender}." added; the delivery check's wording alarm watches it.
-    "Hey {first}! This is {sender}. I hope I'm not being a bother. I'm interested in {addr} and would love to ask you a couple quick questions. Would a short call work?",
+    # RETIRED FOR GOOD 2026-10-12 (Jeff: "stop using it"): "I hope I'm not being a bother ... Would a
+    # short call work?" Blocked as spam (30007) 16 of 19 times without a sender name, and 2 of 2 on
+    # 10/12 WITH "This is {sender}." added. Do not bring it back in any form.
     "Hi {first}, this is {sender}. I work with homeowners in {city} and I'd love to chat about {addr} for a minute or two. Would you be open to that?",
     "Hey {first}, me again! If you've ever considered an offer on {addr}, I'd love to be the one you talk to first. Can I give you a quick call?",
 ]

@@ -1859,6 +1859,38 @@ per-reply cost, Jeff's call. Parked ideas, not to build unprompted: text touch
 N on the day of call attempt N; Slack thread per replying number (needs a
 Slack app, the webhook cannot thread).
 
+## Text Reply Playbook (Word doc for callers, started 2026-10-13)
+
+"Edit the text reply doc" / "the reply playbook" means
+**`C:\Users\dsong\OneDrive\Desktop\Text Reply Playbook.docx`**. It is the team's
+copy-paste guide for answering seller text replies. It is deliberately NOT in
+this repo (the repo is public and this is a team document); it syncs through
+OneDrive.
+
+- **Jeff writes the responses, not Claude.** He rejected a version where I
+  filled them in. Only add response text when he dictates it or explicitly asks
+  for a draft.
+- **Seven types, in this order:** 1 in the process of a loan modification,
+  2 not right now, 3 call this other person or number, 4 it's not for sale,
+  5 unreasonably high asking price, 6 already have a buyer, 7 listed or going
+  to list it. He found a 15-type version "wayyy too broad"; add a type only
+  when he asks.
+- **Keep it visually simple:** title + one grey line, then per type a bold
+  numbered heading, the real replies in small grey italics, a bold "Response"
+  label with blank lines under it, a bold "Then" label, and a thin grey rule
+  between types. No tables, shaded boxes, quick finder or change log (all
+  removed at his request).
+- Example replies come from real inbound texts (`messages` table,
+  `direction='in'`, in `output/sms_agent/sms_agent.db`), with names and
+  numbers replaced by `[name]` / `[number]`.
+- **Editing safely:** the file now holds Jeff's own writing, so EDIT IT IN
+  PLACE with python-docx (`.venv`), never regenerate it from a script, or his
+  responses are wiped. Read it first and show him what is there. Word holds an
+  exclusive lock: if the save raises PermissionError, ask him to close Word
+  rather than force-closing it. After saving, open it for him
+  (`Start-Process` on the path) and give the link as
+  `[Text Reply Playbook.docx](file:///C:/Users/dsong/OneDrive/Desktop/Text%20Reply%20Playbook.docx)`.
+
 ## DataSift.ai (REISift) Integration
 
 DataSift.ai (formerly REISift) is the CRM where scraped records land for niche sequential marketing campaigns.

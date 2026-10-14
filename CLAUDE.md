@@ -1836,6 +1836,8 @@ lands as a literal backspace byte and silently matches nothing. Write regex
 files with the Write tool, or build the string with `chr(92)`, and assert on
 known inputs.
 
+**NO DAILY TEXT CAP (Jeff, 2026-10-14; he has corrected this repeatedly).** `SMS_AGENT_CAMPAIGN_DAILY_CAP=0` (= every text that is due, up to pool capacity). Never set it to 50 or any other number, never describe the run as "capped at 50", and never pass `--limit` to `campaign` unless Jeff asks. Everyone due a touch gets it the same day. The only limits are the per-number carrier-safety caps (`SMS_AGENT_DAILY_CAP` / `SMS_AGENT_DAILY_NUMBER_CAP`, both 70); if those would cut anyone off, tell Jeff the count instead of dropping people. On 10/14 the batch was exactly 50 because 50 texts were due (an uncapped audit found nobody due and not queued); that was a coincidence, not a cap.
+
 **Status (2026-10-12): LIVE again, Ready to Call restored** (Jeff's yes, full, no `|continue`) at the front of `SMS_AGENT_CAMPAIGN_SOURCES` as `FTM- 02 Ready to Call|0.5|deep`. Its touch 1s go out only from the clean number (see `SMS_AGENT_NEW_START_MAX_FLAGS`). The morning build had already run with Ready to Call off, so the day's guard row (`notifications` phone `YYYYMMDD`, kind `campaign_run`) was deleted and the task restarted to build again; that is the way to force a second build in one day.
 
 **Status (2026-10-09): PAUSED by Jeff.** On 10/8 two workers overlapped and 11 numbers got the same

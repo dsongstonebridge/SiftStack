@@ -1210,10 +1210,10 @@ python src/deep_prospect_smartskip.py promote --street "123 Main St" --city Tuls
 - Tests: `python tests/test_deep_prospect_smartskip.py` (32, offline, fake people).
   NOT yet run on a real record: needs SmartSkip. First live run = one record,
   then read the phones, tags and board back.
-- The installed `fcre-skip-trace` plugin (local marketplace
-  `~/.claude/local-marketplaces/fcre/`) had HTTPS certificate checks switched OFF
-  in four scripts; they were switched back on in that local copy. Its skill
-  triggers on "skip trace", so it can collide with the daily `skip-trace` run.
+- Tyler's `fcre-skip-trace` plugin (company-specific to Florida Cash Real Estate)
+  was installed briefly on 2026-10-16 and UNINSTALLED the same day at Jeff's
+  request: its skill triggers on "skip trace" and would collide with the daily
+  `skip-trace` run. The original `.plugin` file is still in Downloads.
 
 ---
 

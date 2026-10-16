@@ -1859,6 +1859,11 @@ marked Correct after a text reply. `kpi-engine/sms_kpis.py` works them out ON TH
 SMS agent's database is only there), and `trigger_kpi_post.ps1` passes them as the
 workflow's `texts` input (base64 JSON, counts only, no addresses: this repo is public).
 The posts only render them; a run started without the PC says so in the section.
+The sheet keeps them too (Jeff: "just in case"): a **Texts** tab, one row per day keyed by
+Date, written by `fill_sheet.py` (`fill_texts`; re-runs update, days with nothing are
+skipped). In GitHub it writes only the day the PC sent; on the PC
+`py -3 fill_sheet.py --texts-only --since D` works out every day (backfilled from 2026-10-05,
+the agent's first send). The Friday post does NOT read this tab.
 Sources: smrtPhone's SMS log (timestamp is the `created` column, `created_at` is always
 empty; keeps ~30 days), the agent DB (touch = outbox `intent`, reply sorting = `messages`
 intent), and DataSift for ONLY the records whose owner replied. Texts Diego types in

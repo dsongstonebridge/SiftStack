@@ -374,13 +374,54 @@ def delete_empty_rows(ws, key_cols, dry):
             for rn in sorted(empty, reverse=True):
                 ws.delete_rows(rn)
 
+def fill_texts(sh, days, dry):
+    """Texts tab, one row per day (Jeff, 2026-10-16: kept on the sheet like the call stats).
+    In GitHub only the day the PC sent in TEXT_KPIS can be written; on the PC every day in
+    the range is worked out from the SMS agent's database. Never breaks the rest of the fill."""
+    import os
+    import sms_kpis
+    try:
+        got = sms_kpis.from_env_b64(os.environ.get("TEXT_KPIS", ""))
+        if got:
+            day = got.get("day")
+            stats = {day["from"]: day} if day and day["from"] in days else {}
+        elif os.environ.get("GITHUB_ACTIONS"):
+            stats = {}
+        else:
+            stats = sms_kpis.build_days(days)
+        stats = {d: s for d, s in stats.items() if s.get("sent") or s.get("replies")}   # no blank days
+        if not stats:
+            k.log("Texts: nothing to write (no text stats came in for these days)")
+            return
+        rows = {(d,): sms_kpis.sheet_row(s) for d, s in stats.items()}
+        for d, r in sorted(rows.items()):
+            k.log(f"Texts | {d[0]} | " + ", ".join(f"{c}={v}" for c, v in r.items() if v not in ("", 0)))
+        try:
+            ws = sh.worksheet("Texts")
+        except Exception:
+            if dry:
+                k.log("Texts: tab does not exist yet (would be created)")
+                return
+            ws = sh.add_worksheet("Texts", rows=400, cols=len(sms_kpis.SHEET_COLUMNS))
+            ws.update(range_name="A1", values=[sms_kpis.SHEET_COLUMNS])
+            ws.freeze(rows=1)
+            k.log("Texts: tab created")
+        upsert(ws, rows, ["Date"], dry)
+    except Exception as ex:
+        k.log(f"Texts skipped: {type(ex).__name__}: {ex}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--since"); ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--texts-only", action="store_true", help="fill only the Texts tab")
     a = ap.parse_args()
     today = datetime.datetime.now(TZ).date()
     start = datetime.date.fromisoformat(a.since) if a.since else today - datetime.timedelta(days=1)
     days = [(start + datetime.timedelta(days=i)).isoformat() for i in range((today - start).days + 1)]
+    if a.texts_only:
+        fill_texts(open_sheet(readonly=a.dry_run), days, a.dry_run)
+        return
     ftm, lm, leads, acq = build(days)
     FTM_COLS = ["Hours", "New Ps #", "Follow Up  Ps #", "Initial Dial", "FU 1 Dial", "FU2 Dial", "FU 3 Dial",
                 "SMS", "SMS Reply", "Dead", "DNC", "No Answer", "Voicemail", "Wrong", "Correct Initial",
@@ -425,6 +466,7 @@ def main():
         upsert(ws, data, keys, a.dry_run)
         delete_empty_rows(ws, keys, a.dry_run)
     upsert(sh.worksheet("Leads Summary"), {(v["Address"],): {c: x for c, x in v.items() if c != "Address"} for v in leads.values() if v["Address"]}, ["Address"], a.dry_run)
+    fill_texts(sh, days, a.dry_run)
     k.log("sheet fill done" + (" (dry run - nothing written)" if a.dry_run else ""))
 
 if __name__ == "__main__":

@@ -1771,6 +1771,16 @@ gate protects spend, not the CRM.** Any trial of `skip-trace --create` puts real
 records in DataSift — which is exactly why the buy box and `batch_review.py` run
 on the extracted sheet, before creation, rather than as a post-upload cleanup.
 
+## Tulsa Buyer Finder skill (2026-10-16, built, not yet run on Tulsa)
+
+"Find buyers for my deal", "who's buying in 74112", "refresh my buyer list" = the personal skill
+`tulsa-buyer-finder` (live copy `~/.claude/skills/tulsa-buyer-finder/`, backup in
+`skills/tulsa-buyer-finder/`). Read-only SiftMap sweep of single-family sales in the last 12 months,
+ranks business buyers (an ORDER, never a score), CSV + PDF. Proven on Park Hill 74451 (Cherokee
+County) on 2026-10-16: 24 buyers, 241 lookups, zero account changes. Rules: SiftMap only, never CRM
+records; the sweep script has exactly two calls (search, detail); three control searches first;
+stop and report counts before the detail lookups; every paid next step asked first.
+
 ## Tulsa KPI Engine + KPI Bot (daily Slack post + Friday sheet post, 2026-10)
 
 Two pieces, one Slack channel:

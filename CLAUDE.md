@@ -1175,6 +1175,46 @@ Courthouse probate records have decedent name + PR/executor name but NO property
 
 **Retired (kept only as a v4 reference):** `src/enformion_heir.py` / `scripts/enformion_person_search.py`. Failure modes for the record: zero relatives half the time, no phones on the graph, ~50-relative cap that silently truncates, a surname gate that drops married-out daughters, `isDeceased` flags that lag reality, and wrong-person matches when anchored on city/ZIP instead of the full street line.
 
+### Deep prospecting write-back for THIS fork: relatives on the Message Board (2026-10-16)
+
+`src/deep_prospect_smartskip.py` writes a SmartSkip export into DataSift under
+Jeff's rule: **only the living owner(s), or the top heir / PR, go in the phone
+list and get Trestle scored. Every other relative goes on the owner's Message
+Board, one `RELATIVE | name | relationship | number | ...` line per number,
+unscored.** Trestle is never spent on relatives until he says the primary
+numbers came up empty. SmartSkip is for deep prospecting ONLY; regular
+foreclosure/probate records stay on Tracerfy + DataSift skip trace.
+
+```bash
+python src/deep_prospect_smartskip.py write --export smartskip.csv --primary subject
+python src/deep_prospect_smartskip.py write --export smartskip.csv --primary "Jane Doe" \
+    --relationship "Jane Doe=Daughter" --commit          # owner dead, daughter is top heir
+python src/deep_prospect_smartskip.py promote --street "123 Main St" --city Tulsa \
+    --only Son,Daughter,Wife,Husband --commit           # later: closest kin first
+```
+
+- DRY RUN until `--commit`. `--primary` is REQUIRED and never defaults: SmartSkip's
+  Deceased flag is unreliable, so the obituary research decides who is primary.
+- Uses this repo's `datasift_api` (Jeff's account) and `skip_trace_agent.score_phones`
+  (litigator check on), NOT the FCRE plugin's network code. Parser
+  `src/smartskip_parse.py` is the FCRE/v5 parser copied verbatim.
+- Phone tags: `SmartSkip` source + dial tier (litigator REPLACES the tier) +
+  relationship mapped onto the EXISTING tags (Son, Daughter, Wife, Husband,
+  Grandchild, else Relative; never a new one). A number two people share gets no
+  relationship tag. Property tags `SmartSkip Skipped` (+ `TrestleIQ Scored` only
+  when scored). `SmartSkip` and `SmartSkip Skipped` did not exist in the account
+  on 2026-10-16 and will be created on the first real run.
+- `promote` finds the newest post starting `SMARTSKIP RELATIVES - NOT ON THE PHONE
+  LIST`; changing that text orphans every post already written. It skips numbers
+  already on the record and never re-scores a number already carrying a tier.
+- Tests: `python tests/test_deep_prospect_smartskip.py` (32, offline, fake people).
+  NOT yet run on a real record: needs SmartSkip. First live run = one record,
+  then read the phones, tags and board back.
+- The installed `fcre-skip-trace` plugin (local marketplace
+  `~/.claude/local-marketplaces/fcre/`) had HTTPS certificate checks switched OFF
+  in four scripts; they were switched back on in that local copy. Its skill
+  triggers on "skip trace", so it can collide with the daily `skip-trace` run.
+
 ---
 
 ### Legacy: Deceased-Owner Heir Resolution — Enformion (v4, superseded by v5 above)

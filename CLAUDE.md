@@ -1210,6 +1210,41 @@ python src/deep_prospect_smartskip.py promote --street "123 Main St" --city Tuls
 - Tests: `python tests/test_deep_prospect_smartskip.py` (32, offline, fake people).
   NOT yet run on a real record: needs SmartSkip. First live run = one record,
   then read the phones, tags and board back.
+**The runner (`src/deep_prospect_run.py`), three commands, run from
+`C:\Users\dsong\SiftStack-deepprospect` (kept at main, its own `.env` copy
+with `SMARTSKIP_EMAIL` / `SMARTSKIP_PASSWORD`):**
+
+```bash
+python src/deep_prospect_run.py start  --street "123 Main St" --city Tulsa      # FREE
+python src/deep_prospect_run.py start  --street "..." --city Tulsa --search-person "Mary Smith"  # probate: the DECEDENT
+python src/deep_prospect_run.py charge --run output/deep_prospect/123-main-st   # BILLS SmartSkip
+python src/deep_prospect_run.py finish --run output/deep_prospect/123-main-st \
+    --primary "Susan Smith" --relationship "Susan Smith=Daughter" --basis "why" --commit
+```
+
+- `start` = obituary check + SmartSkip upload + free count; stops with the max charge.
+  `charge` pays (saved card, never twice), waits, downloads. `finish` writes phones +
+  relatives post, builds the research PDF and uploads it to the record's **Documents
+  tab** with a board line pointing to it. A Message Board post cannot hold a file (the
+  spec's Message object has no attachment field); `upload_property_document()` is
+  presigned-url -> S3 POST -> register, NOT yet proven live: check the Documents tab on
+  the first real record.
+- **CLAUDE picks `--primary`** from the obituary check and the SmartSkip family; ask Jeff
+  only when the research can't settle it. Business/trust owners are SKIPPED (exit 3)
+  unless a person is named: SmartSkip is not free for them (Jeff: only if free).
+- On probate the DataSift owner is the PR, so search the DECEDENT at the property
+  (`--search-person`), or SmartSkip returns the PR's family.
+- `src/obituary_check.py --name "..." --city Tulsa` is the quick free check on its own:
+  flags the owner's obituary, date of death, survived-by, preceded-by, and the SPOUSE
+  TRAP (owner listed as a survivor = owner alive). It judges the decedent from the title
+  plus the FIRST SENTENCE only; a wider window reads a surviving spouse as the decedent.
+  Live 2026-10-16: found Johnnie Lee Fulton Sr. (1932-2019) on Find a Grave + Legacy.
+- **FREE SEARCH FINDING (2026-10-16):** ddgs backends `google`, `duckduckgo`, `brave`
+  (the list `obituary_enricher._search_obituary` uses) all raised "No results found";
+  only `auto` answered. `obituary_enricher` swallows the error and returns [], so the
+  existing obituary enrichment silently finds nothing. `obituary_check` tries `auto`
+  first. `obituary_enricher` itself is NOT changed yet.
+- Tests: `tests/test_deep_prospect_run.py` (18), `tests/test_obituary_check.py` (14).
 - Tyler's `fcre-skip-trace` plugin (company-specific to Florida Cash Real Estate)
   was installed briefly on 2026-10-16 and UNINSTALLED the same day at Jeff's
   request: its skill triggers on "skip trace" and would collide with the daily

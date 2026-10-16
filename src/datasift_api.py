@@ -916,6 +916,48 @@ def get_message_board(owner_uuid: str) -> list[dict]:
     return _page_items(body)
 
 
+def upload_property_document(property_uuid: str, file_path: str) -> dict:
+    """Attach a file to the record's Documents tab. A Message Board post cannot
+    carry a file (the Message object has no attachment field), so a document is
+    the closest place a PDF can live on the record.
+
+    Three steps, from the spec: GET .../document/presigned-url/ returns an S3
+    presigned POST (url + fields) and a storage_key; the file is POSTed straight
+    to S3; then POST .../document/ registers it. The spec lists `prop` (an
+    integer id) as required, but the record exposes no integer id, so it is
+    left to the URL path. NOT yet proven live (2026-10-16): verify on the first
+    real upload with list_property_documents().
+    """
+    import os as _os
+    import requests as _rq
+    name = _os.path.basename(file_path)
+    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    base = f"{CORE_BASE}/api/internal/property/{property_uuid}/document/"
+    if _DRY_RUN:
+        logger.info("DRY RUN - would upload %s to %s's Documents", name, property_uuid)
+        return {"dry_run": True, "filename": name}
+    pre = _request("GET", base + "presigned-url/") or {}
+    post = pre.get("presigned_post") or {}
+    if not post.get("url") or not pre.get("storage_key"):
+        raise DataSiftAPIError(f"presigned-url returned no upload target: {sorted(pre)}")
+    with open(file_path, "rb") as fh:
+        blob = fh.read()
+    r = _rq.post(post["url"], data=post.get("fields") or {},
+                 files={"file": (name, blob, "application/pdf" if ext == "pdf"
+                                 else "application/octet-stream")}, timeout=60)
+    if r.status_code not in (200, 201, 204):
+        raise DataSiftAPIError(f"S3 upload failed: HTTP {r.status_code} {r.text[:200]}")
+    return _request("POST", base, json_body={"filename": name, "extension": ext,
+                                             "storage_key": pre["storage_key"],
+                                             "size": len(blob)}) or {}
+
+
+def list_property_documents(property_uuid: str) -> list[dict]:
+    """The record's Documents tab. Read-only."""
+    body = _request("GET", f"{CORE_BASE}/api/internal/property/{property_uuid}/document/?limit=100") or {}
+    return _page_items(body)
+
+
 def delete_message_board_post(owner_uuid: str, message_uuid: str) -> None:
     """Delete ONE Message Board post by its exact uuid. Destructive: only ever
     called on a post this run made (see main._skip_preexisting_owners)."""

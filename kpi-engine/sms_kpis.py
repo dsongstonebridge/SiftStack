@@ -139,6 +139,9 @@ def load_agent(db: Path) -> dict | None:
 
 
 # ---------------------------------------------------------------- DataSift
+_LOG_CACHE: dict = {}
+
+
 def crm_outcomes(reply_times: dict, records: dict, day_from: str, day_to: str) -> dict:
     """Leads and Correct numbers that followed a text reply.
 
@@ -155,7 +158,10 @@ def crm_outcomes(reply_times: dict, records: dict, day_from: str, day_to: str) -
     if not by_rec:
         return {"leads": 0, "correct": 0, "records_checked": 0}
     token = pk.get_token()
-    logs = {uuid: pk.get_logs(token, uuid) for uuid in by_rec}
+    for uuid in by_rec:              # one read per record per run (the sheet backfill asks per day)
+        if uuid not in _LOG_CACHE:
+            _LOG_CACHE[uuid] = pk.get_logs(token, uuid)
+    logs = {uuid: _LOG_CACHE[uuid] for uuid in by_rec}
     every = [e for evs in logs.values() for e in evs]
     p_idx = pk.detect_new_index([e for e in every if e.get("event_type") == "owner.phone.status.updated"], "phone")
     s_idx = pk.detect_new_index([e for e in every if e.get("event_type") == "property.status.updated"], "property")
@@ -311,6 +317,48 @@ def build(day: str, week: bool, db: Path) -> dict:
     if week:
         result["week"] = compute(monday, day, log_rows, agent)
     return result
+
+
+def build_days(days: list[str], db: Path = DB_DEFAULT) -> dict:
+    """{day: stats} for several days off one read of the log (the sheet's Texts tab)."""
+    log_rows = fetch_log(min(days))
+    agent = load_agent(db)
+    return {d: compute(d, d, log_rows, agent) for d in days}
+
+
+SHEET_COLUMNS = [
+    "Date", "Sent", "People Texted", "Agent", "By Hand", "New Starts", "Follow-ups",
+    "Delivered", "Delivered %", "Undelivered", "Undelivered %", "Still Pending",
+    "Undelivered Reasons", "Spam Blocks", "Replies", "People Replied",
+    "T1 Sent", "T1 Replied", "T1 Reply %", "T2 Sent", "T2 Replied", "T2 Reply %",
+    "T3 Sent", "T3 Replied", "T3 Reply %", "T4 Sent", "T4 Replied", "T4 Reply %",
+    "Interested", "Not Interested", "Wrong #", "Unclear", "Opt-outs", "Opt-out %",
+    "Leads from Text Reply", "Correct after Text Reply",
+]
+
+
+def sheet_row(s: dict) -> dict:
+    """One day's stats as the Texts tab's columns (Date is the key, not included)."""
+    o = s.get("outcomes") or {}
+    row = {
+        "Sent": s["sent"], "People Texted": s["people_texted"], "Agent": s["agent"],
+        "By Hand": s["by_hand"], "New Starts": s.get("new_starts", ""), "Follow-ups": s.get("follow_ups", ""),
+        "Delivered": s["delivered"], "Delivered %": _pct(s["delivered"], s["sent"]) if s["sent"] else "",
+        "Undelivered": s["undelivered"], "Undelivered %": _pct(s["undelivered"], s["sent"]) if s["sent"] else "",
+        "Still Pending": s["pending"],
+        "Undelivered Reasons": ", ".join(f"{n} {why}" for why, n in s["undelivered_reasons"].items()),
+        "Spam Blocks": "; ".join(f"{n}x {w}" for w, n in s["spam_by_wording"]),
+        "Replies": s["replies"], "People Replied": s["repliers"],
+        "Interested": o.get("interested", ""), "Not Interested": o.get("not_interested", ""),
+        "Wrong #": o.get("wrong_number", ""), "Unclear": o.get("unclear", ""), "Opt-outs": o.get("opt_out", ""),
+        "Opt-out %": _pct(o["opt_out"], s["people_texted"]) if o and s["people_texted"] else "",
+        "Leads from Text Reply": s.get("leads_from_texts", ""),
+        "Correct after Text Reply": s.get("correct_from_texts", ""),
+    }
+    for t, (replied, sent) in (s.get("reply_rate_by_touch") or {}).items():
+        row[f"T{t} Sent"], row[f"T{t} Replied"] = sent, replied
+        row[f"T{t} Reply %"] = _pct(replied, sent) if sent else ""
+    return row
 
 
 # ---------------------------------------------------------------- Slack lines

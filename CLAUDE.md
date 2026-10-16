@@ -1850,6 +1850,24 @@ call log then returns EVERY call (old ones too) in Central, with the zone named 
 (`created_at.timezone`). `smrtphone_calls._local()` reads that field (default UTC), so the
 setting can change again without breaking times. Before the fix, calls read 5 hours early.
 
+**Texts section (Jeff, 2026-10-16).** Both posts carry a separate "💬 Texts" section (daily
+= the day, Friday = Monday..Friday), kept apart from the call numbers. Jeff's picks:
+sent (agent vs by hand), new starts vs follow-ups, delivered / undelivered + reasons, spam
+blocks by wording, replies, reply rate by touch, interested / not interested / wrong # /
+unclear / opt-outs (one outcome per person), leads within 14 days of a text reply, numbers
+marked Correct after a text reply. `kpi-engine/sms_kpis.py` works them out ON THE PC (the
+SMS agent's database is only there), and `trigger_kpi_post.ps1` passes them as the
+workflow's `texts` input (base64 JSON, counts only, no addresses: this repo is public).
+The posts only render them; a run started without the PC says so in the section.
+Sources: smrtPhone's SMS log (timestamp is the `created` column, `created_at` is always
+empty; keeps ~30 days), the agent DB (touch = outbox `intent`, reply sorting = `messages`
+intent), and DataSift for ONLY the records whose owner replied. Texts Diego types in
+DataSift are logged as source `api` like the agent's, so "agent" = matches an agent outbox
+send (number + wording). The PC copy lives in Desktop\SiftStack (branch sms-agent-diego),
+so `sms_kpis.py` and `trigger_kpi_post.ps1` must be the same there as on main. Test
+without posting: `python pull_kpis.py --from D --to D --slack print`,
+`python sms_kpis.py --date D [--week]`.
+
 **smrtPhone session expires ~Oct 31, 2026:** run `kpi-engine\smrtphone_login.bat`, then paste
 `kpi-engine\reports\SMRTPHONE_STATE_paste_me.txt` into the `SMRTPHONE_STATE` GitHub secret.
 

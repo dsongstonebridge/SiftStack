@@ -40,6 +40,8 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import sms_kpis   # text-message section of the post (same folder)
+
 HERE = Path(__file__).resolve().parent
 API = "https://apiv2.reisift.io"
 HEADERS_BASE = {
@@ -930,6 +932,25 @@ def write_xlsx(res: dict, bench: dict, path: Path) -> bool:
     return True
 
 
+def text_stats(day_from: str, day_to: str) -> dict:
+    """Text KPIs for the post. In GitHub they arrive from the PC as the workflow's
+    `texts` input (TEXT_KPIS, base64 JSON); on the PC itself they are worked out here."""
+    got = sms_kpis.from_env_b64(os.environ.get("TEXT_KPIS", ""))
+    if got:
+        day = got.get("day") or {}
+        if day and (day.get("from"), day.get("to")) != (day_from, day_to):
+            return {"error": f"the PC sent text stats for {day.get('from')}, not {day_from}"}
+        return got
+    if day_from != day_to:
+        return {"error": "text stats are worked out one day at a time"}
+    if os.environ.get("GITHUB_ACTIONS"):
+        return {"error": "this run was not started from the PC"}
+    try:
+        return sms_kpis.build(day_from, False, sms_kpis.DB_DEFAULT)
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
 def post_slack(res: dict, webhook: str, bench: dict, note: str = "") -> None:
     a = res["account_totals"]
     dials = a["dials"]
@@ -946,7 +967,6 @@ def post_slack(res: dict, webhook: str, bench: dict, note: str = "") -> None:
         f"• Correct numbers: *{a['correct_numbers']}* ({pct(a['correct_numbers'], dials)})  |  Dials per correct: {dpc}",
         f"• Wrong {a['wrong_numbers']}  |  Dead {a['dead_numbers']}  |  DNC {a['dnc_numbers']}",
         f"• Leads: *{a['leads']}*  |  Qualified (Cold/Warm/Hot): *{a['qualified']}*  |  Not interested: {a['not_interested']}  |  Follow-up tasks: {a['follow_ups']}",
-        f"• Texts: {a['sms_sent']} out / {a['sms_received']} in",
     ]
     sp_out = res.get("sp_outbound")
     if sp_out is not None and dials and abs(sp_out - dials) > max(5, 0.05 * dials):
@@ -963,6 +983,13 @@ def post_slack(res: dict, webhook: str, bench: dict, note: str = "") -> None:
             lines.append(f"• {res['names'].get(email, email)}: {c['dials']} dials, "
                          f"{c['conversations']} convos, {c['correct_numbers']} correct, "
                          f"{c['leads']} leads ({c['qualified']} qualified) — dial floor {'MET' if c['dials'] >= floor and floor else 'BELOW'}")
+    # Texts: their own section, separate from the call numbers (Jeff, 2026-10-16)
+    texts = text_stats(res["from"], res["to"])
+    lines.append(f"*💬 Texts*  |  {period}")
+    lines.extend(sms_kpis.render_lines(texts.get("day"), texts.get("error", "")))
+    if webhook == "print":           # --slack print: show the post, send nothing
+        print("\n".join(lines))
+        return
     r = urllib.request.Request(webhook, data=json.dumps({"text": "\n".join(lines)}).encode(),
                                headers={"content-type": "application/json"}, method="POST")
     with urllib.request.urlopen(r, timeout=15):

@@ -14,6 +14,25 @@ New-Item -ItemType Directory -Force (Split-Path $state) | Out-Null
 
 function Log($m) { "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  $m" | Out-File -Append -Encoding utf8 $log }
 
+# Text KPIs (Jeff, 2026-10-16): the SMS agent's database is only on this PC, so they are
+# worked out here and sent in with the run (sms_kpis.py). A failure never blocks the post;
+# the Texts section then says the stats are not available. Returns base64 JSON or "".
+function Get-TextStats($date, $what) {
+    $ErrorActionPreference = "Continue"
+    $b64 = Join-Path $here "reports\texts_$date.b64"
+    try {
+        Remove-Item $b64 -ErrorAction SilentlyContinue
+        $py = Join-Path (Split-Path -Parent $here) ".venv\Scripts\python.exe"
+        if (-not (Test-Path $py)) { $py = "python" }
+        $pyArgs = @((Join-Path $here "sms_kpis.py"), "--date", $date, "--b64-out", $b64)
+        if ($what -eq "both") { $pyArgs += "--week" }
+        & $py @pyArgs *> (Join-Path $here "reports\texts_last.log")
+        if (Test-Path $b64) { return (Get-Content $b64 -Raw).Trim() }
+        Log "text stats for $date not worked out (see reports\texts_last.log)"
+    } catch { Log "text stats for $date failed: $_" }
+    return ""
+}
+
 $now  = Get-Date
 # Jeff, 2026-10-05: Oct 2 never posted. The PC slept through 6:30; a self-wake at 8:56 Sat
 # started the missed run and sleep killed it. Jeff then used the PC 10:40-12:15 Sat, but
@@ -39,14 +58,15 @@ foreach ($day in $due) {
     $what = if ($day.DayOfWeek -eq "Friday") { "both" } else { "daily" }
     $date = $day.ToString("yyyy-MM-dd")
     $ok = $false
+    $texts = ""
     # right after waking, the network may not be up yet: retry for up to ~15 minutes
     for ($try = 1; $try -le 15 -and -not $ok; $try++) {
+        if (-not $texts) { $texts = Get-TextStats $date $what }
         # on time: leave date blank (same as pressing the button; sheet refills from yesterday)
-        if ($day.Date -eq (Get-Date).Date) {
-            & $gh workflow run kpi-posts.yml --repo $repo -f what=$what 2>&1 | Out-Null
-        } else {
-            & $gh workflow run kpi-posts.yml --repo $repo -f what=$what -f date=$date 2>&1 | Out-Null
-        }
+        $ghArgs = @("workflow", "run", "kpi-posts.yml", "--repo", $repo, "-f", "what=$what")
+        if ($day.Date -ne (Get-Date).Date) { $ghArgs += @("-f", "date=$date") }
+        if ($texts) { $ghArgs += @("-f", "texts=$texts") }
+        & $gh @ghArgs 2>&1 | Out-Null
         if ($LASTEXITCODE -eq 0) { $ok = $true } else { Start-Sleep -Seconds 60 }
     }
     if (-not $ok) { Log "FAILED to start $what for $date after 15 tries"; exit 1 }

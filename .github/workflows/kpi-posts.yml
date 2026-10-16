@@ -19,6 +19,11 @@ on:
         type: string
         required: false
         default: ""
+      texts:
+        description: "Text-message stats from the PC (base64 JSON, filled in by trigger_kpi_post.ps1; leave blank)"
+        type: string
+        required: false
+        default: ""
 
 concurrency: kpi-posts
 
@@ -35,6 +40,8 @@ jobs:
       DATASIFT_API_KEY: ${{ secrets.DATASIFT_API_KEY }}
       KPI_SLACK_WEBHOOK_URL: ${{ secrets.KPI_SLACK_WEBHOOK_URL }}
       SMRTPHONE_STATE: ${{ secrets.SMRTPHONE_STATE }}
+      # Text KPIs come from the PC (the SMS agent's database lives there); see kpi-engine/sms_kpis.py
+      TEXT_KPIS: ${{ github.event.inputs.texts }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

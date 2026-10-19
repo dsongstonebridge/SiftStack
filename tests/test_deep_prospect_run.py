@@ -165,5 +165,29 @@ finish(commit=True)
 check("finish twice: no second PDF, no second board posts",
       len(fake.uploads) == n_up and len(fake.board) == n_board)
 
+# ── one SmartSkip search per property (2026-10-19) ───────────────────
+g = Path(tempfile.mkdtemp()) / "100-fake-st"
+check("fresh property, untagged -> allowed", run.prior_run_reason(g, REC) is None)
+check("record tagged SmartSkip Skipped (string tags) -> refused",
+      run.prior_run_reason(g, {**REC, "tags": [dps.TAG_SMARTSKIP_SKIPPED]}) is not None)
+check("record tagged SmartSkip Skipped (tag objects) -> refused",
+      run.prior_run_reason(g, {**REC, "tags": [{"title": dps.TAG_SMARTSKIP_SKIPPED}]}) is not None)
+g.mkdir(parents=True)
+(g / "state.json").write_text(json.dumps({"bulkSkipId": "B1", "paid": False, "searched": "Mary Smith",
+                                          "started": "2026-10-19"}), encoding="utf-8")
+why = run.prior_run_reason(g, REC)
+check("unpaid earlier order on this address -> refused, names the order",
+      why is not None and "B1" in why and "not paid" in why)
+(g / "state.json").write_text(json.dumps({"bulkSkipId": "B1", "paid": True}), encoding="utf-8")
+check("paid earlier order -> refused, says PAID", "PAID" in (run.prior_run_reason(g, REC) or ""))
+
+import obituary_check  # noqa: E402
+check("people-search sites are never fetched",
+      obituary_check._people_search("https://www.truepeoplesearch.com/find/person/x")
+      and obituary_check._people_search("https://www.fastpeoplesearch.com/name/mary-smith"))
+check("obituary / FindAGrave / Legacy pages still allowed",
+      not obituary_check._people_search("https://www.legacy.com/us/obituaries/name/mary-smith-obituary")
+      and not obituary_check._people_search("https://www.findagrave.com/memorial/123/mary-smith"))
+
 print(f"\n{failures} failure(s)")
 sys.exit(1 if failures else 0)

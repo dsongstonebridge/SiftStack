@@ -194,6 +194,22 @@ def web_search(query: str, max_results: int = 8) -> list[dict]:
     return []
 
 
+#: People-search aggregators are never fetched (Jeff, 2026-10-19: stay away from
+#: people search). Their pages mention "died" often enough to pass the
+#: obituary-word filter below.
+PEOPLE_SEARCH_DOMAINS = ("truepeoplesearch", "fastpeoplesearch", "whitepages", "spokeo",
+                         "beenverified", "radaris", "peoplefinders", "thatsthem", "intelius",
+                         "familytreenow", "cyberbackgroundchecks", "searchpeoplefree",
+                         "peoplesearchnow", "clustrmaps", "instantcheckmate", "truthfinder",
+                         "mylife", "usphonebook", "nuwber", "fastbackgroundcheck", "peoplelooker",
+                         "addresses.com", "411.com", "advancedbackgroundchecks", "publicrecordsnow")
+
+
+def _people_search(url: str) -> bool:
+    u = url.lower()
+    return any(d in u for d in PEOPLE_SEARCH_DOMAINS)
+
+
 def _search_page(url: str) -> bool:
     """Legacy's name-search pages (/obituaries/name/<last>/<first>) list many people."""
     u = url.lower()
@@ -213,6 +229,7 @@ def search(owner: str, city: str, state: str) -> list[dict]:
             url = (h.get("href") or "").split("#")[0]
             blob = (h.get("title", "") + " " + h.get("body", "")).lower()
             if (not url or url in seen or oe._is_listing_url(url) or _search_page(url)
+                    or _people_search(url)
                     or not (oe._is_obituary_url(url) or any(w in blob for w in _OBIT_WORDS))):
                 continue
             seen.add(url)

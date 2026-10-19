@@ -21,7 +21,10 @@
         --basis "Mary died 2026-08-02 (Legacy, Ninde Funeral Home); widowed; Susan is PR" --commit
 
 Rules (Jeff, 2026-10-16): SmartSkip only on records he names for deep
-prospecting; regular records stay on Tracerfy. Business and trust owners are
+prospecting; the person searched is ALWAYS the owner who died or cannot be
+reached, never a relative (2026-10-19) - their family comes back from that one
+search; one search per property, ever (`start` refuses a repeat, see
+prior_run_reason); regular records stay on Tracerfy. Business and trust owners are
 skipped (SmartSkip is not free for them) unless a person is named with
 --search-person. On a probate record the DataSift owner is the PR, so the
 search must be the DECEDENT at the property address, or SmartSkip returns the
@@ -54,6 +57,33 @@ PDF_MARKER = "DEEP PROSPECTING RESEARCH PDF"
 PRICE_PER_HIT = 0.15
 _ENTITY_WORDS = re.compile(r"(?<![A-Z])(TRUST|TTEE|TRUSTEE|LLC|L L C|INC|CORP|COMPANY|LP|LLP|"
                            r"PLLC|FOUNDATION|ESTATE|MINISTRIES|CHURCH|HOLDINGS|PROPERTIES)(?![A-Z])")
+
+
+def _tag_titles(rec: dict) -> set[str]:
+    out = set()
+    for t in rec.get("tags") or []:
+        out.add(t if isinstance(t, str) else (t.get("title") or t.get("name") or ""))
+    return out
+
+
+def prior_run_reason(run: Path, rec: dict) -> str | None:
+    """Why `start` must not open a new SmartSkip order here, or None.
+    A second order on the same property is a second charge: re-running start
+    used to overwrite the saved order with a fresh unpaid one, which `charge`
+    would then pay. Checked two ways, because one property can sit on more than
+    one record (Fulton: three probates, one house) and the same house can be
+    typed two ways."""
+    sf = run / "state.json"
+    if sf.exists():
+        st = json.loads(sf.read_text(encoding="utf-8"))
+        how = "PAID" if st.get("paid") else "created, not paid"
+        return (f"this address already has a deep prospecting run ({run.as_posix()}): "
+                f"SmartSkip order {st.get('bulkSkipId')} {how}, searched {st.get('searched')!r} "
+                f"on {st.get('started')}. Use charge/finish on that run instead.")
+    if dps.TAG_SMARTSKIP_SKIPPED in _tag_titles(rec):
+        return (f"the DataSift record already carries the '{dps.TAG_SMARTSKIP_SKIPPED}' tag, "
+                "so it has been deep prospected before.")
+    return None
 
 
 def slug(street: str) -> str:
@@ -120,6 +150,16 @@ def cmd_start(a) -> int:
         return 3
     at_property = bool(a.search_person) or a.search_at == "property"
     run = RUNS_DIR / slug(a.street)
+    why = prior_run_reason(run, rec)
+    if why and not a.restart:
+        print(f"REFUSED, nothing created or charged: {why}\n"
+              "Only if you really want a second SmartSkip search (a second charge), add --restart.")
+        return 5
+    if why:
+        logger.warning("--restart: %s Opening a NEW SmartSkip order anyway.", why)
+        old = run / "state.json"
+        if old.exists():
+            old.rename(run / f"state.replaced-{int(time.time())}.json")
     run.mkdir(parents=True, exist_ok=True)
 
     row = build_input_row(person, rec, at_property=at_property)
@@ -286,9 +326,12 @@ def main(argv=None) -> int:
     s.add_argument("--street", required=True)
     s.add_argument("--city", default="")
     s.add_argument("--state", default="OK")
-    s.add_argument("--search-person", help="who to search (probate: the decedent)")
+    s.add_argument("--search-person", help="who to search: the owner who died or can't be reached "
+                   "(probate: the decedent, since DataSift lists the PR as owner). Never a relative.")
     s.add_argument("--search-at", choices=["mailing", "property"], default="mailing")
     s.add_argument("--spouse", help="spouse's name, sharpens the obituary check")
+    s.add_argument("--restart", action="store_true",
+                   help="open a NEW SmartSkip order even though this property was run before (second charge)")
     c = sub.add_parser("charge", help="BILLS SmartSkip, waits, downloads")
     c.add_argument("--run", required=True)
     c.add_argument("--wait", type=int, default=1200)

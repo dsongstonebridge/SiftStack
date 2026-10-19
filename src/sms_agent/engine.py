@@ -361,10 +361,11 @@ def _do_opt_out(phone: str, record_uuid: str, matches: Optional[list] = None,
     # means the number gets dialled again tomorrow by someone else.
     targets = _all_records_for(phone, record_uuid, matches)
     for uuid in targets:
-        acts.append(
-            f"CRM tag {config.TAG_OPT_OUT} on {uuid[:8]}: "
-            f"{_report(crm.add_tags(uuid, [config.TAG_OPT_OUT]))}"
-        )
+        if not config.NO_RECORD_OPT_OUT_TAG:
+            acts.append(
+                f"CRM tag {config.TAG_OPT_OUT} on {uuid[:8]}: "
+                f"{_report(crm.add_tags(uuid, [config.TAG_OPT_OUT]))}"
+            )
         crm.post_note(uuid, f"SMS opt-out received from {phone}. Suppressed from all texting.")
     if len(targets) > 1:
         acts.append(f"applied across {len(targets)} records sharing this number")
@@ -617,7 +618,8 @@ def _do_sensitive(phone: str, record_uuid: str, body: str, result,
                 f"phone -> {status} on {uuid[:8]}: "
                 f"{_report(crm.set_phone_status(uuid, phone, status))}"
             )
-            crm.add_tags(uuid, [config.TAG_OPT_OUT])
+            if not config.NO_RECORD_OPT_OUT_TAG:
+                crm.add_tags(uuid, [config.TAG_OPT_OUT])
         crm.post_note(uuid, f'SMS sensitive reply from {phone}: "{body[:220]}"', pinned=bereaved)
 
     if hostile:
@@ -685,8 +687,13 @@ def _do_sensitive(phone: str, record_uuid: str, body: str, result,
         # we would answer a cease-and-desist by posting them a letter.
         stop = hostile or _wants_no_contact(text)
         tag = config.TAG_OPT_OUT if stop else config.TAG_MAIL_ONLY
-        for uuid in ([record_uuid] if record_uuid else []):
-            crm.add_tags(uuid, [tag])
+        if config.NO_RECORD_OPT_OUT_TAG:
+            # Tulsa fork: no record tags from replies, Do Not Market OR Mail
+            # Only (Jeff, 2026-10-19: "i can tag mail only").
+            tag = "no record tag (number only)"
+        else:
+            for uuid in ([record_uuid] if record_uuid else []):
+                crm.add_tags(uuid, [tag])
         if stop:
             store.suppress(phone, "asked to be left alone")
             store.update_conversation(phone, state="opted_out",

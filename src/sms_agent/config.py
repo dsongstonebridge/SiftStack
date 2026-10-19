@@ -199,6 +199,14 @@ ONLY_RECORDS = {x.strip() for x in _env("SMS_AGENT_ONLY_RECORDS", "").split(",")
 # CORRECT_DNC / WRONG_DNC), WRONG, DEAD and the litigator tag still block.
 IGNORE_DNC_FLAG = _env("SMS_AGENT_IGNORE_DNC_FLAG", "0") in ("1", "true", "True")
 
+# Tulsa fork (Jeff, 2026-10-19): an opt-out blocks THAT NUMBER only, never the
+# whole record. Upstream tags the record "Do Not Market" on every STOP, which
+# shut out the owner on 12308 N 107th East Pl after a stranger replied "THIS IS
+# NOT AMY ... stop texting". The number is still suppressed locally, added to
+# smrtPhone's do-not-text list and marked DNC/WRONG as before. Also covers the
+# "Mail Only" tag a soft/bereaved reply used to get: Jeff tags that himself.
+NO_RECORD_OPT_OUT_TAG = _env("SMS_AGENT_NO_RECORD_OPT_OUT_TAG", "0") in ("1", "true", "True")
+
 # Tulsa fork (Jeff, 2026-10-05): text EVERY qualifying number on a record
 # (Dial First/Second, textable line, good status), not only the best one.
 # A record with a number marked Correct still gets only that number.

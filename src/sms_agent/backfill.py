@@ -168,6 +168,9 @@ def apply_terminal(result: Result, commit: bool = False) -> list[str]:
 
         if reply.intent == "OPT_OUT":
             store.suppress(phone, "opt_out")
+            if config.NO_RECORD_OPT_OUT_TAG:
+                actions.append(f"{phone}: suppressed opt_out (number only, no record tag)")
+                continue
             res = crm.add_tags(reply.record_uuid, [config.TAG_OPT_OUT])
             actions.append(f"{phone}: suppressed opt_out, tag {'error' if res.get('error') else 'ok'}")
         else:

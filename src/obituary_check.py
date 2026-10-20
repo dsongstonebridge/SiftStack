@@ -64,7 +64,10 @@ def name_in(name: str, text: str) -> bool:
     if not first:
         return False
     firsts = {first} | {v.upper() for v in oe._get_name_variants(first)}
-    up = (text or "").upper()
+    # A middle INITIAL's period ("Darrell R. Soward") is not a sentence end; the
+    # gap below refuses periods, so without this the owner's own obituary was
+    # missed and then misread as the spouse trap (2026-10-20).
+    up = re.sub(r"(?<![A-Z])([A-Z])\.", r"\1", (text or "").upper())
     for f in firsts:
         if re.search(r"(?<![A-Z])" + re.escape(f) + r"(?![A-Z])(?:[^.]{0,30}?)(?<![A-Z])"
                      + re.escape(last) + r"(?![A-Z])", up):

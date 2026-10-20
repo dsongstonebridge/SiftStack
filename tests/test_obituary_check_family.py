@@ -36,5 +36,15 @@ check("no known family: falls back to LIKELY and says survivors unchecked",
 trap = {"url": "d", "title": "Rhonda Thomas Obituary",
         "text": "Rhonda Thomas of Tulsa passed away May 1, 2026. She is survived by her husband, Russell Wayne Thomas."}
 check("spouse trap still caught", oc.check(owner, city="Tulsa", known=known, pages=[trap])["summary"].startswith("OWNER IS A SURVIVOR"))
+
+initial = {"url": "e", "title": "Darrell R. Soward Obituary - Tulsa, OK",
+           "text": "Darrell R. Soward of Tulsa, Oklahoma passed away on March 25, 2023 at the age of 89. "
+                   "He is survived by: his daughters, Becky and Debbie Bully; his wife Polly; and his son Stephen. "
+                   "Share a memory of Darrell R. Soward."}
+r3 = oc.check("Darrell Raymond Soward", city="Tulsa", spouse="Polly Soward",
+              known=["Debbie Bully", "Becky Bully", "Stephen Soward"], pages=[initial])
+check("a middle initial with a period still matches the owner", oc.name_in("Darrell Raymond Soward", initial["title"]))
+check("owner's own obituary (initial in name) is CONFIRMED, not the spouse trap",
+      r3["summary"].startswith("CONFIRMED"))
 print(fails, "failure(s)")
 sys.exit(1 if fails else 0)

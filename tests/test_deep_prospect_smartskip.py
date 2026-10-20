@@ -193,7 +193,12 @@ check("write: property tags SmartSkip Skipped + TrestleIQ Scored",
       fake.prop_tags[0] == [dp.TAG_SMARTSKIP_SKIPPED, sta.TAG_TRESTLE_SCORED])
 check("write: family post on the board", fake.board and fake.board[0].startswith(dp.FAMILY_MARKER))
 check("write: family post names everyone with a number",
-      all(n in fake.board[0] for n in ALL) and "Kyle Testman" in fake.board[0])
+      all(dp._fmt(n) in fake.board[0] for n in ALL) and "Kyle Testman" in fake.board[0])
+lines = {l.split(" | ")[3]: l for l in fake.board[0].splitlines() if l.count(" | ") >= 3}
+check("write: family post shows each number's dial tier",
+      lines[dp._fmt(DAUGHTER)].split(" | ")[4] == "Dial First")
+check("write: family post shows a litigator number as DO NOT CALL, not a tier",
+      lines[dp._fmt(SON)].split(" | ")[4] == sta.PHONE_TAG_LITIGATOR_RISK)
 check("write: family post is not mistaken for an old relatives post",
       dp.find_relatives_post([{"message": fake.board[0]}]) is None)
 n_posts = len(fake.board)

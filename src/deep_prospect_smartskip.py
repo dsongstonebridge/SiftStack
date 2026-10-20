@@ -159,7 +159,7 @@ def build_plan(rec: dict, primary: list[str], rel_overrides: dict[str, str] | No
     for p in chosen:
         rel = "" if p["is_subject"] else account_rel_tag(p["relationship"])
         primary_out.append({
-            "name": p["name"], "is_subject": p["is_subject"],
+            "name": p["name"], "is_subject": p["is_subject"], "relationship": p["relationship"],
             "phones": [{"number": ph["number"], "type": _phone_type(ph.get("type")),
                         # Only an unshared number can carry a relationship tag.
                         "relationship_tag": rel if rel and len(holders[ph["number"]]) == 1 else ""}
@@ -216,19 +216,31 @@ def build_board_post(plan: dict, *, today: str | None = None) -> str:
     return "\n".join(lines)
 
 
-def build_family_post(plan: dict, *, today: str | None = None) -> str:
-    """Who is who, for a caller looking at a list of scored numbers. Every
+def _fmt(num: str) -> str:
+    return f"{num[:3]}-{num[3:6]}-{num[6:]}" if len(num) == 10 and num.isdigit() else num
+
+
+def build_family_post(plan: dict, *, today: str | None = None,
+                      tiers: dict[str, str] | None = None) -> str:
+    """Who is who, for a caller looking at a list of scored numbers: a dial
+    sheet on its own (Jeff, 2026-10-20), each number with its dial tier. Every
     number here is already on the phone list; relationship tags cannot carry a
     name, so this is where the names live."""
     today = today or date.today().isoformat()
+    tiers = tiers or {}
+
+    def tier(num):
+        return tiers.get(num) or ("not scored yet" if num != "none" else "")
+
     lines = [f"{FAMILY_MARKER} ({today})",
              f"Traced: {plan['subject']}. Call first: "
              + ", ".join(p["name"] for p in plan["primary"]) + ".",
-             "Every number below is on the phone list with its Trestle dial tier.", ""]
+             "Every number below is on the phone list. Name | relationship | number | dial tier.", ""]
     for p in plan["primary"]:
-        who = "Owner (traced subject)" if p["is_subject"] else "Call first"
+        who = "Owner (traced subject)" if p["is_subject"] else (p.get("relationship") or "Call first")
         for ph in p["phones"] or [{"number": "none"}]:
-            lines.append(" | ".join(["CALL FIRST", p["name"], who, ph["number"]]))
+            lines.append(" | ".join(["CALL FIRST", p["name"], who, _fmt(ph["number"]),
+                                     tier(ph["number"])]).rstrip(" |"))
     for b in plan["board"]:
         rel = b["relationship"] + (" (flagged deceased, unverified)" if b["deceased"] else "")
         extra = b["extra"]
@@ -236,7 +248,8 @@ def build_family_post(plan: dict, *, today: str | None = None) -> str:
             extra = "; ".join(x for x in (extra, "also holds " + ", ".join(
                 f"...{s[-4:]}" for s in b["shared"])) if x)
         for num in (b["phones"] or ["none"]):
-            lines.append(" | ".join(["FAMILY", b["name"], rel, num, extra]).rstrip(" |"))
+            lines.append(" | ".join(["FAMILY", b["name"], rel, _fmt(num), tier(num), extra])
+                         .rstrip(" |"))
     if not plan["board"]:
         lines.append("(SmartSkip returned no relatives)")
     return "\n".join(lines)
@@ -354,10 +367,25 @@ def _write_phones(property_uuid: str, owner_uuid: str, rec: dict, people: list[d
                 tags.append(ph["relationship_tag"])
             number_to_tags.setdefault(n, []).extend(tags)
 
+    # Each number's dial tier for the family post: this run's score, else the
+    # tier it already carried on the record. Litigator replaces the tier.
+    existing = {}
+    for p in ((rec.get("owner") or {}).get("phones") or []):
+        n = sta.norm_phone(p.get("number"))
+        t = [x for x in (p.get("tags") or [])
+             if x.startswith("Dial ") or x == "Drop" or x == sta.PHONE_TAG_LITIGATOR_RISK]
+        if n and t:
+            existing[n] = sta.PHONE_TAG_LITIGATOR_RISK if sta.PHONE_TAG_LITIGATOR_RISK in t else t[0]
+    tiers = {}
+    for n in number_to_tags:
+        s = by_number.get(n, {})
+        tiers[n] = (sta.PHONE_TAG_LITIGATOR_RISK if s.get("litigator_risk")
+                    else s.get("tier") or existing.get(n, ""))
+
     out = {"numbers": len(number_to_tags), "new_numbers": len(phones),
            "already_on_record": len(on_record & set(number_to_tags)),
            "scored": len(scored), "already_scored": len(skip & set(number_to_tags)),
-           "ok": True, "missing": {}}
+           "tiers": tiers, "ok": True, "missing": {}}
     if not number_to_tags:
         return out
     if phones:
@@ -391,7 +419,7 @@ def write_record(rec: dict, plan: dict, *, dry_run: bool = True, repost: bool = 
                            "pass --repost to post anyway", existing.get("created"))
             res["posted"] = False
         else:
-            _api.post_message_board(owner_uuid, build_family_post(plan))
+            _api.post_message_board(owner_uuid, build_family_post(plan, tiers=res.get("tiers")))
             res["posted"] = True
         res.update(property_uuid=uuid)
         return res

@@ -278,7 +278,8 @@ def cmd_finish(a) -> int:
     # record is resolved from the run's own address so the two cannot drift.
     rec.update(property_address=state["street"], property_city=state["city"],
                property_state=state["state"])
-    plan = dps.build_plan(rec, a.primary, dps._overrides(a.relationship))
+    plan = dps.build_plan(rec, a.primary, dps._overrides(a.relationship),
+                          subject_deceased=a.decedent)
     dry = not a.commit
     res = dps.write_record(rec, plan, dry_run=dry, repost=a.repost)
 
@@ -342,6 +343,9 @@ def main(argv=None) -> int:
     f.add_argument("--primary", action="append", required=True)
     f.add_argument("--relationship", action="append")
     f.add_argument("--basis", default="", help="why these are the primary people")
+    f.add_argument("--decedent", action="store_true",
+                   help="the obituary or probate filing CONFIRMS the searched person died: "
+                        "label them Decedent, not Owner (always true on a probate search)")
     f.add_argument("--repost", action="store_true")
     f.add_argument("--commit", action="store_true")
     a = ap.parse_args(argv)

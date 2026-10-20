@@ -99,12 +99,17 @@ def pick_record(recs: list[dict], input_name: str | None) -> dict:
     return recs[0]
 
 
-def build_plan(rec: dict, primary: list[str], rel_overrides: dict[str, str] | None = None) -> dict:
+def build_plan(rec: dict, primary: list[str], rel_overrides: dict[str, str] | None = None,
+               *, subject_deceased: bool = False) -> dict:
     """Split one parsed SmartSkip record into phone-list people and board people.
 
     `primary` holds "subject" and/or names of relatives (the top heir / PR).
     `rel_overrides` corrects SmartSkip's coarse labels from the obituary
     research: {"Jane Doe": "Daughter"}.
+    `subject_deceased`: the research (obituary / probate filing) CONFIRMS the
+    traced subject died. The subject is then labelled "Decedent" instead of
+    "Owner", with no "flagged deceased, unverified" note (Jeff, 2026-10-20).
+    SmartSkip's own flag never decides this; it is wrong too often.
 
     A number that a primary person holds goes in the phone list ONCE and is
     dropped from every board line (the owner rule on a shared household line).
@@ -123,7 +128,8 @@ def build_plan(rec: dict, primary: list[str], rel_overrides: dict[str, str] | No
 
     subject = {"name": f"{rec['first']} {rec['last']}".strip(), "relationship": "",
                "phones": rec["subject_phones"], "is_subject": True,
-               "deceased": rec.get("deceased", False)}
+               "deceased": False if subject_deceased else rec.get("deceased", False)}
+    subject_label = "Decedent (traced subject)" if subject_deceased else "Owner (traced subject)"
     people = [subject] + [
         {"name": r["name"], "relationship": override(r["name"], r["canon_rel"]),
          "phones": r["phones"], "is_subject": False, "deceased": r.get("deceased", False),
@@ -172,7 +178,7 @@ def build_plan(rec: dict, primary: list[str], rel_overrides: dict[str, str] | No
             placed.add(ph["number"])
             tagged.append({"number": ph["number"], "type": _phone_type(ph.get("type")),
                            "relationship_tag": rel if rel and len(holders[ph["number"]]) == 1 else ""})
-        label = "Owner (traced subject)" if p["is_subject"] else (p["relationship"] or "Relative")
+        label = subject_label if p["is_subject"] else (p["relationship"] or "Relative")
         board_out.append({
             "name": p["name"], "relationship": label, "deceased": p["deceased"],
             "extra": ", ".join(x for x in (f"age {p['age']}" if p.get("age") else "",
@@ -420,7 +426,7 @@ def promote_record(street: str, city: str, state: str, *, only: set[str] | None 
             if r["number"] in {ph["number"] for ph in p["phones"]}:
                 continue
             tag = account_rel_tag(r["relationship"]) if len(holders[r["number"]]) == 1 else ""
-            if r["relationship"].startswith("Owner"):
+            if r["relationship"].startswith(("Owner", "Decedent")):
                 tag = ""                                  # the traced subject is nobody's relative
             p["phones"].append({"number": r["number"], "type": "", "relationship_tag": tag})
 
@@ -465,6 +471,8 @@ def main(argv: list[str] | None = None) -> int:
     w.add_argument("--primary", action="append", required=True,
                    help="'subject' or a relative's name; repeat for co-owners")
     w.add_argument("--relationship", action="append", help="NAME=Relationship correction")
+    w.add_argument("--decedent", action="store_true",
+                   help="research CONFIRMS the traced subject died: label them Decedent, not Owner")
     w.add_argument("--repost", action="store_true")
     w.add_argument("--commit", action="store_true", help="actually write and bill Trestle")
     p = sub.add_parser("promote", help="old-rule records only: board relatives -> phone list")
@@ -479,7 +487,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if a.cmd == "write":
         rec = pick_record(smartskip_parse.parse(a.export), a.input_name)
-        plan = build_plan(rec, a.primary, _overrides(a.relationship))
+        plan = build_plan(rec, a.primary, _overrides(a.relationship), subject_deceased=a.decedent)
         n = (sum(len(p["phones"]) for p in plan["primary"])
              + sum(len(b["phone_list"]) for b in plan["board"]))
         print(f"PHONE LIST: {n} numbers, all Trestle scored (about ${n * 0.015:.2f}). Call first:",

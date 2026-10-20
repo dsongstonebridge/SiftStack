@@ -91,6 +91,15 @@ check("top heir as primary: her own number tagged Daughter", tags.get(DAUGHTER) 
 check("top heir as primary: the shared line gets no relationship tag", tags.get(SHARED) == "")
 check("top heir as primary: deceased owner goes to the board",
       any(b["relationship"].startswith("Owner") for b in heir["board"]))
+dead = dp.build_plan(REC, ["Susan Testman"], OVR, subject_deceased=True)
+subj = [b for b in dead["board"] if b["name"] == "Robert Testman"][0]
+check("confirmed death: subject labelled Decedent, not Owner",
+      subj["relationship"] == "Decedent (traced subject)")
+fam = dp.build_family_post(dead, today="2026-10-20")
+check("confirmed death: no 'flagged deceased, unverified' note on the decedent",
+      "unverified" not in [l for l in fam.splitlines() if "Robert Testman" in l][0])
+check("confirmed death: decedent's numbers carry no relationship tag",
+      all(not ph["relationship_tag"] for ph in subj["phone_list"]))
 check("--primary is required", raises(lambda: dp.build_plan(REC, [], OVR)))
 check("an unknown --primary name is refused", raises(lambda: dp.build_plan(REC, ["Jane Nobody"], OVR)))
 check("Other Relative maps to the existing Relative tag", dp.account_rel_tag("Other Relative") == "Relative")

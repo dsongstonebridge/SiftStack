@@ -139,6 +139,36 @@ def build_input_row(person: str, rec: dict, *, at_property: bool) -> dict:
             "Property Zip": (a.get("postal_code") or a.get("zip") or "")[:5]}
 
 
+def known_family_from_board(owner_uuid: str) -> list[str]:
+    """Names the probate filing already established (heirs, the PR), read off
+    the record's own Message Board posts. An obituary whose survivors name none
+    of these people is someone else's (Jeff, 2026-10-20)."""
+    names: list[str] = []
+    try:
+        posts = _api.get_message_board(owner_uuid)
+    except Exception as e:                      # noqa: BLE001 - free check, never fatal
+        logger.warning("could not read the board for known family: %s", e)
+        return names
+    for p in posts:
+        text = dps._plain(p.get("message") or "")
+        for line in text.splitlines():
+            line = line.strip()
+            m = re.match(r"(?:Heirs|Named):\s*(.+)", line)
+            if m:
+                # Only "Name (Relationship, address)" entries; the summary line
+                # "Heirs: 2 - MULTIPLE HEIRS..." carries no names.
+                for part in m.group(1).split(";"):
+                    if "(" not in part:
+                        continue
+                    name = part.split("(")[0].strip()
+                    if re.fullmatch(r"[A-Za-z.'\- ]+", name) and 2 <= len(name.split()) <= 5:
+                        names.append(name)
+            m = re.match(r"Personal Rep(?:resentative)?[^:]*:\s*([^-(]+)", line)
+            if m and len(m.group(1).split()) >= 2:
+                names.append(m.group(1).strip())
+    return list(dict.fromkeys(names))
+
+
 # ── 1. start (free) ───────────────────────────────────────────────────
 
 def cmd_start(a) -> int:
@@ -172,8 +202,14 @@ def cmd_start(a) -> int:
         w.writeheader()
         w.writerow(row)
 
+    known = list(a.known or []) + known_family_from_board(owner_uuid)
+    known = [k for k in dict.fromkeys(known) if not obituary_check.name_in(k, person)]
+    if not known and not a.spouse:
+        logger.warning("no known family (no probate heirs on the board, no --spouse/--known): "
+                       "obituary matches cannot be checked against survivors")
     obits = obituary_check.check(person, city=row["Property City"] or a.city, state=a.state,
-                                 street=row["Property Address"], spouse=a.spouse or "")
+                                 street=row["Property Address"], spouse=a.spouse or "",
+                                 known=known)
     (run / "obituary_check.json").write_text(json.dumps(obits, indent=2), encoding="utf-8")
     obit_txt = obituary_check.report(obits)
     (run / "obituary_check.txt").write_text(obit_txt, encoding="utf-8")
@@ -246,10 +282,19 @@ def research_pack(state: dict, plan: dict, obits: dict, basis: str, phone_tags: 
         for ph in p["phones"]:
             tags = ", ".join(phone_tags.get(ph["number"], [])) or "not scored yet"
             lines.append(f"| {p['name']} | {ph['number']} | {tags} |")
-    lines += ["", "## Obituary check", "", f"Top finding: {obits.get('summary')}", ""]
-    for c in obits.get("candidates", []):
-        if c["verdict"].startswith("UNRELATED"):
-            continue
+    lines += ["", "## Obituary check", "", f"Top finding: {obits.get('summary')}",
+              "Known family checked against survivors: "
+              + (", ".join(obits.get("known") or []) or "none on record"), ""]
+    shown = [c for c in obits.get("candidates", [])
+             if not c["verdict"].startswith(obituary_check.RULED_OUT)]
+    # A confirmed obituary is the answer; the other name matches are noise to a
+    # caller and were how a stranger's obituary got read as "likely" (10-20).
+    if any(c["verdict"].startswith("CONFIRMED") for c in shown):
+        shown = [c for c in shown if c["verdict"].startswith("CONFIRMED")]
+    elif shown:
+        lines += ["No obituary is confirmed against the known family. The matches below "
+                  "share a name only; treat each as unverified.", ""]
+    for c in shown:
         lines += [f"- **{c['verdict']}**: {c['title']}", f"  - {c['url']}",
                   f"  - Died: {c['dod'] or 'not found'}"]
         if c.get("survived_by"):
@@ -333,6 +378,9 @@ def main(argv=None) -> int:
                    "(probate: the decedent, since DataSift lists the PR as owner). Never a relative.")
     s.add_argument("--search-at", choices=["mailing", "property"], default="mailing")
     s.add_argument("--spouse", help="spouse's name, sharpens the obituary check")
+    s.add_argument("--known", action="append",
+                   help="a relative already known (heir, PR, child); repeat. Probate heirs and "
+                        "the PR are read off the record's board automatically.")
     s.add_argument("--restart", action="store_true",
                    help="open a NEW SmartSkip order even though this property was run before (second charge)")
     c = sub.add_parser("charge", help="BILLS SmartSkip, waits, downloads")

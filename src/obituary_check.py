@@ -108,9 +108,40 @@ def preceded_by(text: str) -> str:
     return m.group(1).strip() if m else ""
 
 
+def middle_conflict(owner: str, head: str) -> str:
+    """The page names FIRST <other middle> LAST where the owner's middle name is
+    known and different: 'Russell Hand Thomas' is not 'Russell Wayne Thomas'
+    (2026-10-20, a wrong LIKELY on the first live run). Returns the page's
+    middle name, or ""."""
+    t = tokens(owner)
+    if len(t) < 3:
+        return ""
+    first, middle, last = t[0], t[1], t[-1]
+    firsts = {first} | {v.upper() for v in oe._get_name_variants(first)}
+    up = (head or "").upper()
+    for f in firsts:
+        for m in re.finditer(r"(?<![A-Z])" + re.escape(f) + r"\s+([A-Z]+)\.?\s+(?:[A-Z]\.?\s+)?"
+                             + re.escape(last) + r"(?![A-Z])", up):
+            mid = m.group(1)
+            if mid in _SUFFIX or mid == middle or mid == middle[0]:
+                return ""
+            return mid.title()
+    return ""
+
+
+def family_hits(known: list[str], text: str) -> list[str]:
+    """Known relatives (from the probate filing / record) whose FIRST name shows
+    up in the survivors text. First name only: married daughters change surname."""
+    return [k for k in known if k and first_name_in(k, text)]
+
+
 def analyze(page: dict, owner: str, *, city: str = "", street: str = "",
-            spouse: str = "") -> dict:
-    """Flag one candidate page. `page` = {url, title, text}."""
+            spouse: str = "", known: list[str] | None = None) -> dict:
+    """Flag one candidate page. `page` = {url, title, text}.
+
+    `known`: family already known from the probate filing or the record (spouse,
+    heirs, PR). An obituary whose survivors name none of them is NOT this
+    owner's, however well the name and city match (Jeff, 2026-10-20)."""
     text, title = page.get("text") or "", page.get("title") or ""
     # Title + FIRST SENTENCE only: that is where the person who died is named.
     # A wider window reaches "survived by his wife, Margaret" and reads the
@@ -135,13 +166,26 @@ def analyze(page: dict, owner: str, *, city: str = "", street: str = "",
                                           and re.search(r"(?i)\b(wife|husband|spouse)\b", survived)
                                           and not out["name_in_title_or_opening"]))
     owner_preceded = bool(preceded) and name_in(owner, preceded)
-    if owner_survives and not out["name_in_title_or_opening"]:
+    known = [k for k in (known or []) if k and not name_in(k, owner)]
+    family_text = survived + " " + preceded
+    hits = family_hits(known, family_text)
+    other_middle = middle_conflict(owner, head)
+    out.update(known_family_named=hits, other_middle_name=other_middle)
+    named = out["name_in_title_or_opening"]
+    if owner_survives and not named:
         verdict = "OWNER IS A SURVIVOR (someone else's obituary; owner likely ALIVE)"
     elif owner_preceded:
         verdict = "OWNER DIED EARLIER (listed as 'preceded in death' in a relative's obituary)"
-    elif out["name_in_title_or_opening"] and (out["city_mentioned"] or out["street_mentioned"]):
-        verdict = "LIKELY THE OWNER'S OBITUARY (name + place match)"
-    elif out["name_in_title_or_opening"]:
+    elif named and other_middle:
+        verdict = f"DIFFERENT PERSON (middle name {other_middle}, not the owner's)"
+    elif named and hits:
+        verdict = "CONFIRMED (name matches and survivors include known family: " + ", ".join(hits) + ")"
+    elif named and known and survived.strip():
+        verdict = "DIFFERENT PERSON (none of the known family is among the survivors)"
+    elif named and (out["city_mentioned"] or out["street_mentioned"]):
+        verdict = ("LIKELY THE OWNER'S OBITUARY (name + place match; survivors not checked "
+                   "against known family)")
+    elif named:
         verdict = "POSSIBLE (name matches, place not confirmed - check age/relatives)"
     elif out["spouse_named_in_opening"]:
         verdict = "SPOUSE'S OBITUARY (check whether the owner is named as a survivor)"
@@ -238,30 +282,37 @@ def search(owner: str, city: str, state: str) -> list[dict]:
     return out[:10]
 
 
-_RANK = ["OWNER IS A SURVIVOR", "OWNER DIED EARLIER", "LIKELY THE OWNER", "POSSIBLE",
-         "SPOUSE'S OBITUARY", "UNRELATED"]
+_RANK = ["OWNER IS A SURVIVOR", "OWNER DIED EARLIER", "CONFIRMED", "LIKELY THE OWNER", "POSSIBLE",
+         "SPOUSE'S OBITUARY", "DIFFERENT PERSON", "UNRELATED"]
+#: Verdicts that mean "not this owner": hidden from the report and the PDF.
+RULED_OUT = ("DIFFERENT PERSON", "UNRELATED")
 
 
 def check(owner: str, *, city: str = "", state: str = "OK", street: str = "",
-          spouse: str = "", pages: list[dict] | None = None) -> dict:
-    """Search, read and flag. Pass `pages` ([{url, title, text}]) to skip the web."""
+          spouse: str = "", known: list[str] | None = None,
+          pages: list[dict] | None = None) -> dict:
+    """Search, read and flag. Pass `pages` ([{url, title, text}]) to skip the web.
+    `known`: family already known (filing heirs, PR, spouse); see analyze()."""
+    known = list(dict.fromkeys([k for k in ([spouse] + list(known or [])) if k]))
     if pages is None:
         pages = []
         for hit in search(owner, city, state):
             text = fetch_text(hit["url"]) or hit.get("snippet", "")
             pages.append({"url": hit["url"], "title": hit.get("title", ""), "text": text})
-    results = [analyze(p, owner, city=city, street=street, spouse=spouse) for p in pages]
+    results = [analyze(p, owner, city=city, street=street, spouse=spouse, known=known)
+               for p in pages]
     results.sort(key=lambda r: next(i for i, k in enumerate(_RANK) if r["verdict"].startswith(k)))
     top = results[0]["verdict"] if results else "NO OBITUARY FOUND"
-    return {"owner": owner, "city": city, "state": state, "spouse": spouse,
+    return {"owner": owner, "city": city, "state": state, "spouse": spouse, "known": known,
             "summary": top, "candidates": results}
 
 
 def report(res: dict) -> str:
     lines = [f"OBITUARY CHECK: {res['owner']} ({res['city'] or '?'}, {res['state']})",
+             "Known family checked against survivors: " + (", ".join(res.get("known") or []) or "NONE GIVEN"),
              f"Top finding: {res['summary']}", ""]
     for i, c in enumerate(res["candidates"], 1):
-        if c["verdict"].startswith("UNRELATED"):
+        if c["verdict"].startswith(RULED_OUT):
             continue
         lines += [f"{i}. {c['verdict']}", f"   {c['title']}", f"   {c['url']}",
                   f"   died: {c['dod'] or 'not found'}"]
@@ -270,6 +321,9 @@ def report(res: dict) -> str:
         if c["preceded_by"]:
             lines.append("   preceded by: " + re.sub(r"\s+", " ", c["preceded_by"])[:300])
         lines.append("")
+    diff = [c for c in res["candidates"] if c["verdict"].startswith("DIFFERENT PERSON")]
+    for c in diff:
+        lines.append(f"RULED OUT: {c['title']} - {c['verdict']}")
     weak = sum(c["verdict"].startswith("UNRELATED") for c in res["candidates"])
     if weak:
         lines.append(f"({weak} unrelated result(s) hidden; see the JSON)")
@@ -283,11 +337,14 @@ def main(argv=None) -> int:
     ap.add_argument("--state", default="OK")
     ap.add_argument("--street", default="")
     ap.add_argument("--spouse", default="")
+    ap.add_argument("--known", action="append", default=[],
+                    help="a relative already known (heir, PR, child); repeat")
     ap.add_argument("--out", help="write the full JSON here")
     a = ap.parse_args(argv)
     logging.basicConfig(level=logging.WARNING)
     logging.getLogger("ddgs").setLevel(logging.ERROR)
-    res = check(a.name, city=a.city, state=a.state, street=a.street, spouse=a.spouse)
+    res = check(a.name, city=a.city, state=a.state, street=a.street, spouse=a.spouse,
+                known=a.known)
     print(report(res).encode("ascii", "replace").decode("ascii"))
     if a.out:
         os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)

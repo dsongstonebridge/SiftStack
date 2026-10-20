@@ -1,21 +1,22 @@
-"""Deep prospecting: write SmartSkip results into DataSift, relatives on the board.
+"""Deep prospecting: write SmartSkip results into DataSift.
 
-Jeff's rule (2026-10-16): only the living owner(s), or the top heir / PR, go
-in a record's phone list and get Trestle scored. Every other relative SmartSkip
-returns goes on the owner's Message Board, one line per number, and is NOT
-scored. Trestle is never spent on relatives until the primary numbers have been
-worked and come up empty.
+Jeff's rule (2026-10-20, replaces the 2026-10-16 relatives-on-the-board rule):
+EVERY number SmartSkip returns, owner and relatives alike, goes on the phone
+list and gets Trestle scored, the way Ty set it up. Scoring a few, calling,
+missing, then scoring a few more costs more in time than ~$0.015 a number
+saves. The --primary person(s) are who to call first; that is said on the
+board and in the research PDF, not enforced by holding numbers back.
 
 Two commands, both DRY RUN until --commit:
 
-  write    One SmartSkip export record -> phones for the primary person(s)
+  write    One SmartSkip export record -> every number on the phone list
            (SmartSkip source tag + dial tier + relationship tag where it is
-           certain), one Message Board post listing every relative, property
-           tags `SmartSkip Skipped` (+ `TrestleIQ Scored` if anything was scored).
+           certain), one Message Board post saying who is who and who to call
+           first, property tags `SmartSkip Skipped` (+ `TrestleIQ Scored`).
 
-  promote  Later, when Jeff says the primary numbers came up empty: read that
-           record's relatives post back off the board, add those numbers to the
-           phone list, score them, and post a short note saying so.
+  promote  Only for a record written under the old rule (a board post headed
+           BOARD_MARKER): read its relatives back off the board, add those
+           numbers to the phone list, score them, and post a short note.
 
     python src/deep_prospect_smartskip.py write --export smartskip.csv --primary subject
     python src/deep_prospect_smartskip.py write --export smartskip.csv \
@@ -54,6 +55,9 @@ TAG_SMARTSKIP_SKIPPED = "SmartSkip Skipped"
 #: First line of the relatives post. `promote` finds the post by this text, so
 #: changing it orphans every post already written.
 BOARD_MARKER = "SMARTSKIP RELATIVES - NOT ON THE PHONE LIST"
+#: First line of the 2026-10-20 family post (every number already on the phone
+#: list). `promote` never reads it: there is nothing left to add.
+FAMILY_MARKER = "SMARTSKIP FAMILY - ALL NUMBERS ON THE PHONE LIST"
 PROMOTED_MARKER = "SMARTSKIP RELATIVES ADDED TO THE PHONE LIST"
 LINE_PREFIX = "RELATIVE |"
 
@@ -156,9 +160,18 @@ def build_plan(rec: dict, primary: list[str], rel_overrides: dict[str, str] | No
                        for ph in p["phones"]]})
 
     board_out = []
+    placed = set(primary_numbers)
     for p in people:
         if p in chosen:
             continue
+        rel = "" if p["is_subject"] else account_rel_tag(p["relationship"])
+        tagged = []
+        for ph in p["phones"]:
+            if ph["number"] in placed:        # each number written once
+                continue
+            placed.add(ph["number"])
+            tagged.append({"number": ph["number"], "type": _phone_type(ph.get("type")),
+                           "relationship_tag": rel if rel and len(holders[ph["number"]]) == 1 else ""})
         label = "Owner (traced subject)" if p["is_subject"] else (p["relationship"] or "Relative")
         board_out.append({
             "name": p["name"], "relationship": label, "deceased": p["deceased"],
@@ -166,7 +179,8 @@ def build_plan(rec: dict, primary: list[str], rel_overrides: dict[str, str] | No
                                             " ".join(x for x in (p.get("city"), p.get("state")) if x))
                                if x),
             "phones": [ph["number"] for ph in p["phones"] if ph["number"] not in primary_numbers],
-            "shared": [ph["number"] for ph in p["phones"] if ph["number"] in primary_numbers]})
+            "shared": [ph["number"] for ph in p["phones"] if ph["number"] in primary_numbers],
+            "phone_list": tagged})
     return {"subject": subject["name"], "primary": primary_out, "board": board_out}
 
 
@@ -194,6 +208,40 @@ def build_board_post(plan: dict, *, today: str | None = None) -> str:
         lines.append("(SmartSkip returned no relatives)")
     lines += ["", f"{n} relative number(s) held here."]
     return "\n".join(lines)
+
+
+def build_family_post(plan: dict, *, today: str | None = None) -> str:
+    """Who is who, for a caller looking at a list of scored numbers. Every
+    number here is already on the phone list; relationship tags cannot carry a
+    name, so this is where the names live."""
+    today = today or date.today().isoformat()
+    lines = [f"{FAMILY_MARKER} ({today})",
+             f"Traced: {plan['subject']}. Call first: "
+             + ", ".join(p["name"] for p in plan["primary"]) + ".",
+             "Every number below is on the phone list with its Trestle dial tier.", ""]
+    for p in plan["primary"]:
+        who = "Owner (traced subject)" if p["is_subject"] else "Call first"
+        for ph in p["phones"] or [{"number": "none"}]:
+            lines.append(" | ".join(["CALL FIRST", p["name"], who, ph["number"]]))
+    for b in plan["board"]:
+        rel = b["relationship"] + (" (flagged deceased, unverified)" if b["deceased"] else "")
+        extra = b["extra"]
+        if b["shared"]:
+            extra = "; ".join(x for x in (extra, "also holds " + ", ".join(
+                f"...{s[-4:]}" for s in b["shared"])) if x)
+        for num in (b["phones"] or ["none"]):
+            lines.append(" | ".join(["FAMILY", b["name"], rel, num, extra]).rstrip(" |"))
+    if not plan["board"]:
+        lines.append("(SmartSkip returned no relatives)")
+    return "\n".join(lines)
+
+
+def find_family_post(posts: list[dict]) -> dict | None:
+    """Newest post carrying the family marker."""
+    for p in posts:
+        if FAMILY_MARKER in _plain(p.get("message") or ""):
+            return p
+    return None
 
 
 def _plain(text: str) -> str:
@@ -262,8 +310,17 @@ def _write_phones(property_uuid: str, owner_uuid: str, rec: dict, people: list[d
     """Score + upsert + tag a set of numbers. `people` is
     [{"name", "phones": [{"number", "type", "relationship_tag"}]}].
     Same safety as skip_trace_agent.writeback: caller statuses carried into the
-    upsert, tags verified by reading the record back."""
+    upsert, tags verified by reading the record back.
+
+    A number ALREADY on the record (an earlier skip trace, then dialed) is
+    never re-upserted: the upsert replaces the phone object, so it could only
+    overwrite its line type with SmartSkip's guess or put a status at risk. It
+    gets the SmartSkip source tag (true: SmartSkip returned it) and a tier only
+    if it never had one. No relationship tag: whose number it is was settled
+    before SmartSkip, and phone tags cannot be removed (Jeff, 2026-10-20)."""
     skip = _already_tiered(rec)
+    on_record = {sta.norm_phone(p.get("number"))
+                 for p in ((rec.get("owner") or {}).get("phones") or [])} - {None}
     subjects = [{"name": label, "property_address": property_uuid, "people": [
         {"phones": [{"number": ph["number"], "type_raw": ph.get("type") or "",
                      "sources": [SOURCE_SMARTSKIP]}
@@ -277,28 +334,31 @@ def _write_phones(property_uuid: str, owner_uuid: str, rec: dict, people: list[d
         for ph in p["phones"]:
             n = ph["number"]
             s = by_number.get(n, {})
-            entry = {"number": n}
-            if s.get("type_raw") or ph.get("type"):
-                entry["type"] = s.get("type_raw") or ph.get("type")
-            phones.append(entry)
+            if n not in on_record:
+                entry = {"number": n}
+                if s.get("type_raw") or ph.get("type"):
+                    entry["type"] = s.get("type_raw") or ph.get("type")
+                phones.append(entry)
             tags = [SOURCE_SMARTSKIP]
             if s.get("litigator_risk"):
                 tags.append(sta.PHONE_TAG_LITIGATOR_RISK)   # REPLACES the tier
             elif s.get("tier"):
                 tags.append(s["tier"])
-            if ph.get("relationship_tag"):
+            if ph.get("relationship_tag") and n not in on_record:
                 tags.append(ph["relationship_tag"])
             number_to_tags.setdefault(n, []).extend(tags)
 
-    out = {"numbers": len(phones), "scored": len(scored),
-           "already_scored": len(skip & {e["number"] for e in phones}),
+    out = {"numbers": len(number_to_tags), "new_numbers": len(phones),
+           "already_on_record": len(on_record & set(number_to_tags)),
+           "scored": len(scored), "already_scored": len(skip & set(number_to_tags)),
            "ok": True, "missing": {}}
-    if not phones:
+    if not number_to_tags:
         return out
-    current = sta._current_phone_state(property_uuid)
-    for e in phones:
-        e.update(current.get(e["number"], {}))
-    _api.upsert_phones(owner_uuid, phones)
+    if phones:
+        current = sta._current_phone_state(property_uuid)
+        for e in phones:
+            e.update(current.get(e["number"], {}))
+        _api.upsert_phones(owner_uuid, phones)
     check = _api.apply_phone_tags_verified(
         owner_uuid, {n: sorted(set(t)) for n, t in number_to_tags.items()})
     out.update(ok=check["ok"], missing=check.get("missing", {}))
@@ -306,26 +366,28 @@ def _write_phones(property_uuid: str, owner_uuid: str, rec: dict, people: list[d
 
 
 def write_record(rec: dict, plan: dict, *, dry_run: bool = True, repost: bool = False) -> dict:
-    """`write`: primary numbers to the phone list, everyone else to the board."""
+    """`write`: every number to the phone list, scored; who-is-who on the board."""
     _api.set_dry_run(dry_run)
     try:
         uuid, owner_uuid, crm = _resolve(rec["property_address"], rec["property_city"],
                                          rec["property_state"])
-        res = _write_phones(uuid, owner_uuid, crm, plan["primary"],
+        people = plan["primary"] + [{"name": b["name"], "phones": b["phone_list"]}
+                                    for b in plan["board"] if b["phone_list"]]
+        res = _write_phones(uuid, owner_uuid, crm, people,
                             label=plan["subject"], dry_run=dry_run)
         tags = [TAG_SMARTSKIP_SKIPPED] + ([sta.TAG_TRESTLE_SCORED] if res["scored"] else [])
         _api.add_tags(uuid, tags)
         res["property_tags"] = tags
 
-        existing = find_relatives_post(_api.get_message_board(owner_uuid))
+        existing = find_family_post(_api.get_message_board(owner_uuid))
         if existing and not repost:
-            logger.warning("record already has a relatives post (%s) - not posting a second; "
+            logger.warning("record already has a family post (%s) - not posting a second; "
                            "pass --repost to post anyway", existing.get("created"))
             res["posted"] = False
         else:
-            _api.post_message_board(owner_uuid, build_board_post(plan))
+            _api.post_message_board(owner_uuid, build_family_post(plan))
             res["posted"] = True
-        res.update(property_uuid=uuid, board_numbers=sum(len(b["phones"]) for b in plan["board"]))
+        res.update(property_uuid=uuid)
         return res
     finally:
         _api.set_dry_run(False)
@@ -397,7 +459,7 @@ def _overrides(items: list[str]) -> dict[str, str]:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
-    w = sub.add_parser("write", help="SmartSkip export -> phones (primary) + board (relatives)")
+    w = sub.add_parser("write", help="SmartSkip export -> every number on the phone list, scored")
     w.add_argument("--export", required=True)
     w.add_argument("--input-name", help="which record, when the export holds several")
     w.add_argument("--primary", action="append", required=True,
@@ -405,7 +467,7 @@ def main(argv: list[str] | None = None) -> int:
     w.add_argument("--relationship", action="append", help="NAME=Relationship correction")
     w.add_argument("--repost", action="store_true")
     w.add_argument("--commit", action="store_true", help="actually write and bill Trestle")
-    p = sub.add_parser("promote", help="board relatives -> phone list, scored")
+    p = sub.add_parser("promote", help="old-rule records only: board relatives -> phone list")
     p.add_argument("--street", required=True)
     p.add_argument("--city", default="")
     p.add_argument("--state", default="OK")
@@ -418,10 +480,11 @@ def main(argv: list[str] | None = None) -> int:
     if a.cmd == "write":
         rec = pick_record(smartskip_parse.parse(a.export), a.input_name)
         plan = build_plan(rec, a.primary, _overrides(a.relationship))
-        print("PHONE LIST:", "; ".join(f"{p['name']} ({len(p['phones'])})" for p in plan["primary"]))
-        print("BOARD ONLY:", sum(len(b["phones"]) for b in plan["board"]), "numbers across",
-              len(plan["board"]), "people")
-        print("-" * 60 + "\n" + build_board_post(plan) + "\n" + "-" * 60)
+        n = (sum(len(p["phones"]) for p in plan["primary"])
+             + sum(len(b["phone_list"]) for b in plan["board"]))
+        print(f"PHONE LIST: {n} numbers, all Trestle scored (about ${n * 0.015:.2f}). Call first:",
+              "; ".join(f"{p['name']} ({len(p['phones'])})" for p in plan["primary"]))
+        print("-" * 60 + "\n" + build_family_post(plan) + "\n" + "-" * 60)
         res = write_record(rec, plan, dry_run=dry, repost=a.repost)
     else:
         only = {s.strip() for s in a.only.split(",")} if a.only else None

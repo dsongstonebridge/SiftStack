@@ -1,8 +1,8 @@
 """Offline tests for deep_prospect_smartskip (2026-10-16).
 
-Jeff's rule: only the primary person's numbers go in the phone list and get
-Trestle scored; every relative goes on the Message Board until he asks to
-promote them. Fake export, fake people, every API call stubbed -- nothing
+Jeff's rule (2026-10-20): every SmartSkip number, owner and relatives, goes on
+the phone list and gets Trestle scored; the board names who is who and who to
+call first. `promote` stays for records written under the old 2026-10-16 rule. Fake export, fake people, every API call stubbed -- nothing
 touches the CRM and nothing is billed.
 Run: python tests/test_deep_prospect_smartskip.py
 """
@@ -166,21 +166,66 @@ dp._api = fake = FakeAPI()
 sta.score_phones = fake_score
 sta._current_phone_state = lambda uuid: {}
 
+ALL = {OWNER, SHARED, DAUGHTER, SON, NEPHEW}
 res = dp.write_record(REC, plan, dry_run=False)
-sent = {p["number"] for p in fake.upserts[0]}
-check("write: only primary numbers upserted", sent == {OWNER, SHARED})
-check("write: Trestle scored only primary numbers", set(scored_numbers) == {OWNER, SHARED})
+sent = [p["number"] for p in fake.upserts[0]]
+check("write: every SmartSkip number upserted", set(sent) == ALL)
+check("write: each number upserted once", len(sent) == len(set(sent)))
+check("write: Trestle scored every number", set(scored_numbers) == ALL)
+check("write: each number scored once", len(scored_numbers) == len(set(scored_numbers)))
 check("write: phone tags = SmartSkip + tier", fake.tag_calls[0][OWNER] == ["Dial First", "SmartSkip"])
+check("write: daughter's number tagged Daughter", "Daughter" in fake.tag_calls[0][DAUGHTER])
+check("write: nephew tagged Relative (no new tag)", "Relative" in fake.tag_calls[0][NEPHEW])
+check("write: shared household line carries no relationship tag",
+      not set(fake.tag_calls[0][SHARED]) & dp.ACCOUNT_REL_TAGS)
+check("write: litigator REPLACES the tier on a relative's number",
+      sta.PHONE_TAG_LITIGATOR_RISK in fake.tag_calls[0][SON] and "Dial First" not in fake.tag_calls[0][SON])
 check("write: property tags SmartSkip Skipped + TrestleIQ Scored",
       fake.prop_tags[0] == [dp.TAG_SMARTSKIP_SKIPPED, sta.TAG_TRESTLE_SCORED])
-check("write: relatives post on the board", fake.board and fake.board[0].startswith(dp.BOARD_MARKER))
+check("write: family post on the board", fake.board and fake.board[0].startswith(dp.FAMILY_MARKER))
+check("write: family post names everyone with a number",
+      all(n in fake.board[0] for n in ALL) and "Kyle Testman" in fake.board[0])
+check("write: family post is not mistaken for an old relatives post",
+      dp.find_relatives_post([{"message": fake.board[0]}]) is None)
 n_posts = len(fake.board)
 dp.write_record(REC, plan, dry_run=False)
-check("write twice: no second relatives post", len(fake.board) == n_posts)
+check("write twice: no second family post", len(fake.board) == n_posts)
 
-# promote: the owner numbers are now on the record (and tiered)
-fake.phones = [{"number": OWNER, "tags": ["SmartSkip", "Dial First"]},
-               {"number": SHARED, "tags": ["SmartSkip", "Dial Second"]}]
+heir_fake = FakeAPI()
+dp._api = heir_fake
+scored_numbers[:] = []
+dp.write_record(REC, heir, dry_run=False)
+check("top heir as primary: the deceased owner's numbers still go on the list",
+      {p["number"] for p in heir_fake.upserts[0]} == ALL)
+check("top heir as primary: owner's own number carries no relationship tag",
+      not set(heir_fake.tag_calls[0][OWNER]) & dp.ACCOUNT_REL_TAGS)
+
+# a record already skip traced and dialed before deep prospecting
+worked = FakeAPI(phones=[
+    {"number": OWNER, "tags": ["Tracerfy", "Dial Second"], "status": "DEAD"},
+    {"number": DAUGHTER, "tags": ["DataSift"], "status": "NO_ANSWER"}])
+dp._api = worked
+scored_numbers[:] = []
+res = dp.write_record(REC, plan, dry_run=False)
+sent = [p["number"] for p in worked.upserts[0]]
+check("worked record: numbers already on it are NOT re-upserted (no duplicate, no reset)",
+      OWNER not in sent and DAUGHTER not in sent)
+check("worked record: new numbers are added", set(sent) == ALL - {OWNER, DAUGHTER})
+check("worked record: an already-tiered number is not scored again", OWNER not in scored_numbers)
+check("worked record: an untiered existing number gets scored", DAUGHTER in scored_numbers)
+check("worked record: existing tiered number only gains the SmartSkip source tag",
+      worked.tag_calls[0][OWNER] == ["SmartSkip"])
+check("worked record: no relationship tag on a number already on the record",
+      "Daughter" not in worked.tag_calls[0][DAUGHTER])
+status = {p["number"]: p.get("status") for p in worked.phones}
+check("worked record: statuses untouched (still DEAD / NO_ANSWER)",
+      status.get(OWNER) == "DEAD" and status.get(DAUGHTER) == "NO_ANSWER")
+
+# promote (old-rule records): a pre-2026-10-20 relatives post on the board
+fake = FakeAPI(phones=[{"number": OWNER, "tags": ["SmartSkip", "Dial First"]},
+                       {"number": SHARED, "tags": ["SmartSkip", "Dial Second"]}],
+               board=[dp.build_board_post(plan, today="2026-10-16")])
+dp._api = fake
 fake.upserts, fake.tag_calls, scored_numbers[:] = [], [], []
 res = dp.promote_record("100 Fake St", "Tulsa", "OK", only={"Son", "Daughter"}, dry_run=False)
 sent = {p["number"] for p in fake.upserts[0]}

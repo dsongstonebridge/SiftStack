@@ -7,10 +7,11 @@
                job and downloads the results.
     3. finish  Picks nothing on its own: Claude reads the obituary check and the
                SmartSkip family, then passes --primary (owner, or top heir/PR)
-               and --basis (why). Writes the phone list (Trestle scores ONLY the
-               primary numbers), the relatives-only Message Board post, the
-               research PDF to the record's Documents tab, and a board line
-               pointing to it. DRY RUN until --commit.
+               and --basis (why). Writes EVERY SmartSkip number to the phone
+               list, all Trestle scored (Jeff, 2026-10-20), a who-is-who
+               Message Board post naming who to call first, the research PDF
+               to the record's Documents tab, and a board line pointing to it.
+               DRY RUN until --commit.
 
     python src/deep_prospect_run.py start --street "123 Main St" --city Tulsa
     python src/deep_prospect_run.py start --street "123 Main St" --city Tulsa \
@@ -255,14 +256,15 @@ def research_pack(state: dict, plan: dict, obits: dict, basis: str, phone_tags: 
             lines.append("  - Survived by: " + re.sub(r"\s+", " ", c["survived_by"])[:500])
         if c.get("preceded_by"):
             lines.append("  - Preceded by: " + re.sub(r"\s+", " ", c["preceded_by"])[:300])
-    lines += ["", "## Relatives (on the Message Board, not scored)", "",
-              "| Name | Relationship | Numbers |", "|---|---|---|"]
+    lines += ["", "## Family (all on the phone list, scored)", "",
+              "| Name | Relationship | Number | Tags |", "|---|---|---|---|"]
     for b in plan["board"]:
-        nums = ", ".join(b["phones"]) or "none"
         rel = b["relationship"] + (" (flagged deceased, unverified)" if b["deceased"] else "")
-        lines.append(f"| {b['name']} | {rel} | {nums} |")
+        for n in b["phones"] or ["none"]:
+            tags = ", ".join(phone_tags.get(n, [])) or ("" if n == "none" else "not scored yet")
+            lines.append(f"| {b['name']} | {rel} | {n} | {tags} |")
     lines += ["", "SmartSkip's deceased flags and relationship labels are not reliable; "
-              "the obituary decides. Relatives are added and scored only on request."]
+              "the obituary decides."]
     return "\n".join(lines)
 
 

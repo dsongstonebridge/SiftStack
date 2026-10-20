@@ -891,6 +891,7 @@ def score_phones(subjects: list[dict], *, dry_run: bool = True) -> dict[str, dic
         return {}
 
     results: dict[str, dict] = {}
+    no_litigator_answer: list[str] = []
     for i, number in enumerate(sorted(unique), 1):
         try:
             # add_litigator=True: the litigator/TCPA-plaintiff flag is a "do
@@ -904,18 +905,35 @@ def score_phones(subjects: list[dict], *, dry_run: bool = True) -> dict[str, dic
             logger.warning("trestle: %s -> %s", number, data["error"])
             continue
         score = data.get("activity_score")
-        litigator_risk = (data.get("add_ons", {}) or {}).get(
-            "litigator_checks", {}).get("phone.is_litigator_risk")
+        lit_block = (data.get("add_ons") or {}).get("litigator_checks")
+        litigator_risk = (lit_block or {}).get("phone.is_litigator_risk") \
+            if isinstance(lit_block, dict) else None
+        if litigator_risk is None:
+            # A missing answer used to read as "not a litigator", silently.
+            # The account had never seen a single flag (2026-10-20), so the
+            # check has to prove it ran: no answer is reported, never assumed.
+            no_litigator_answer.append(number)
+            if len(no_litigator_answer) == 1:
+                logger.error("trestle: NO litigator answer for %s; add_ons came back as %r",
+                             number, data.get("add_ons"))
         results[number] = {
             "tier": assign_tier(score, DEFAULT_TIERS),
             "score": score,
             "type": (data.get("line_type") or "").title(),
             "litigator_risk": bool(litigator_risk),
+            "litigator_checked": litigator_risk is not None,
         }
         if litigator_risk:
             logger.warning("trestle: %s flagged as LITIGATOR RISK", number)
         if i % 25 == 0:
             logger.info("trestle: %d/%d", i, len(unique))
+    if results:
+        checked = len(results) - len(no_litigator_answer)
+        log = logger.error if no_litigator_answer else logger.info
+        log("trestle: litigator check answered for %d of %d scored number(s)%s",
+            checked, len(results),
+            "" if not no_litigator_answer else
+            " - UNCHECKED numbers are NOT known to be safe: " + ", ".join(no_litigator_answer))
 
     for s in subjects:
         for p in s["people"]:

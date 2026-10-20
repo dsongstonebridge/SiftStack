@@ -139,6 +139,22 @@ def build_input_row(person: str, rec: dict, *, at_property: bool) -> dict:
             "Property Zip": (a.get("postal_code") or a.get("zip") or "")[:5]}
 
 
+def decedent_from_board(owner_uuid: str) -> str:
+    """'Russell Wayne Thomas Jr.' from a 'Decedent: ...' / 'Decedent Name: ...'
+    line on the record's board, without any '(fka ...)' or '(d. ...)' tail."""
+    try:
+        posts = _api.get_message_board(owner_uuid)
+    except Exception as e:                      # noqa: BLE001 - free check, never fatal
+        logger.warning("could not read the board for the decedent's name: %s", e)
+        return ""
+    for p in posts:
+        for line in dps._plain(p.get("message") or "").splitlines():
+            m = re.match(r"\s*Decedent(?: Name)?:\s*([^(\n]+)", line)
+            if m and len(m.group(1).split()) >= 2:
+                return m.group(1).strip().rstrip(",")
+    return ""
+
+
 def known_family_from_board(owner_uuid: str) -> list[str]:
     """Names the probate filing already established (heirs, the PR), read off
     the record's own Message Board posts. An obituary whose survivors name none
@@ -202,12 +218,22 @@ def cmd_start(a) -> int:
         w.writeheader()
         w.writerow(row)
 
+    # The board's probate post carries the decedent's FULL name (middle name,
+    # suffix). Use it for the obituary check, so a middle name is never lost
+    # because the search was typed without one (Jeff, 2026-10-20).
+    full = decedent_from_board(owner_uuid)
+    if full and obituary_check.name_in(person, full) and len(obituary_check.tokens(full)) > \
+            len(obituary_check.tokens(person)):
+        logger.info("obituary check uses the board's full name %r (searched as %r)", full, person)
+        obit_name = full
+    else:
+        obit_name = person
     known = list(a.known or []) + known_family_from_board(owner_uuid)
-    known = [k for k in dict.fromkeys(known) if not obituary_check.name_in(k, person)]
+    known = [k for k in dict.fromkeys(known) if not obituary_check.name_in(k, obit_name)]
     if not known and not a.spouse:
         logger.warning("no known family (no probate heirs on the board, no --spouse/--known): "
                        "obituary matches cannot be checked against survivors")
-    obits = obituary_check.check(person, city=row["Property City"] or a.city, state=a.state,
+    obits = obituary_check.check(obit_name, city=row["Property City"] or a.city, state=a.state,
                                  street=row["Property Address"], spouse=a.spouse or "",
                                  known=known)
     (run / "obituary_check.json").write_text(json.dumps(obits, indent=2), encoding="utf-8")

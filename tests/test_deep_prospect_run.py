@@ -140,7 +140,7 @@ def finish(commit, repost=False):
     return run.cmd_finish(argparse.Namespace(
         run=str(tmp), primary=["Susan Smith"], relationship=["Susan Smith=Daughter"],
         basis="Robert died Aug 2 2026 (obituary); widowed; Susan is the daughter and PR",
-        repost=repost, commit=commit))
+        decedent=True, repost=repost, commit=commit))
 
 
 finish(commit=False)
@@ -150,12 +150,18 @@ check("record resolved from the run's address, not SmartSkip's upper-case copy",
       fake.looked_up == ("100 Fake St", "Tulsa"))
 
 finish(commit=True)
-check("commit: only the top heir's number on the phone list", [p["number"] for p in fake.phones] == ["9185550201"])
-check("commit: her number tagged Daughter", "Daughter" in fake.phones[0]["tags"])
+# Rule since 2026-10-20: every SmartSkip number goes on the phone list.
+check("commit: every SmartSkip number on the phone list",
+      sorted(p["number"] for p in fake.phones) == ["9185550201", "9185550301"])
+check("commit: her number tagged Daughter",
+      "Daughter" in next(p for p in fake.phones if p["number"] == "9185550201")["tags"])
 check("commit: PDF uploaded to Documents", len(fake.uploads) == 1)
-check("commit: board has the relatives post and the PDF line",
-      any(m.startswith(dps.BOARD_MARKER) for m in fake.board)
+check("commit: board has the family post and the PDF line",
+      any(m.startswith(dps.FAMILY_MARKER) for m in fake.board)
       and any(m.startswith(run.PDF_MARKER) for m in fake.board))
+check("commit: confirmed death labels the subject Decedent, not Owner",
+      any("Decedent (traced subject)" in m for m in fake.board)
+      and not any("Owner (traced subject)" in m for m in fake.board))
 md = next(p for p in tmp.iterdir() if p.suffix == ".md").read_text(encoding="utf-8")
 check("research pack names the basis and the obituary", "Susan is the daughter" in md and "example.test/obit" in md)
 check("research pack lists the deceased owner as a board relative", "Robert Smith" in md and "Mark Smith" in md)

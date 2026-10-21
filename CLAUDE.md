@@ -1175,76 +1175,106 @@ Courthouse probate records have decedent name + PR/executor name but NO property
 
 **Retired (kept only as a v4 reference):** `src/enformion_heir.py` / `scripts/enformion_person_search.py`. Failure modes for the record: zero relatives half the time, no phones on the graph, ~50-relative cap that silently truncates, a surname gate that drops married-out daughters, `isDeceased` flags that lag reality, and wrong-person matches when anchored on city/ZIP instead of the full street line.
 
-### Deep prospecting write-back for THIS fork: relatives on the Message Board (2026-10-16)
+### Deep prospecting for THIS fork: SmartSkip, every number scored (rule of 2026-10-20)
 
-`src/deep_prospect_smartskip.py` writes a SmartSkip export into DataSift under
-Jeff's rule: **only the living owner(s), or the top heir / PR, go in the phone
-list and get Trestle scored. Every other relative goes on the owner's Message
-Board, one `RELATIVE | name | relationship | number | ...` line per number,
-unscored.** Trestle is never spent on relatives until he says the primary
-numbers came up empty. SmartSkip is for deep prospecting ONLY; regular
-foreclosure/probate records stay on Tracerfy + DataSift skip trace.
+**LIVE since 2026-10-20** (first two records: 3316 S 144th E Ave, probate
+PB-2026-856; 6306 E 24th Pl, obituary pre-probate). Jeff names each record; SmartSkip
+is for deep prospecting ONLY (regular foreclosure/probate records stay on Tracerfy +
+DataSift skip trace). Run from `C:\Users\dsong\SiftStack-deepprospect` (kept at main,
+its own `.env` copy with `SMARTSKIP_EMAIL` / `SMARTSKIP_PASSWORD`).
 
-```bash
-python src/deep_prospect_smartskip.py write --export smartskip.csv --primary subject
-python src/deep_prospect_smartskip.py write --export smartskip.csv --primary "Jane Doe" \
-    --relationship "Jane Doe=Daughter" --commit          # owner dead, daughter is top heir
-python src/deep_prospect_smartskip.py promote --street "123 Main St" --city Tulsa \
-    --only Son,Daughter,Wife,Husband --commit           # later: closest kin first
-```
-
-- DRY RUN until `--commit`. `--primary` is REQUIRED and never defaults: SmartSkip's
-  Deceased flag is unreliable, so the obituary research decides who is primary.
-- Uses this repo's `datasift_api` (Jeff's account) and `skip_trace_agent.score_phones`
-  (litigator check on), NOT the FCRE plugin's network code. Parser
-  `src/smartskip_parse.py` is the FCRE/v5 parser copied verbatim.
-- Phone tags: `SmartSkip` source + dial tier (litigator REPLACES the tier) +
-  relationship mapped onto the EXISTING tags (Son, Daughter, Wife, Husband,
-  Grandchild, else Relative; never a new one). A number two people share gets no
-  relationship tag. Property tags `SmartSkip Skipped` (+ `TrestleIQ Scored` only
-  when scored). `SmartSkip` and `SmartSkip Skipped` did not exist in the account
-  on 2026-10-16 and will be created on the first real run.
-- `promote` finds the newest post starting `SMARTSKIP RELATIVES - NOT ON THE PHONE
-  LIST`; changing that text orphans every post already written. It skips numbers
-  already on the record and never re-scores a number already carrying a tier.
-- Tests: `python tests/test_deep_prospect_smartskip.py` (32, offline, fake people).
-  NOT yet run on a real record: needs SmartSkip. First live run = one record,
-  then read the phones, tags and board back.
-**The runner (`src/deep_prospect_run.py`), three commands, run from
-`C:\Users\dsong\SiftStack-deepprospect` (kept at main, its own `.env` copy
-with `SMARTSKIP_EMAIL` / `SMARTSKIP_PASSWORD`):**
+**THE RULE (Jeff, 2026-10-20, replaces the 2026-10-16 relatives-on-the-board rule):
+every number SmartSkip returns, owner and relatives alike, goes on the phone list
+and gets Trestle scored**, the way Ty set it up. Scoring a few, calling, missing,
+then scoring more costs more in time than ~$0.015 a number saves. Who to call first
+is said on the board and in the PDF, never enforced by holding numbers back.
 
 ```bash
-python src/deep_prospect_run.py start  --street "123 Main St" --city Tulsa      # FREE
-python src/deep_prospect_run.py start  --street "..." --city Tulsa --search-person "Mary Smith"  # probate: the DECEDENT
+python src/deep_prospect_run.py start  --street "123 Main St" --city Tulsa \
+    --search-person "Mary Smith" --search-at property --spouse "John Smith" \
+    --known "Susan Smith"                                    # FREE
 python src/deep_prospect_run.py charge --run output/deep_prospect/123-main-st   # BILLS SmartSkip
-python src/deep_prospect_run.py finish --run output/deep_prospect/123-main-st \
-    --primary "Susan Smith" --relationship "Susan Smith=Daughter" --basis "why" --commit
+python src/deep_prospect_run.py finish --run output/deep_prospect/123-main-st --decedent \
+    --primary "Susan Smith" --relationship "Susan Smith=Daughter" --basis "why"  # dry run
+python src/deep_prospect_run.py finish ... --commit          # BILLS Trestle, writes
 ```
 
-- `start` = obituary check + SmartSkip upload + free count; stops with the max charge.
-  `charge` pays (saved card, never twice), waits, downloads. `finish` writes phones +
-  relatives post, builds the research PDF and uploads it to the record's **Documents
-  tab** with a board line pointing to it. A Message Board post cannot hold a file (the
-  spec's Message object has no attachment field); `upload_property_document()` is
-  presigned-url -> S3 POST -> register, NOT yet proven live: check the Documents tab on
-  the first real record.
-- **CLAUDE picks `--primary`** from the obituary check and the SmartSkip family; ask Jeff
-  only when the research can't settle it. Business/trust owners are SKIPPED (exit 3)
-  unless a person is named: SmartSkip is not free for them (Jeff: only if free).
-- On probate the DataSift owner is the PR, so search the DECEDENT at the property
-  (`--search-person`), or SmartSkip returns the PR's family.
-- `src/obituary_check.py --name "..." --city Tulsa` is the quick free check on its own:
-  flags the owner's obituary, date of death, survived-by, preceded-by, and the SPOUSE
-  TRAP (owner listed as a survivor = owner alive). It judges the decedent from the title
-  plus the FIRST SENTENCE only; a wider window reads a surviving spouse as the decedent.
-  Live 2026-10-16: found Johnnie Lee Fulton Sr. (1932-2019) on Find a Grave + Legacy.
-- **FREE SEARCH FINDING (2026-10-16):** ddgs backends `google`, `duckduckgo`, `brave`
-  (the list `obituary_enricher._search_obituary` uses) all raised "No results found";
-  only `auto` answered. `obituary_enricher` swallows the error and returns [], so the
-  existing obituary enrichment silently finds nothing. `obituary_check` tries `auto`
-  first. `obituary_enricher` itself is NOT changed yet.
-- Tests: `tests/test_deep_prospect_run.py` (18), `tests/test_obituary_check.py` (14).
+**Two spend stops per record, and Claude asks Jeff before each** (standing
+no-unapproved-spend rule; the code itself only gates on `--commit`):
+1. `charge`: SmartSkip, ~$0.15 per hit, on the **saved card (Visa ...9901), NOT the
+   wallet**. Bulk skip pays by card payment-intent; Ty saw the card charged while
+   the wallet sat untouched. Jeff expected the wallet; he may ask SmartSkip support.
+2. `finish --commit`: Trestle on every NEW number, ~$0.015 each (14 numbers = $0.21
+   on 6306). Run `finish` without `--commit` first and quote the count it prints.
+
+**Before `start`, read the record (Jeff, 2026-10-20, after a miss):** its Message
+Board (probate post: decedent's FULL name, PR, heirs), notes, and the county owner of
+record (`tulsa_assessor.search_assessor`, free). `start` now pulls the decedent's full
+name and the known family off the board automatically (`decedent_from_board`,
+`known_family_from_board`), but obituary-sourced records may have an EMPTY board
+(6306's heir map lives only in `output/datasift_ready_*.csv`), so pass `--spouse` /
+`--known` by hand. **Who is searched:** always the owner who died or can't be
+reached, never a relative; on probate that is the DECEDENT at the property
+(`--search-person ... --search-at property`), or SmartSkip returns the PR's family.
+One search per property: `start` refuses a repeat (`--restart` = second charge; an
+unpaid order is never billed).
+
+**Before `finish --commit`, read the generated `Deep_Prospecting_*.md` yourself.**
+On 3316 a PDF went up calling a stranger's obituary "likely" because nobody read it.
+
+**Obituary check (`src/obituary_check.py`), rules learned on the live runs:**
+- An obituary is the owner's only if its survivors include the KNOWN family (from
+  the filing / board / `--spouse` / `--known`): match = **CONFIRMED**; survivors
+  naming none of them = **DIFFERENT PERSON**. A different middle name ("Russell
+  Hand Thomas" vs "Russell Wayne Thomas") = DIFFERENT PERSON. Ruled-out pages are
+  hidden from the report and the PDF; the PDF shows only the confirmed obituary
+  when one exists. With no known family it falls back to LIKELY and says so.
+- A middle initial's period ("Darrell R. Soward") broke the name match, and the
+  owner's own obituary was then misread as the SPOUSE TRAP. Fixed (6908292).
+- The free web search often misses the real obituary (all 10 results unrelated on
+  6306). When Claude finds it by hand, feed the page through
+  `obituary_check.check(..., pages=[{url, title, text}])` and rewrite the run's
+  `obituary_check.json`/`.txt` so the PDF carries the confirmed obituary.
+- Stay away from people-search sites (TruePeopleSearch etc.); obituary pages,
+  Find a Grave, Legacy, Echovita, assessor/deed and court pages are fine. ddgs
+  backends `google`/`duckduckgo`/`brave` return nothing; only `auto` works
+  (`obituary_enricher` still swallows this and finds nothing; not fixed, per Jeff).
+
+**What `finish` writes (`src/deep_prospect_smartskip.py`):**
+- Every SmartSkip number -> phone list with tags `SmartSkip` + dial tier
+  (litigator `DO NOT CALL - Litigator Risk` REPLACES the tier) + a relationship tag
+  mapped onto the EXISTING tags (Wife, Husband, Son, Daughter, Grandchild, else
+  Relative; never a new one). A number two people share gets no relationship tag.
+  SmartSkip's past neighbors ("Associate") are dropped.
+- **Numbers already on the record are never re-upserted** (the upsert replaces the
+  phone object, so it could overwrite line type or a caller's status). They only
+  gain the `SmartSkip` source tag, a tier only if they never had one, and never a
+  relationship tag. Verified live: 11 (3316) and 5 (6306) worked numbers unchanged.
+- One Message Board post, `SMARTSKIP FAMILY - ALL NUMBERS ON THE PHONE LIST`, a dial
+  sheet on its own: `CALL FIRST|FAMILY | name | relationship | 918-555-0101 | Dial X`.
+  `--decedent` (pass it whenever the obituary/filing confirms the death, always on
+  probate) labels the subject "Decedent (traced subject)" instead of "Owner".
+- Research PDF -> the record's **Documents tab** (proven live) + a board line
+  pointing to it. Property tags `SmartSkip Skipped` + `TrestleIQ Scored`.
+- `promote` only handles records written under the OLD rule (a post headed
+  `SMARTSKIP RELATIVES - NOT ON THE PHONE LIST`); none exist live.
+
+**Trestle litigator check: proven working 2026-10-20.** The account had NEVER
+carried the litigator tag, and a missing answer used to read as "not a litigator"
+silently. `skip_trace_agent.score_phones` now logs `litigator check answered for N
+of M` and errors on any number with no answer (4fdf5cf). Live: 9 of 9 and 14 of 14
+answered, none flagged. **Tags need re-sends** on most runs (DataSift's silent
+`set_phone_tags` failure); `apply_phone_tags_verified` handles it, twice on 6306.
+The code still estimates Trestle at $0.015/number; Jeff thinks it may be $0.02 with
+the litigator add-on (unconfirmed, check the Trestle invoice).
+
+**After every `--commit`:** snapshot the record's phones (number, status, type,
+tags) BEFORE, then read back and diff: old numbers unchanged, no duplicates, new
+numbers tagged, family post + PDF present.
+
+- Tests (offline, nothing billed): `tests/test_deep_prospect_smartskip.py` (54),
+  `tests/test_deep_prospect_run.py` (26), `tests/test_obituary_check.py` (14),
+  `tests/test_obituary_check_family.py` (9).
 - Tyler's `fcre-skip-trace` plugin (company-specific to Florida Cash Real Estate)
   was installed briefly on 2026-10-16 and UNINSTALLED the same day at Jeff's
   request: its skill triggers on "skip trace" and would collide with the daily

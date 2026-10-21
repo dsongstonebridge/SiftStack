@@ -33,6 +33,8 @@ Steps 3 and 4 are IDENTICAL to 9:29. Only steps 1 and 2 change:
    `output/petition_ocr/`, plus a summary flagging cases already processed.
 2. The `petition-extractor` agent (`.claude/agents/petition-extractor.md`, file-only, Sonnet) reads
    the cached text and writes one JSON per petition to `output/petition_rows/`.
+   `.claude/` is gitignored, so a backup copy is committed as
+   `methods/0930/petition-extractor.agent.md`; after editing the live agent, copy it there.
    `python src/merge_petition_rows.py` checks every value's type, checks each quoted piece of
    evidence against the OCR text, and writes `output/petition_batch.xlsx`. Claude hand-reads only
    the rows it flags.

@@ -75,7 +75,7 @@ def _preflight_check(mode: str, searches: list[SavedSearch] | None = None) -> li
             failures.append("TNPN_EMAIL / TNPN_PASSWORD not set (required for list-searches)")
     if mode in scrape_modes:
         # Only require TNPN creds when tnpn-source searches are in scope.
-        # OK searches (OSCN, TinStar) are public and need no credentials.
+        # OK searches (OSCN) are public and need no credentials.
         active = searches if searches is not None else list(SAVED_SEARCHES)
         has_tnpn = any(s.source == "tnpn" for s in active)
         if has_tnpn:
@@ -3443,11 +3443,6 @@ def cli_main() -> None:
         help="Ignore cached tax-delinquent scan and do a full re-scan from oktaxrolls.com",
     )
     parser.add_argument(
-        "--force-tinstar",
-        action="store_true",
-        help="Run TinStar scraper regardless of day of week (normally Fridays only)",
-    )
-    parser.add_argument(
         "--max-notices",
         type=int,
         default=0,
@@ -3698,7 +3693,7 @@ def cli_main() -> None:
     parser.add_argument(
         "--acclaim-only",
         action="store_true",
-        help="Run Acclaim scraper only — skips OSCN, TinStar, Tulsa World, and tax scraper",
+        help="Run Acclaim scraper only — skips OSCN, Tulsa World, and tax scraper",
     )
     parser.add_argument(
         "--llm-backend",
@@ -4354,7 +4349,6 @@ def _run_scrape_pipeline(args, searches) -> None:
 
     tnpn_searches       = [] if _acclaim_only else [s for s in searches if s.source == "tnpn"]
     oscn_searches        = [] if _acclaim_only else [s for s in searches if s.source == "oscn"]
-    tinstar_searches     = [] if _acclaim_only else [s for s in searches if s.source == "tinstar"]
     oktaxrolls_searches  = [] if _acclaim_only else [s for s in searches if s.source == "oktaxrolls"]
     tulsaworld_searches  = [] if _acclaim_only else [s for s in searches if s.source == "tulsaworld"]
     acclaimed_searches   = [s for s in searches if s.source == "acclaimed"]
@@ -4414,26 +4408,6 @@ def _run_scrape_pipeline(args, searches) -> None:
             logging.info("Tax delinquent: %d records fetched (writing to separate CSV)", len(td_notices))
         except Exception:
             logging.exception("Tax delinquent scrape failed")
-
-    # ── TinStar sheriff sale scraper (Fridays only — list updates weekly) ──
-    _is_friday = datetime.now().weekday() == 4
-    _force_tinstar = getattr(args, "force_tinstar", False)
-    if tinstar_searches and (_is_friday or _force_tinstar):
-        from tinstar_scraper import scrape_tinstar
-        logging.info("Scraping %d TinStar search(es) for Tulsa County", len(tinstar_searches))
-        for search in tinstar_searches:
-            try:
-                ts_notices = asyncio.run(scrape_tinstar(
-                    county=search.county,
-                    since_date=since_date,
-                    email=config.TINSTAR_EMAIL,
-                    password=config.TINSTAR_PASSWORD,
-                ))
-                all_notices.extend(ts_notices)
-            except Exception:
-                logging.exception("TinStar scrape failed for %s", search.county)
-    elif tinstar_searches and not _is_friday:
-        logging.info("TinStar skipped (runs Fridays only — use --force-tinstar to override)")
 
     # ── Tulsa World legal notice scraper (Column.us REST API) ────────────
     if tulsaworld_searches:
@@ -4695,8 +4669,6 @@ def _run_scrape_pipeline(args, searches) -> None:
         _active_sources.append("tnpn")
     if oscn_searches:
         _active_sources.append("oscn")
-    if tinstar_searches:
-        _active_sources.append("tinstar")
     if oktaxrolls_searches:
         _active_sources.append("taxrolls")
     if tulsaworld_searches:

@@ -135,11 +135,9 @@ BASE_URL = "https://www.tnpublicnotice.com"
 LOGIN_URL = f"{BASE_URL}/authenticate.aspx"
 SMART_SEARCH_URL = f"{BASE_URL}/Smartsearch/Default.aspx"
 
-# Oklahoma sources (no login required for OSCN; TinStar may require account)
+# Oklahoma sources (no login required for OSCN)
+# (Sheriff sale dates come from src/tinstar_sale_check.py, a separate weekly check.)
 OSCN_SEARCH_URL = "https://www.oscn.net/dockets/Search.aspx"
-TINSTAR_REPORTS_URL = "https://www.tinstar.io/reports"
-TINSTAR_EMAIL = os.getenv("TINSTAR_EMAIL", "")
-TINSTAR_PASSWORD = os.getenv("TINSTAR_PASSWORD", "")
 ACCLAIM_EMAIL = os.getenv("acclaim_EMAIL", "")       # Tulsa County Clerk document search
 ACCLAIM_PASSWORD = os.getenv("acclaim_PASSWORD", "")
 
@@ -222,7 +220,7 @@ class SavedSearch:
     county: str
     notice_type: str  # One of NOTICE_TYPES
     saved_search_name: str  # Display name / dropdown label
-    source: str = "tnpn"   # "tnpn" | "oscn" | "tinstar" | "oktaxrolls" | "acclaimed"
+    source: str = "tnpn"   # "tnpn" | "oscn" | "oktaxrolls" | "acclaimed"
 
 
 # ── Saved Searches ─────────────────────────────────────────────────────
@@ -244,8 +242,6 @@ SAVED_SEARCHES: list[SavedSearch] = [
     SavedSearch("Tulsa", "probate",     "Tulsa County Probate",          source="oscn"),
     SavedSearch("Tulsa", "foreclosure", "Tulsa County OSCN Foreclosure", source="oscn"),
     SavedSearch("Tulsa", "eviction",    "Tulsa County FED",              source="oscn"),
-    # TinStar: Tulsa County Sheriff scheduled auction properties (disabled -- too short lead time)
-    # SavedSearch("Tulsa", "foreclosure",    "Tulsa County Sheriff Sale",   source="tinstar"),
     # OKTaxRolls: Tulsa County Treasurer delinquent tax list
     SavedSearch("Tulsa", "tax_delinquent", "Tulsa County Tax Delinquent", source="oktaxrolls"),
     # Tulsa World (Column.us): published legal notices — foreclosures, power of sale, probate RE sales

@@ -1781,6 +1781,47 @@ County) on 2026-10-16: 24 buyers, 241 lookups, zero account changes. Rules: Sift
 records; the sweep script has exactly two calls (search, detail); three control searches first;
 stop and report counts before the detail lookups; every paid next step asked first.
 
+## TinStar sheriff-sale check (weekly, 2026-10-21)
+
+`src/tinstar_sale_check.py` + personal skill `tinstar-sale-check` (full rules there) +
+the **auction-date-agent** (`.claude/agents/`), which does this job and nothing else.
+**The CRM is READ-ONLY here except Message Board posts** (Jeff, 2026-10-21); a test
+fails if the script calls any other DataSift write. Not on Ty's org chart (Jeff's call).
+The Sheriff's "Foreclosure Sales List" (tcso.org -> tinstar.io/reports) lists every
+sale for the next six weeks; a sale date is the first sign an OK foreclosure is really
+going to auction. Each Monday the check marks which CRM records now have one.
+
+- **Data:** the report page loads `tinstar.io/api/cases`, plain JSON, no login, no
+  CAPTCHA (verified 2026-10-21; ~93 upcoming sales over 7 Wednesdays). The feed also
+  carries bidder names/phones/emails and every case since 2020: only the public-report
+  columns are kept (`KEEP`). Appraisal = `appraisalTinstar` (what the report shows).
+  Zero upcoming sales = failure.
+- **Matching is by ADDRESS** (not every record has a CJ number): one house-number
+  search per sale, compared through `datasift_api._norm_street`. Exactly one record,
+  same street and city = posted to its Message Board (sale date + appraisal + case).
+  Street type/direction/spelling/unit/city differences or two records at one address =
+  FLAGGED, posted only after Jeff confirms (`post --confirm N`) or skipped for good
+  (`dismiss N`). A confirmed or dismissed flag stays that way on later Mondays (the
+  first re-run re-asked about a flag already posted; fixed and tested).
+- **First live run 2026-10-21:** 93 sales (Oct 21 to Dec 2, 6 recalled), 3 exact
+  matches posted (1834 W 64th St, 5334 Redbud Dr, 9243 S 86th E Ave), flag #67
+  (TinStar typo "6306 E 24TH PL ST") posted on Jeff's yes, flag #54 (unit number
+  written differently) dismissed. All four boards read back: one post each.
+- A sale can land on a Thursday: holiday Wednesdays move to the next business day
+  (Nov 11 Veterans Day -> Nov 12). The post prints the real weekday from the date.
+- One post per record per sale date; moved date = change post; recalled after posting =
+  one recall post; every post read back off the board.
+- **Schedule:** Windows task "TinStar sale check Mondays 9 AM" (`tools/register_tinstar_task.ps1`),
+  same triggers as the KPI task (Mon 9 AM, logon, unlock, wake, every 15 min, never
+  wakes the PC), launched hidden via `tools/run_hidden.vbs`. Runs from THIS (foreclosure)
+  worktree with the OneDrive `.venv` python. Done-state `output/tinstar/state.json`.
+  When done it shows a reminder toast (`tools/toast_notify.ps1`) that stays until clicked.
+- `search_by_address` has no retry of its own; one CRM 502 killed the first run.
+  `_search()` retries; a failed lookup is "error", never "not in the CRM", and more
+  than 10% errors fails the run so the next tick retries.
+- The old `src/tinstar_scraper.py` (Playwright + regex guesses, never found the feed)
+  and its `main.py`/`config.py` hooks were deleted (Jeff, 2026-10-21).
+
 ## Tulsa KPI Engine + KPI Bot (daily Slack post + Friday sheet post, 2026-10)
 
 Two pieces, one Slack channel:

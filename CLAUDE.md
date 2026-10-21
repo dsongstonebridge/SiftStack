@@ -1787,6 +1787,10 @@ stop and report counts before the detail lookups; every paid next step asked fir
 the **auction-date-agent** (`.claude/agents/`), which does this job and nothing else.
 **The CRM is READ-ONLY here except Message Board posts** (Jeff, 2026-10-21); a test
 fails if the script calls any other DataSift write. Not on Ty's org chart (Jeff's call).
+Live copies: `~/.claude/skills/tinstar-sale-check/` and `.claude/agents/auction-date-agent.md`
+(`.claude/` is gitignored). Backups committed in `skills/tinstar-sale-check/` (agent under
+`agents/`); after editing a live copy, copy it there and commit. No dist archive on purpose
+(private tool with machine paths; same as tulsa-buyer-finder).
 The Sheriff's "Foreclosure Sales List" (tcso.org -> tinstar.io/reports) lists every
 sale for the next six weeks; a sale date is the first sign an OK foreclosure is really
 going to auction. Each Monday the check marks which CRM records now have one.

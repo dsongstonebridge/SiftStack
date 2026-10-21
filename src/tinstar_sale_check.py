@@ -14,7 +14,10 @@ those properties already live in the CRM and put the date on their record.
 
 How it works:
   - THE CRM IS READ-ONLY HERE except Message Board posts (Jeff, 2026-10-21).
-    The only DataSift write this module may call is post_message_board; no
+    The only DataSift write this module may call is post_property_message_board
+    (the PROPERTY record's board). NEVER the owner record: Jeff, 2026-10-21,
+    after the first posts went to owner boards: "We never, ever, ever write
+    anything to the owner records without explicitly saying so." No
     tags, lists, statuses, fields, notes, creates or deletes. A test scans
     this file and fails if any other datasift_api call appears.
   - The report page loads its list from tinstar.io/api/cases (plain JSON, no
@@ -205,9 +208,10 @@ def classify(sale: dict, cands: list[dict]) -> tuple[str, list[dict]]:
 
 
 def _record_view(r: dict, reasons: list[str], sale: dict) -> dict:
-    """What we keep about a CRM record: uuid, address, owner name, owner uuid."""
+    """What we keep about a CRM record: property uuid, address, owner NAME.
+    The owner's uuid is deliberately not kept: posts go to the property."""
     detail = r
-    if not (r.get("owner") or {}).get("uuid"):
+    if not (r.get("owner") or {}).get("last_name"):
         detail = _api.get_property(r["uuid"]) or r
     owner = detail.get("owner") or {}
     a = detail.get("address") or r.get("address") or {}
@@ -218,7 +222,7 @@ def _record_view(r: dict, reasons: list[str], sale: dict) -> dict:
     if reasons is not None and last and len(last) > 2:
         reasons.append("owner name is on the case" if last in defendant
                        else "owner name not on the case")
-    return {"uuid": r["uuid"], "owner_uuid": owner.get("uuid"),
+    return {"uuid": r["uuid"],
             "street": a.get("street"), "city": a.get("city"),
             "zip": a.get("postal_code") or a.get("zip"), "owner": name,
             "reasons": reasons}
@@ -251,17 +255,16 @@ def recall_text(sale: dict, checked: date) -> str:
                       f"Checked {checked.isoformat()}"])
 
 
-def _post_verified(owner_uuid: str, text: str) -> None:
-    _api.post_message_board(owner_uuid, text)
-    board = _api.get_message_board(owner_uuid)
+def _post_verified(property_uuid: str, text: str) -> None:
+    """Post to the PROPERTY's Message Board and read it back."""
+    _api.post_property_message_board(property_uuid, text)
+    board = _api.get_property_message_board(property_uuid)
     if not any((m.get("message") or "").strip() == text.strip() for m in board):
-        raise RuntimeError(f"Message Board post did not land on owner {owner_uuid}")
+        raise RuntimeError(f"Message Board post did not land on property {property_uuid}")
 
 
 def post_sale(rec: dict, sale: dict, state: dict, checked: date) -> str:
     """Post the sale to one record. Returns what happened (for the summary)."""
-    if not rec.get("owner_uuid"):
-        return "not posted: record has no owner"
     posted = state.setdefault("posted", {})
     prefix = f"{rec['uuid']}|{sale.get('caseNumber')}|"
     key = prefix + sale["saleDate"]
@@ -271,13 +274,13 @@ def post_sale(rec: dict, sale: dict, state: dict, checked: date) -> str:
         return "not posted: sale already recalled"
     earlier = sorted(k.split("|")[2] for k in posted if k.startswith(prefix))
     sale_line = f"Sale date: {_fmt_date(sale['saleDate'])}"
-    board = _api.get_message_board(rec["owner_uuid"])
+    board = _api.get_property_message_board(rec["uuid"])
     if any(sale_line in (m.get("message") or "") for m in board):
         posted[key] = {"on": checked.isoformat(), "note": "already on the board"}
         return "already on the board"
     text = board_text(sale, checked, moved_from=earlier[-1] if earlier else None)
-    _post_verified(rec["owner_uuid"], text)
-    posted[key] = {"on": checked.isoformat(), "owner_uuid": rec["owner_uuid"]}
+    _post_verified(rec["uuid"], text)
+    posted[key] = {"on": checked.isoformat(), "board": "property"}
     return "posted (date changed)" if earlier else "posted"
 
 
@@ -289,9 +292,9 @@ def post_recalls(sales: list[dict], state: dict, checked: date) -> list[str]:
     for key, info in list(state.get("posted", {}).items()):
         uuid, case, sdate = key.split("|")
         sale = by_key.get(f"{case}|{sdate}")
-        if not sale or key in done or not info.get("owner_uuid"):
+        if not sale or key in done or info.get("board") != "property":
             continue
-        _post_verified(info["owner_uuid"], recall_text(sale, checked))
+        _post_verified(uuid, recall_text(sale, checked))
         done[key] = checked.isoformat()
         out.append(f"{clean_street(sale.get('address'))} ({case})")
     return out

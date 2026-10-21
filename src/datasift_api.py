@@ -916,6 +916,26 @@ def get_message_board(owner_uuid: str) -> list[dict]:
     return _page_items(body)
 
 
+def post_property_message_board(property_uuid: str, message: str) -> dict:
+    """PROPERTY Message Board: the board on the property record, where the
+    team's call notes live. Not the owner's board (post_message_board above).
+
+    Jeff, 2026-10-21: nothing is ever written to an OWNER record unless he
+    says so explicitly. The TinStar check put four posts on owner boards and
+    they were invisible where he works. Not in the published spec.yaml (which
+    lists only the owner board); the route is the one probate_pr_note.py and
+    obituary_crm_push.py use, and a GET of it returns the team's own notes."""
+    return _request("POST", f"{CORE_BASE}/api/internal/property/{property_uuid}/message/",
+                     json_body={"message": message})
+
+
+def get_property_message_board(property_uuid: str) -> list[dict]:
+    """Every post on a PROPERTY's Message Board, newest first. Read-only."""
+    body = _request("GET",
+                    f"{CORE_BASE}/api/internal/property/{property_uuid}/message/?limit=100") or {}
+    return _page_items(body)
+
+
 def upload_property_document(property_uuid: str, file_path: str) -> dict:
     """Attach a file to the record's Documents tab. A Message Board post cannot
     carry a file (the Message object has no attachment field), so a document is

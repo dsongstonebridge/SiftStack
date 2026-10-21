@@ -1820,8 +1820,15 @@ stop and report counts before the detail lookups; every paid next step asked fir
 
 `src/tinstar_sale_check.py` + personal skill `tinstar-sale-check` (full rules there) +
 the **auction-date-agent** (`.claude/agents/`), which does this job and nothing else.
-**The CRM is READ-ONLY here except Message Board posts** (Jeff, 2026-10-21); a test
-fails if the script calls any other DataSift write. Not on Ty's org chart (Jeff's call).
+**Posts go on the PROPERTY record's Message Board, NEVER the owner's.** Nothing is ever
+written to an OWNER record unless Jeff explicitly says so (Jeff, 2026-10-21: "We never,
+ever, ever write anything to the owner records without explicitly saying so"). The
+first four posts went to owner boards via `post_message_board` and nobody could see
+them; the team works on the property board. `datasift_api.post_property_message_board`
+/ `get_property_message_board` (`/api/internal/property/{uuid}/message/`, the route
+`probate_pr_note.py` and `obituary_crm_push.py` use; it is NOT in the published
+spec.yaml, which lists only the owner board). **The CRM is otherwise READ-ONLY here**;
+a test fails if the script calls any other DataSift write or any owner-board call. Not on Ty's org chart (Jeff's call).
 Live copies: `~/.claude/skills/tinstar-sale-check/` and `.claude/agents/auction-date-agent.md`
 (`.claude/` is gitignored). Backups committed in `skills/tinstar-sale-check/` (agent under
 `agents/`); after editing a live copy, copy it there and commit. No dist archive on purpose
@@ -1837,7 +1844,7 @@ going to auction. Each Monday the check marks which CRM records now have one.
   Zero upcoming sales = failure.
 - **Matching is by ADDRESS** (not every record has a CJ number): one house-number
   search per sale, compared through `datasift_api._norm_street`. Exactly one record,
-  same street and city = posted to its Message Board (sale date + appraisal + case).
+  same street and city = posted to its PROPERTY Message Board (sale date + appraisal + case).
   Street type/direction/spelling/unit/city differences or two records at one address =
   FLAGGED, posted only after Jeff confirms (`post --confirm N`) or skipped for good
   (`dismiss N`). A confirmed or dismissed flag stays that way on later Mondays (the
@@ -1845,7 +1852,11 @@ going to auction. Each Monday the check marks which CRM records now have one.
 - **First live run 2026-10-21:** 93 sales (Oct 21 to Dec 2, 6 recalled), 3 exact
   matches posted (1834 W 64th St, 5334 Redbud Dr, 9243 S 86th E Ave), flag #67
   (TinStar typo "6306 E 24TH PL ST") posted on Jeff's yes, flag #54 (unit number
-  written differently) dismissed. All four boards read back: one post each.
+  written differently) dismissed. Those first posts landed on the OWNER boards (the
+  mistake above); all four were re-posted to the PROPERTY boards the same morning and
+  read back: one sheriff-sale post each, newest on the board. The four owner-board
+  posts are listed in `output/tinstar/state.json` under
+  `owner_board_posts_2026_10_21_MISTAKE`.
 - A sale can land on a Thursday: holiday Wednesdays move to the next business day
   (Nov 11 Veterans Day -> Nov 12). The post prints the real weekday from the date.
 - One post per record per sale date; moved date = change post; recalled after posting =

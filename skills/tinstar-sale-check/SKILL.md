@@ -1,6 +1,6 @@
 ---
 name: tinstar-sale-check
-description: Jeff's weekly Tulsa County sheriff-sale check. Every Monday at 9 AM (or as soon as the PC is in use after that) a Windows task reads the Sheriff's foreclosure sales list (TinStar, the next six weeks of auctions), checks each address against the DataSift CRM, posts the sale date and appraisal to the Message Board of every exact match, flags records that look like the same house written differently, and pops a notification that stays until clicked. Use when Jeff asks about "TinStar findings", "the sheriff sale check", "which of my records have a sale date", "auction dates", "sheriff sale list", wants the summary of the latest check, wants to confirm/post a flagged record, or wants to run, re-run, test or fix the weekly check.
+description: Jeff's weekly Tulsa County sheriff-sale check. Every Monday at 9 AM (or as soon as the PC is in use after that) a Windows task reads the Sheriff's foreclosure sales list (TinStar, the next six weeks of auctions), checks each address against the DataSift CRM, posts the sale date and appraisal to the PROPERTY Message Board of every exact match (never the owner record), flags records that look like the same house written differently, and pops a notification that stays until clicked. Use when Jeff asks about "TinStar findings", "the sheriff sale check", "which of my records have a sale date", "auction dates", "sheriff sale list", wants the summary of the latest check, wants to confirm/post a flagged record, or wants to run, re-run, test or fix the weekly check.
 ---
 
 # TinStar sheriff-sale check
@@ -41,7 +41,12 @@ Run every command below with `cd C:\Users\dsong\SiftStack-foreclosure` first.
 
 ## 2. Rules
 
-- **THE CRM IS READ-ONLY, Message Board posts are the ONLY write** (Jeff,
+- **Posts go on the PROPERTY record's Message Board, NEVER the owner's.**
+  Nothing is ever written to an OWNER record unless Jeff says so explicitly
+  (Jeff, 2026-10-21, after the first four posts landed on owner boards where
+  nobody works: "an enormous mistake"). The script uses
+  `post_property_message_board`; a test fails on any owner-board call.
+- **THE CRM IS READ-ONLY, property Message Board posts are the ONLY write** (Jeff,
   2026-10-21). No tags, lists, statuses, custom fields, notes, owner edits,
   creates, deletes, skip traces or enrichment, from the script or by hand in a
   session, even when a finding seems to call for it. Suggest it to Jeff in

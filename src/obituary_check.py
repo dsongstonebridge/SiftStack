@@ -132,6 +132,25 @@ def middle_conflict(owner: str, head: str) -> str:
     return ""
 
 
+_NOT_NAMES = {"HE", "SHE", "HIS", "HER", "HIM", "THEY", "THEIR", "THE", "AND", "IS", "WAS",
+              "SURVIVED", "SURVIVING", "SURVIVORS", "BY", "HIS", "MANY", "LOVING", "FAMILY",
+              "FRIENDS", "NUMEROUS", "OTHER", "RELATIVES", "A", "AN", "OF", "IN", "WITH",
+              "FUNERAL", "SERVICES", "SERVICE", "ARRANGEMENTS", "ARRANGEMENT", "SHARE", "IN",
+              "LIEU", "GOD", "LORD", "JESUS", "CHRIST", "HEAVEN", "ALL", "WHO", "LOVED", "HIM"}
+
+
+def names_listed(survived: str) -> bool:
+    """True when the survivors text actually names someone. "Survived by his
+    loving family and many friends" names nobody, and must not be read as a
+    list the known family is missing from (Jeff, 2026-10-20)."""
+    # The extracted text runs on past the list ("Funeral arrangement under the
+    # care of Gary Kelley's ..."); a funeral director is not a survivor.
+    text = re.split(r"(?i)\b(?:funeral|services?\s+(?:will|are|were)|arrangements?|visitation|"
+                    r"memorial|in lieu|share)\b", survived or "", maxsplit=1)[0]
+    words = re.findall(r"\b[A-Z][a-z]+\b", text)
+    return any(w.upper() not in _NOT_NAMES and w.upper() not in _SUFFIX for w in words)
+
+
 def family_hits(known: list[str], text: str) -> list[str]:
     """Known relatives (from the probate filing / record) whose FIRST name shows
     up in the survivors text. First name only: married daughters change surname."""
@@ -183,7 +202,10 @@ def analyze(page: dict, owner: str, *, city: str = "", street: str = "",
         verdict = f"DIFFERENT PERSON (middle name {other_middle}, not the owner's)"
     elif named and hits:
         verdict = "CONFIRMED (name matches and survivors include known family: " + ", ".join(hits) + ")"
-    elif named and known and survived.strip():
+    elif named and known and names_listed(survived):
+        # Ruled out ONLY when survivors are actually listed by name and none of
+        # them is known family. A blank or nameless survivors section leaves the
+        # obituary in play (falls through to LIKELY / POSSIBLE below).
         verdict = "DIFFERENT PERSON (none of the known family is among the survivors)"
     elif named and (out["city_mentioned"] or out["street_mentioned"]):
         verdict = ("LIKELY THE OWNER'S OBITUARY (name + place match; survivors not checked "

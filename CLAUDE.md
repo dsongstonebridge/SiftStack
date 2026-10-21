@@ -1274,7 +1274,7 @@ numbers tagged, family post + PDF present.
 
 - Tests (offline, nothing billed): `tests/test_deep_prospect_smartskip.py` (54),
   `tests/test_deep_prospect_run.py` (26), `tests/test_obituary_check.py` (14),
-  `tests/test_obituary_check_family.py` (9).
+  `tests/test_obituary_check_family.py` (14).
 - Tyler's `fcre-skip-trace` plugin (company-specific to Florida Cash Real Estate)
   was installed briefly on 2026-10-16 and UNINSTALLED the same day at Jeff's
   request: its skill triggers on "skip trace" and would collide with the daily

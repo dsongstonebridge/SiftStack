@@ -46,5 +46,23 @@ r3 = oc.check("Darrell Raymond Soward", city="Tulsa", spouse="Polly Soward",
 check("a middle initial with a period still matches the owner", oc.name_in("Darrell Raymond Soward", initial["title"]))
 check("owner's own obituary (initial in name) is CONFIRMED, not the spouse trap",
       r3["summary"].startswith("CONFIRMED"))
+# Jeff, 2026-10-20: known family must appear in the survivors ONLY when survivors
+# are actually listed. A blank or nameless survivors section keeps the obituary in play.
+def verdict(text):
+    page = {"url": "x", "title": "Russell Wayne Thomas Jr. Obituary - Tulsa", "text": text}
+    return oc.check(owner, city="Tulsa", known=known, pages=[page])["summary"]
+opening = "Russell Wayne Thomas Jr., 55, of Tulsa passed away July 30, 2026. "
+check("no survivors section: kept (LIKELY), not ruled out",
+      verdict(opening + "Services at Floral Haven.").startswith("LIKELY"))
+check("survivors named nobody ('loving family and many friends'): kept, not ruled out",
+      verdict(opening + "He is survived by his loving family and many friends.").startswith("LIKELY"))
+check("nameless survivors + funeral home name after it: still kept",
+      verdict(opening + "He is survived by his loving family. Funeral arrangements under the care "
+                        "of Gary Kelley Funeral Service.").startswith("LIKELY"))
+check("partial overlap (wife on the list, others new): CONFIRMED",
+      verdict(opening + "He is survived by his wife, Rhonda; his sister Rebecca; his brother William.")
+      .startswith("CONFIRMED"))
+check("survivors listed by name, none known: ruled out",
+      verdict(opening + "He is survived by his wife, Gloria; his son Mark.").startswith("DIFFERENT PERSON"))
 print(fails, "failure(s)")
 sys.exit(1 if fails else 0)

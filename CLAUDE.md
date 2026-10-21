@@ -1223,9 +1223,14 @@ unpaid order is never billed).
 On 3316 a PDF went up calling a stranger's obituary "likely" because nobody read it.
 
 **Obituary check (`src/obituary_check.py`), rules learned on the live runs:**
-- An obituary is the owner's only if its survivors include the KNOWN family (from
-  the filing / board / `--spouse` / `--known`): match = **CONFIRMED**; survivors
-  naming none of them = **DIFFERENT PERSON**. A different middle name ("Russell
+- Survivors are checked against the KNOWN family (from the filing / board /
+  `--spouse` / `--known`): any known name among them = **CONFIRMED** (partial
+  overlap is fine; obituaries add siblings and grandkids). Ruled out as **DIFFERENT
+  PERSON** only when survivors are LISTED BY NAME and none is known family, i.e.
+  the lists differ drastically. A blank or nameless survivors section ("his loving
+  family and many friends") keeps the obituary in play (Jeff, 2026-10-21; the
+  funeral-home text after the list is cut so a director is never read as a
+  survivor). A different middle name ("Russell
   Hand Thomas" vs "Russell Wayne Thomas") = DIFFERENT PERSON. Ruled-out pages are
   hidden from the report and the PDF; the PDF shows only the confirmed obituary
   when one exists. With no known family it falls back to LIKELY and says so.

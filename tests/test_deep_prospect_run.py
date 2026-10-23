@@ -81,11 +81,15 @@ with open(tmp / "smartskip_export.csv", "w", newline="", encoding="utf-8") as fh
                     "survived_by": "survived by his daughter Susan and son Mark", "preceded_by": ""}]}))
 
 
+OWNER_POSTS = []   # every owner-board post from any fake; must stay empty
+
+
 class FakeAPI:
     DataSiftAPIError = Exception
 
     def __init__(self):
         self.phones, self.board, self.uploads, self.dry = [], [], [], False
+        self.owner_posts = []
 
     def set_dry_run(self, on):
         self.dry = on
@@ -113,10 +117,18 @@ class FakeAPI:
     def add_tags(self, uuid, tags):
         pass
 
+    # self.board is the PROPERTY board; an owner-board post fails a check.
     def get_message_board(self, owner_uuid):
+        return []
+
+    def get_property_message_board(self, uuid):
         return [{"message": m} for m in self.board]
 
     def post_message_board(self, owner_uuid, message):
+        self.owner_posts.append(message)
+        OWNER_POSTS.append(message)
+
+    def post_property_message_board(self, uuid, message):
         if not self.dry:
             self.board.insert(0, message)
 
@@ -157,7 +169,7 @@ check("commit: her number tagged Daughter",
       "Daughter" in next(p for p in fake.phones if p["number"] == "9185550201")["tags"])
 check("commit: PDF uploaded to Documents", len(fake.uploads) == 1)
 check("commit: board has the family post and the PDF line",
-      any(m.startswith(dps.FAMILY_MARKER) for m in fake.board)
+      any(m.startswith(dps.FAMILY_MARKER_V2) for m in fake.board)
       and any(m.startswith(run.PDF_MARKER) for m in fake.board))
 check("commit: confirmed death labels the subject Decedent, not Owner",
       any("Decedent (traced subject)" in m for m in fake.board)
@@ -194,6 +206,29 @@ check("people-search sites are never fetched",
 check("obituary / FindAGrave / Legacy pages still allowed",
       not obituary_check._people_search("https://www.legacy.com/us/obituaries/name/mary-smith-obituary")
       and not obituary_check._people_search("https://www.findagrave.com/memorial/123/mary-smith"))
+
+check("nothing is ever posted to an OWNER board (Jeff, 2026-10-21/23)", not OWNER_POSTS)
+fake.board = ["=== DECEASED OWNER ===\nDecedent: Roland Theriot | Died: 7/6/2026 | Obituary: https://x"]
+check("board name stops at the '|' of a July obituary post",
+      run.decedent_from_board("O1", "P1") == "Roland Theriot")
+check("split_name: plain name -> first and last word",
+      run.split_name("Bonnie Marie Pingrey Baker") == ("Bonnie", "Baker"))
+check("split_name: First|Last keeps a compound surname",
+      run.split_name("Francisco|Perez Rodriguez") == ("Francisco", "Perez Rodriguez"))
+_ST = {"street": "1 A St", "city": "Tulsa", "state": "OK", "searched": "X Y", "searched_at": "mailing"}
+check("research notes reach the PDF text", "## Research notes" in run.research_pack(
+    _ST, {"primary": [], "board": []}, {"summary": "", "candidates": []}, "b", {},
+    "Owner is a nurse.", decedent=False))
+_md = run.research_pack(_ST, {"primary": [], "board": []},
+                        {"summary": "LIKELY THE OWNER'S OBITUARY", "candidates": []}, "b", {}, decedent=False)
+check("living owner: the raw 'LIKELY' top finding never reaches the PDF", "LIKELY" not in _md)
+check("owner deceased, traced person living: PDF says so, not 'treated as LIVING'",
+      "OWNER is believed deceased" in run.research_pack(
+          _ST, {"primary": [], "board": []}, {"summary": "x", "candidates": []}, "b", {},
+          decedent=False, owner_dead=True))
+check("living owner: name-only obituaries are left out of the PDF", "Obit Stranger" not in run.research_pack(
+    _ST, {"primary": [], "board": []}, {"summary": "", "candidates": [
+        {"verdict": "LIKELY", "title": "Obit Stranger", "url": "u", "dod": ""}]}, "b", {}, decedent=False))
 
 print(f"\n{failures} failure(s)")
 sys.exit(1 if failures else 0)

@@ -120,13 +120,24 @@ def _save(run: Path, state: dict) -> None:
     (run / "state.json").write_text(json.dumps(state, indent=2), encoding="utf-8")
 
 
+def split_name(person: str) -> tuple[str, str]:
+    """'First Middle Last' -> (First, Last). 'Francisco|Perez Rodriguez' keeps a
+    compound surname whole."""
+    if "|" in person:
+        first, last = (x.strip() for x in person.split("|", 1))
+        first = first.split()[0] if first else ""
+    else:
+        parts = person.split()
+        first, last = (parts[0], parts[-1]) if len(parts) >= 2 else ("", "")
+    if not first or not last:
+        raise SystemExit(f"need a first and last name to search, got {person!r}")
+    return first, last
+
+
 def build_input_row(person: str, rec: dict, *, at_property: bool) -> dict:
     """One SmartSkip upload row. A decedent is searched at the property (where
     they lived); a living owner at their mailing address."""
-    parts = person.split()
-    if len(parts) < 2:
-        raise SystemExit(f"need a first and last name to search, got {person!r}")
-    first, last = parts[0], parts[-1]
+    first, last = split_name(person)
     a = rec.get("address") or {}
     m = ((rec.get("owner") or {}).get("address") or {}) if not at_property else {}
     mail = m if (m.get("street") or m.get("address")) else a
@@ -139,29 +150,40 @@ def build_input_row(person: str, rec: dict, *, at_property: bool) -> dict:
             "Property Zip": (a.get("postal_code") or a.get("zip") or "")[:5]}
 
 
-def decedent_from_board(owner_uuid: str) -> str:
+def _boards(owner_uuid: str, property_uuid: str | None = None) -> list[dict]:
+    """Posts on both boards (read only): probate posts sit on the owner board,
+    the team's notes and deep prospecting posts on the property board."""
+    posts = list(_api.get_message_board(owner_uuid))
+    if property_uuid:
+        posts += _api.get_property_message_board(property_uuid)
+    return posts
+
+
+def decedent_from_board(owner_uuid: str, property_uuid: str | None = None) -> str:
     """'Russell Wayne Thomas Jr.' from a 'Decedent: ...' / 'Decedent Name: ...'
     line on the record's board, without any '(fka ...)' or '(d. ...)' tail."""
     try:
-        posts = _api.get_message_board(owner_uuid)
+        posts = _boards(owner_uuid, property_uuid)
     except Exception as e:                      # noqa: BLE001 - free check, never fatal
         logger.warning("could not read the board for the decedent's name: %s", e)
         return ""
     for p in posts:
         for line in dps._plain(p.get("message") or "").splitlines():
-            m = re.match(r"\s*Decedent(?: Name)?:\s*([^(\n]+)", line)
+            # "[^(|\n]": the July obituary posts read "Decedent: X | Died: ... |
+            # Obituary: ..." on one line; stop at the bar (2026-10-23).
+            m = re.match(r"\s*Decedent(?: Name)?:\s*([^(|\n]+)", line)
             if m and len(m.group(1).split()) >= 2:
                 return m.group(1).strip().rstrip(",")
     return ""
 
 
-def known_family_from_board(owner_uuid: str) -> list[str]:
+def known_family_from_board(owner_uuid: str, property_uuid: str | None = None) -> list[str]:
     """Names the probate filing already established (heirs, the PR), read off
     the record's own Message Board posts. An obituary whose survivors name none
     of these people is someone else's (Jeff, 2026-10-20)."""
     names: list[str] = []
     try:
-        posts = _api.get_message_board(owner_uuid)
+        posts = _boards(owner_uuid, property_uuid)
     except Exception as e:                      # noqa: BLE001 - free check, never fatal
         logger.warning("could not read the board for known family: %s", e)
         return names
@@ -191,6 +213,10 @@ def cmd_start(a) -> int:
     uuid, owner_uuid, rec = dps._resolve(a.street, a.city, a.state)
     owner = rec.get("owner") or {}
     person = a.search_person or person_name(owner)
+    if person and not a.search_person:
+        # The CRM's own fields, so a compound surname ("Perez Rodriguez") is
+        # searched whole rather than as its last word.
+        person = f"{(owner.get('first_name') or '').strip()}|{(owner.get('last_name') or '').strip()}"
     if not person:
         print(f"SKIPPED: the owner is a business or trust ({owner.get('company') or 'no person name'}). "
               "SmartSkip is not free for those. Name a person with --search-person to trace them.")
@@ -217,18 +243,19 @@ def cmd_start(a) -> int:
         w = csv.DictWriter(fh, fieldnames=list(row))
         w.writeheader()
         w.writerow(row)
+    person = person.replace("|", " ").strip()   # the first|last split was only for SmartSkip
 
     # The board's probate post carries the decedent's FULL name (middle name,
     # suffix). Use it for the obituary check, so a middle name is never lost
     # because the search was typed without one (Jeff, 2026-10-20).
-    full = decedent_from_board(owner_uuid)
+    full = decedent_from_board(owner_uuid, uuid)
     if full and obituary_check.name_in(person, full) and len(obituary_check.tokens(full)) > \
             len(obituary_check.tokens(person)):
         logger.info("obituary check uses the board's full name %r (searched as %r)", full, person)
         obit_name = full
     else:
         obit_name = person
-    known = list(a.known or []) + known_family_from_board(owner_uuid)
+    known = list(a.known or []) + known_family_from_board(owner_uuid, uuid)
     known = [k for k in dict.fromkeys(known) if not obituary_check.name_in(k, obit_name)]
     if not known and not a.spouse:
         logger.warning("no known family (no probate heirs on the board, no --spouse/--known): "
@@ -298,25 +325,48 @@ def cmd_charge(a) -> int:
 
 # ── 3. finish (DRY RUN until --commit) ────────────────────────────────
 
-def research_pack(state: dict, plan: dict, obits: dict, basis: str, phone_tags: dict) -> str:
+def research_pack(state: dict, plan: dict, obits: dict, basis: str, phone_tags: dict,
+                  notes: str = "", decedent: bool = True, owner_dead: bool = False) -> str:
     lines = [f"# Deep Prospecting: {state['street']}, {state['city']} {state['state']}",
              "", f"Prepared {date.today().isoformat()}. Searched: **{state['searched']}** "
              f"(at the {state['searched_at']} address).", "",
              "## Who to call first", "", basis or "(no basis given)", ""]
+    on_list = plan.get("phone_list_numbers")
+
+    def tag_text(n):
+        if n == "none":
+            return ""
+        if on_list is not None and n not in on_list:
+            return dps.BOARD_ONLY
+        return ", ".join(phone_tags.get(n, [])) or "not scored yet"
+
     lines += ["| Person | Number | Tags |", "|---|---|---|"]
     for p in plan["primary"]:
         for ph in p["phones"]:
-            tags = ", ".join(phone_tags.get(ph["number"], [])) or "not scored yet"
-            lines.append(f"| {p['name']} | {ph['number']} | {tags} |")
-    lines += ["", "## Obituary check", "", f"Top finding: {obits.get('summary')}",
-              "Known family checked against survivors: "
-              + (", ".join(obits.get("known") or []) or "none on record"), ""]
+            lines.append(f"| {p['name']} | {ph['number']} | {tag_text(ph['number'])} |")
     shown = [c for c in obits.get("candidates", [])
              if not c["verdict"].startswith(obituary_check.RULED_OUT)]
+    confirmed = any(c["verdict"].startswith("CONFIRMED") for c in shown)
+    # A living traced person's raw top finding ("LIKELY THE OWNER'S OBITUARY" on a
+    # namesake) must not sit above "treated as LIVING" (2026-10-23 report read).
+    top = obits.get("summary") if (decedent or confirmed) else "no obituary for the traced person"
+    lines += ["", "## Obituary check", "", f"Top finding: {top}",
+              "Known family checked against survivors: "
+              + (", ".join(obits.get("known") or []) or "none on record"), ""]
     # A confirmed obituary is the answer; the other name matches are noise to a
     # caller and were how a stranger's obituary got read as "likely" (10-20).
-    if any(c["verdict"].startswith("CONFIRMED") for c in shown):
+    if confirmed:
         shown = [c for c in shown if c["verdict"].startswith("CONFIRMED")]
+    elif not decedent and owner_dead:
+        lines += ["The traced person is living, but the OWNER is believed deceased: see the "
+                  "research notes. Obituaries that only share the traced person's name are left out.", ""]
+        shown = []
+    elif not decedent:
+        # A living owner's namesakes are strangers' obituaries: leave them out
+        # rather than put "possible death" next to someone we are calling.
+        lines += ["No obituary matching this owner and their known family was found; the "
+                  "owner is treated as LIVING. Obituaries that only share the name are left out.", ""]
+        shown = []
     elif shown:
         lines += ["No obituary is confirmed against the known family. The matches below "
                   "share a name only; treat each as unverified.", ""]
@@ -327,15 +377,19 @@ def research_pack(state: dict, plan: dict, obits: dict, basis: str, phone_tags: 
             lines.append("  - Survived by: " + re.sub(r"\s+", " ", c["survived_by"])[:500])
         if c.get("preceded_by"):
             lines.append("  - Preceded by: " + re.sub(r"\s+", " ", c["preceded_by"])[:300])
-    lines += ["", "## Family (all on the phone list, scored)", "",
+    lines += ["", "## Family", "",
+              "Scored and on the phone list: " + (", ".join(plan.get("scored_names") or []) or "nobody")
+              + ". Everyone else is listed here only (living owner: owner + spouse; "
+              "deceased owner: close family only).", "",
               "| Name | Relationship | Number | Tags |", "|---|---|---|---|"]
     for b in plan["board"]:
         rel = b["relationship"] + (" (flagged deceased, unverified)" if b["deceased"] else "")
         for n in b["phones"] or ["none"]:
-            tags = ", ".join(phone_tags.get(n, [])) or ("" if n == "none" else "not scored yet")
-            lines.append(f"| {b['name']} | {rel} | {n} | {tags} |")
+            lines.append(f"| {b['name']} | {rel} | {n} | {tag_text(n)} |")
     lines += ["", "SmartSkip's deceased flags and relationship labels are not reliable; "
               "the obituary decides."]
+    if notes.strip():
+        lines += ["", "## Research notes", "", notes.strip()]
     return "\n".join(lines)
 
 
@@ -350,7 +404,9 @@ def cmd_finish(a) -> int:
     rec.update(property_address=state["street"], property_city=state["city"],
                property_state=state["state"])
     plan = dps.build_plan(rec, a.primary, dps._overrides(a.relationship),
-                          subject_deceased=a.decedent)
+                          subject_deceased=a.decedent, score_add=getattr(a, "score", None),
+                          score_drop=getattr(a, "no_score", None),
+                          owner_deceased=True if getattr(a, "owner_deceased", False) else None)
     dry = not a.commit
     res = dps.write_record(rec, plan, dry_run=dry, repost=a.repost)
 
@@ -360,14 +416,17 @@ def cmd_finish(a) -> int:
         tags = {sta.norm_phone(p.get("number")): sorted(p.get("tags") or [])
                 for p in owner.get("phones") or []}
     obits = json.loads((run / "obituary_check.json").read_text(encoding="utf-8"))
-    md = research_pack(state, plan, obits, a.basis, tags)
+    notes_file = getattr(a, "notes", None)
+    notes = Path(notes_file).read_text(encoding="utf-8") if notes_file else ""
+    md = research_pack(state, plan, obits, a.basis, tags, notes, decedent=a.decedent,
+                       owner_dead=bool(getattr(a, "owner_deceased", False)))
     md_path = run / f"Deep_Prospecting_{slug(state['street'])}.md"
     md_path.write_text(md, encoding="utf-8")
     from deep_prospect_pdf import generate_pdf
     pdf = generate_pdf(str(md_path))
 
     already = any(PDF_MARKER in (p.get("message") or "")
-                  for p in _api.get_message_board(state["owner_uuid"]))
+                  for p in _boards(state["owner_uuid"], state["property_uuid"]))
     if already and not a.repost:
         print(json.dumps(res))
         print(f"PDF built ({pdf}) but NOT uploaded: this record already has a research PDF "
@@ -380,7 +439,8 @@ def cmd_finish(a) -> int:
             names = [d.get("filename") for d in _api.list_property_documents(state["property_uuid"])]
             if os.path.basename(pdf) not in names:
                 raise SystemExit(f"PDF upload did not land: Documents tab holds {names}")
-        _api.post_message_board(state["owner_uuid"],
+        # PROPERTY board, where the team works; never the owner's (Jeff, 2026-10-21/23).
+        _api.post_property_message_board(state["property_uuid"],
             f"{PDF_MARKER} ({date.today().isoformat()})\n"
             f"Full research (obituary, family, who to call) is in this record's Documents tab: "
             f"{os.path.basename(pdf)}")
@@ -420,6 +480,15 @@ def main(argv=None) -> int:
     f.add_argument("--decedent", action="store_true",
                    help="the obituary or probate filing CONFIRMS the searched person died: "
                         "label them Decedent, not Owner (always true on a probate search)")
+    f.add_argument("--score", action="append",
+                   help="also Trestle-score this person (a co-owner on title, or a PR SmartSkip "
+                        "calls a catch-all Relative); repeat")
+    f.add_argument("--no-score", action="append",
+                   help="never score this person even if the default rule would; repeat")
+    f.add_argument("--owner-deceased", action="store_true",
+                   help="the OWNER died but the traced person is a living relative: score close "
+                        "family (deceased-owner rule) without labelling the traced person a decedent")
+    f.add_argument("--notes", help="text file of extra research, added to the PDF as 'Research notes'")
     f.add_argument("--repost", action="store_true")
     f.add_argument("--commit", action="store_true")
     a = ap.parse_args(argv)

@@ -126,7 +126,11 @@ def middle_conflict(owner: str, head: str) -> str:
         for m in re.finditer(r"(?<![A-Z])" + re.escape(f) + r"\s+([A-Z]+)\.?\s+(?:[A-Z]\.?\s+)?"
                              + re.escape(last) + r"(?![A-Z])", up):
             mid = m.group(1)
-            if mid in _SUFFIX or mid == middle or mid == middle[0]:
+            # An initial on our side matches any middle name with that letter:
+            # "Nancy E Bridgewater" is Nancy Eileen (2026-10-23, real obituaries
+            # for Bridgewater and Gresham were ruled out over this).
+            if mid in _SUFFIX or mid == middle or mid == middle[0] or \
+                    (len(middle) == 1 and mid[0] == middle):
                 return ""
             return mid.title()
     return ""

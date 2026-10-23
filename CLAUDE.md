@@ -1175,7 +1175,7 @@ Courthouse probate records have decedent name + PR/executor name but NO property
 
 **Retired (kept only as a v4 reference):** `src/enformion_heir.py` / `scripts/enformion_person_search.py`. Failure modes for the record: zero relatives half the time, no phones on the graph, ~50-relative cap that silently truncates, a surname gate that drops married-out daughters, `isDeceased` flags that lag reality, and wrong-person matches when anchored on city/ZIP instead of the full street line.
 
-### Deep prospecting for THIS fork: SmartSkip, every number scored (rule of 2026-10-20)
+### Deep prospecting for THIS fork: SmartSkip, then Trestle on a narrow scope (rule of 2026-10-23)
 
 **LIVE since 2026-10-20** (first two records: 3316 S 144th E Ave, probate
 PB-2026-856; 6306 E 24th Pl, obituary pre-probate). Jeff names each record; SmartSkip
@@ -1183,11 +1183,28 @@ is for deep prospecting ONLY (regular foreclosure/probate records stay on Tracer
 DataSift skip trace). Run from `C:\Users\dsong\SiftStack-deepprospect` (kept at main,
 its own `.env` copy with `SMARTSKIP_EMAIL` / `SMARTSKIP_PASSWORD`).
 
-**THE RULE (Jeff, 2026-10-20, replaces the 2026-10-16 relatives-on-the-board rule):
-every number SmartSkip returns, owner and relatives alike, goes on the phone list
-and gets Trestle scored**, the way Ty set it up. Scoring a few, calling, missing,
-then scoring more costs more in time than ~$0.015 a number saves. Who to call first
-is said on the board and in the PDF, never enforced by holding numbers back.
+**TRESTLE SCOPE (Jeff, 2026-10-23, standing; replaces the 2026-10-20 "score every
+number" rule).** Only numbers NOT already in the CRM are ever scored, and only for:
+- **Living owner:** the owner (traced subject) and their spouse. Never relatives,
+  children, in-laws or catch-all "Relative" rows.
+- **Deceased owner:** never the dead owner's own numbers; close family only: spouse,
+  children, parents, siblings, PR. No catch-all relatives, no in-laws.
+"Deceased" means deceased by Claude's research first (obituary, probate, board,
+SiftMap, deed history), or SmartSkip's flag, or the record's own data, not just the
+CRM's Deceased Owner tag. Everyone else goes on the property board only (labelled
+`board only - not on phone list`), never upserted, never scored. **Before any
+Trestle spend, give Jeff a simple table:** living owners + spouses, deceased-owner
+family by relationship, what is excluded, and why any record scores nothing. The
+2026-10-23 batch of 58: 1,463 new numbers under the old rule, 218 under this one.
+
+`finish` levers for the cases the labels get wrong:
+- `--owner-deceased` : the owner died but the traced subject is a living relative
+  (e.g. Lenord Coats Jr. on 3903 S Union): close-family scope, subject still scored.
+- `--score "Name"` / `--no-score "Name"` (repeatable): force a person in or out
+  (a living co-owner on title SmartSkip calls "Relative"; a parent who also died).
+- `"Name@Relationship"` in `--primary`/`--score`: picks one of two same-name people
+  (John Webster the owner vs John Webster his son). An exact full name beats an
+  initial-only namesake automatically.
 
 ```bash
 python src/deep_prospect_run.py start  --street "123 Main St" --city Tulsa \
@@ -1201,9 +1218,16 @@ python src/deep_prospect_run.py finish ... --commit          # BILLS Trestle, wr
 
 **Two spend stops per record, and Claude asks Jeff before each** (standing
 no-unapproved-spend rule; the code itself only gates on `--commit`):
-1. `charge`: SmartSkip, ~$0.15 per hit, on the **saved card (Visa ...9901), NOT the
-   wallet**. Bulk skip pays by card payment-intent; Ty saw the card charged while
-   the wallet sat untouched. Jeff expected the wallet; he may ask SmartSkip support.
+1. `charge`: SmartSkip, ~$0.15 per hit. **The WALLET does work (found 2026-10-23 in
+   the app's BulkSkipView bundle):** `POST /bulk-skip/payment-intent
+   {"bulkSkipId": ..., "paymentSource": "wallet"}` returns `{status,
+   walletTransactionId}`; `GET /wallet/balance` reports CENTS. Try the wallet first,
+   the saved card only if it refuses (and only up to what Jeff approved).
+   **Several records = ONE SmartSkip order, never one order each** (Jeff, 2026-10-23):
+   run `start` per record (free), combine the one-row inputs into one CSV, submit and
+   pay once, then split the vertical export back into each run's
+   `smartskip_export.csv` by Input Name. 58 rows cost $8.70 from the wallet; all 58
+   returned results, so no misses to refund.
 2. `finish --commit`: Trestle on every NEW number, ~$0.015 each (14 numbers = $0.21
    on 6306). Run `finish` without `--commit` first and quote the count it prints.
 
@@ -1218,6 +1242,19 @@ reached, never a relative; on probate that is the DECEDENT at the property
 (`--search-person ... --search-at property`), or SmartSkip returns the PR's family.
 One search per property: `start` refuses a repeat (`--restart` = second charge; an
 unpaid order is never billed).
+
+**Trusts and LLCs (Jeff, 2026-10-23, standing rule):** skip one ONLY when no person's
+name can be found from the trust name itself ("BAKER, BONNIE MARIE PINGREY REV TRUST"),
+the record's Message Boards, or SiftMap. When a person can be named, deep prospect them
+like any record: `--search-person "<name>" --search-at property` (the decedent, if they
+died). The search is on the person, so it costs the same as any other.
+
+**Message Board posts go on the PROPERTY board** (`post_property_message_board`), never
+the owner's (Jeff, 2026-10-21/23); phones still live on the owner, which is where
+DataSift keeps them. Reads check both boards, since probate posts sit on the owner board.
+`finish --notes FILE` adds a "Research notes" section to the PDF (useful facts found on a
+living owner); on a living owner (no `--decedent`) the PDF leaves out obituaries that only
+share the name.
 
 **Before `finish --commit`, read the generated `Deep_Prospecting_*.md` yourself.**
 On 3316 a PDF went up calling a stranger's obituary "likely" because nobody read it.
@@ -1246,7 +1283,7 @@ On 3316 a PDF went up calling a stranger's obituary "likely" because nobody read
   (`obituary_enricher` still swallows this and finds nothing; not fixed, per Jeff).
 
 **What `finish` writes (`src/deep_prospect_smartskip.py`):**
-- Every SmartSkip number -> phone list with tags `SmartSkip` + dial tier
+- Every IN-SCOPE SmartSkip number (see TRESTLE SCOPE) -> phone list with tags `SmartSkip` + dial tier
   (litigator `DO NOT CALL - Litigator Risk` REPLACES the tier) + a relationship tag
   mapped onto the EXISTING tags (Wife, Husband, Son, Daughter, Grandchild, else
   Relative; never a new one). A number two people share gets no relationship tag.
@@ -1255,8 +1292,9 @@ On 3316 a PDF went up calling a stranger's obituary "likely" because nobody read
   phone object, so it could overwrite line type or a caller's status). They only
   gain the `SmartSkip` source tag, a tier only if they never had one, and never a
   relationship tag. Verified live: 11 (3316) and 5 (6306) worked numbers unchanged.
-- One Message Board post, `SMARTSKIP FAMILY - ALL NUMBERS ON THE PHONE LIST`, a dial
-  sheet on its own: `CALL FIRST|FAMILY | name | relationship | 918-555-0101 | Dial X`.
+- One PROPERTY Message Board post, `SMARTSKIP FAMILY - WHO IS WHO` (older records
+  carry `SMARTSKIP FAMILY - ALL NUMBERS ON THE PHONE LIST`; both are recognised), a
+  dial sheet on its own, with out-of-scope numbers marked board only: `CALL FIRST|FAMILY | name | relationship | 918-555-0101 | Dial X`.
   `--decedent` (pass it whenever the obituary/filing confirms the death, always on
   probate) labels the subject "Decedent (traced subject)" instead of "Owner".
 - Research PDF -> the record's **Documents tab** (proven live) + a board line
@@ -1276,6 +1314,17 @@ the litigator add-on (unconfirmed, check the Trestle invoice).
 **After every `--commit`:** snapshot the record's phones (number, status, type,
 tags) BEFORE, then read back and diff: old numbers unchanged, no duplicates, new
 numbers tagged, family post + PDF present.
+
+**2026-10-23 batch (58 records, 218 numbers scored):** read-back clean on 57 of 58.
+Old numbers unchanged on all 58, 1 family post + 1 PDF line on each property board,
+owner boards untouched, status unchanged. 8 records needed the automatic tag
+re-send. On 2028 S Olympia Ave Trestle returned no result (no tier, no litigator
+answer) for 915-837-9484, which looks like a garbled 432-837-9484; tagged
+`Unknown`, left alone. SmartSkip's "Child"/"Spouse" labels map to the `Relative`
+phone tag, so the board post is where who-is-who lives. 4529 E Xyler St was SOLD
+before the run (PR deed Ross estate -> Soup To Nuts LLC, doc 2026091276, $62,000;
+warranty deed to the Guzmans, doc 2026091707, $80,000, Assessor sales history):
+check `get_parcel_sales_history` on every record in a queue before spending.
 
 - Tests (offline, nothing billed): `tests/test_deep_prospect_smartskip.py` (54),
   `tests/test_deep_prospect_run.py` (26), `tests/test_obituary_check.py` (14),

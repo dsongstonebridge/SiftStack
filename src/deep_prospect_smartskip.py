@@ -58,6 +58,10 @@ BOARD_MARKER = "SMARTSKIP RELATIVES - NOT ON THE PHONE LIST"
 #: First line of the 2026-10-20 family post (every number already on the phone
 #: list). `promote` never reads it: there is nothing left to add.
 FAMILY_MARKER = "SMARTSKIP FAMILY - ALL NUMBERS ON THE PHONE LIST"
+#: First line of the family post since 2026-10-23 (scoped scoring: only some
+#: numbers reach the phone list). find_family_post matches both markers.
+FAMILY_MARKER_V2 = "SMARTSKIP FAMILY - WHO IS WHO"
+BOARD_ONLY = "board only - not on phone list"
 PROMOTED_MARKER = "SMARTSKIP RELATIVES ADDED TO THE PHONE LIST"
 LINE_PREFIX = "RELATIVE |"
 
@@ -99,8 +103,32 @@ def pick_record(recs: list[dict], input_name: str | None) -> dict:
     return recs[0]
 
 
+#: Trestle scope (Jeff, 2026-10-23, standing): a living owner's record scores only
+#: the subject and the spouse; a deceased owner's record never scores the dead
+#: owner and scores close family only. Catch-all "Relative" and in-laws: never.
+SPOUSE_RELS = {"Spouse", "Husband", "Wife"}
+CLOSE_RELS = SPOUSE_RELS | {"Child", "Son", "Daughter", "Parent", "Mother", "Father",
+                            "Sibling", "Brother", "Sister"}
+
+
+def _match(want: str, people: list[dict]) -> list[dict]:
+    """People matching `want`. "Name@Relationship" narrows two people with the
+    same name (3903 S Union: the traced son and his father are both Lenord Coats)."""
+    want, _, rel = want.partition("@")
+    pool = [p for p in people if not rel or
+            (p["relationship"] or "").strip().lower() == rel.strip().lower()]
+    hits = [p for p in pool if sta._same_person(want, p["name"])]
+    if len(hits) > 1:
+        # An initial-only relative ("M COATS") fuzzy-matches anyone with that
+        # surname; an exact full-name match wins (2026-10-23).
+        exact = [p for p in hits if p["name"].strip().lower() == want.strip().lower()]
+        hits = exact or hits
+    return hits
+
+
 def build_plan(rec: dict, primary: list[str], rel_overrides: dict[str, str] | None = None,
-               *, subject_deceased: bool = False) -> dict:
+               *, subject_deceased: bool = False, score_add: list[str] | None = None,
+               score_drop: list[str] | None = None, owner_deceased: bool | None = None) -> dict:
     """Split one parsed SmartSkip record into phone-list people and board people.
 
     `primary` holds "subject" and/or names of relatives (the top heir / PR).
@@ -115,6 +143,12 @@ def build_plan(rec: dict, primary: list[str], rel_overrides: dict[str, str] | No
     dropped from every board line (the owner rule on a shared household line).
     A shared number carries no relationship tag: it is not provably one
     person's.
+
+    Who is SCORED (on the phone list, Trestle-scored) follows SPOUSE_RELS /
+    CLOSE_RELS above; everyone else is board-only (named on the post, never
+    added to the phone list, never scored). `score_add` / `score_drop` (names,
+    or "subject") correct what SmartSkip's labels cannot know: a co-owner on
+    title, or a PR SmartSkip calls a catch-all "Relative".
     """
     if not primary:
         raise SystemExit("--primary is required: 'subject' and/or the top heir / PR by name")
@@ -137,17 +171,33 @@ def build_plan(rec: dict, primary: list[str], rel_overrides: dict[str, str] | No
          "state": r.get("mailing_state", "")}
         for r in rec["relatives"]]
 
+    def find(want: str, flag: str) -> dict:
+        hits = [subject] if want.strip().lower() == "subject" else _match(want, people)
+        if len(hits) != 1:
+            raise SystemExit(f"{flag} {want!r} matched {len(hits)} people in this record: "
+                             f"{[p['name'] for p in people]}")
+        return hits[0]
+
     chosen: list[dict] = []
     for want in primary:
-        if want.strip().lower() == "subject":
-            hits = [subject]
+        hit = find(want, "--primary")
+        if hit not in chosen:
+            chosen.append(hit)
+
+    # owner_deceased: the OWNER died even when the traced subject did not (the
+    # traced person is the owner's living son). Scoring then follows the
+    # deceased-owner rule while the subject keeps the "Owner" label.
+    dead_owner = subject_deceased if owner_deceased is None else owner_deceased
+    for p in people:
+        if p["is_subject"]:
+            p["scored"] = not subject_deceased
         else:
-            hits = [p for p in people if sta._same_person(want, p["name"])]
-        if len(hits) != 1:
-            raise SystemExit(f"--primary {want!r} matched {len(hits)} people in this record: "
-                             f"{[p['name'] for p in people]}")
-        if hits[0] not in chosen:
-            chosen.append(hits[0])
+            p["scored"] = (p["relationship"] or "").strip().title() in (
+                CLOSE_RELS if dead_owner else SPOUSE_RELS)
+    for want in score_add or []:
+        find(want, "--score")["scored"] = True
+    for want in score_drop or []:
+        find(want, "--no-score")["scored"] = False
 
     holders: dict[str, set[str]] = {}
     for p in people:
@@ -160,20 +210,23 @@ def build_plan(rec: dict, primary: list[str], rel_overrides: dict[str, str] | No
         rel = "" if p["is_subject"] else account_rel_tag(p["relationship"])
         primary_out.append({
             "name": p["name"], "is_subject": p["is_subject"], "relationship": p["relationship"],
+            "scored": p["scored"],
             "phones": [{"number": ph["number"], "type": _phone_type(ph.get("type")),
                         # Only an unshared number can carry a relationship tag.
                         "relationship_tag": rel if rel and len(holders[ph["number"]]) == 1 else ""}
                        for ph in p["phones"]]})
 
     board_out = []
-    placed = set(primary_numbers)
+    # Only numbers that reach the phone list count as placed, so a number an
+    # unscored person shares with a scored one still reaches the phone list.
+    placed = {ph["number"] for p in chosen if p["scored"] for ph in p["phones"]}
     for p in people:
         if p in chosen:
             continue
         rel = "" if p["is_subject"] else account_rel_tag(p["relationship"])
         tagged = []
         for ph in p["phones"]:
-            if ph["number"] in placed:        # each number written once
+            if not p["scored"] or ph["number"] in placed:   # each number written once
                 continue
             placed.add(ph["number"])
             tagged.append({"number": ph["number"], "type": _phone_type(ph.get("type")),
@@ -186,8 +239,10 @@ def build_plan(rec: dict, primary: list[str], rel_overrides: dict[str, str] | No
                                if x),
             "phones": [ph["number"] for ph in p["phones"] if ph["number"] not in primary_numbers],
             "shared": [ph["number"] for ph in p["phones"] if ph["number"] in primary_numbers],
-            "phone_list": tagged})
-    return {"subject": subject["name"], "primary": primary_out, "board": board_out}
+            "phone_list": tagged, "scored": p["scored"]})
+    return {"subject": subject["name"], "primary": primary_out, "board": board_out,
+            "phone_list_numbers": placed,
+            "scored_names": [p["name"] for p in people if p["scored"]]}
 
 
 # ── the board post: written by `write`, read back by `promote` ────────
@@ -223,19 +278,27 @@ def _fmt(num: str) -> str:
 def build_family_post(plan: dict, *, today: str | None = None,
                       tiers: dict[str, str] | None = None) -> str:
     """Who is who, for a caller looking at a list of scored numbers: a dial
-    sheet on its own (Jeff, 2026-10-20), each number with its dial tier. Every
-    number here is already on the phone list; relationship tags cannot carry a
-    name, so this is where the names live."""
+    sheet on its own (Jeff, 2026-10-20), each number with its dial tier, or
+    "board only" for a number kept off the phone list and never scored
+    (2026-10-23 scope). Relationship tags cannot carry a name, so this is
+    where the names live."""
     today = today or date.today().isoformat()
     tiers = tiers or {}
+    on_list = plan.get("phone_list_numbers")
 
     def tier(num):
-        return tiers.get(num) or ("not scored yet" if num != "none" else "")
+        if num == "none":
+            return ""
+        if on_list is not None and num not in on_list:
+            return BOARD_ONLY
+        return tiers.get(num) or "not scored yet"
 
-    lines = [f"{FAMILY_MARKER} ({today})",
+    lines = [f"{FAMILY_MARKER_V2} ({today})",
              f"Traced: {plan['subject']}. Call first: "
              + ", ".join(p["name"] for p in plan["primary"]) + ".",
-             "Every number below is on the phone list. Name | relationship | number | dial tier.", ""]
+             "Name | relationship | number | dial tier. Numbers marked '" + BOARD_ONLY
+             + "' were not added or scored (living owner: owner + spouse only; "
+               "deceased owner: close family only).", ""]
     for p in plan["primary"]:
         who = "Owner (traced subject)" if p["is_subject"] else (p.get("relationship") or "Call first")
         for ph in p["phones"] or [{"number": "none"}]:
@@ -258,7 +321,8 @@ def build_family_post(plan: dict, *, today: str | None = None,
 def find_family_post(posts: list[dict]) -> dict | None:
     """Newest post carrying the family marker."""
     for p in posts:
-        if FAMILY_MARKER in _plain(p.get("message") or ""):
+        text = _plain(p.get("message") or "")
+        if FAMILY_MARKER in text or FAMILY_MARKER_V2 in text:
             return p
     return None
 
@@ -334,12 +398,13 @@ def _write_phones(property_uuid: str, owner_uuid: str, rec: dict, people: list[d
     A number ALREADY on the record (an earlier skip trace, then dialed) is
     never re-upserted: the upsert replaces the phone object, so it could only
     overwrite its line type with SmartSkip's guess or put a status at risk. It
-    gets the SmartSkip source tag (true: SmartSkip returned it) and a tier only
-    if it never had one. No relationship tag: whose number it is was settled
-    before SmartSkip, and phone tags cannot be removed (Jeff, 2026-10-20)."""
-    skip = _already_tiered(rec)
+    gets the SmartSkip source tag (true: SmartSkip returned it) and is never
+    Trestle-scored again, tiered or not: only numbers NOT already in the CRM
+    are scored (Jeff, 2026-10-23). No relationship tag: whose number it is was
+    settled before SmartSkip, and phone tags cannot be removed (2026-10-20)."""
     on_record = {sta.norm_phone(p.get("number"))
                  for p in ((rec.get("owner") or {}).get("phones") or [])} - {None}
+    skip = _already_tiered(rec) | on_record
     subjects = [{"name": label, "property_address": property_uuid, "people": [
         {"phones": [{"number": ph["number"], "type_raw": ph.get("type") or "",
                      "sources": [SOURCE_SMARTSKIP]}
@@ -353,7 +418,8 @@ def _write_phones(property_uuid: str, owner_uuid: str, rec: dict, people: list[d
         for ph in p["phones"]:
             n = ph["number"]
             s = by_number.get(n, {})
-            if n not in on_record:
+            if n not in on_record and n not in {e["number"] for e in phones}:
+                # A number two relatives share is upserted once (2026-10-23).
                 entry = {"number": n}
                 if s.get("type_raw") or ph.get("type"):
                     entry["type"] = s.get("type_raw") or ph.get("type")
@@ -405,21 +471,28 @@ def write_record(rec: dict, plan: dict, *, dry_run: bool = True, repost: bool = 
     try:
         uuid, owner_uuid, crm = _resolve(rec["property_address"], rec["property_city"],
                                          rec["property_state"])
-        people = plan["primary"] + [{"name": b["name"], "phones": b["phone_list"]}
-                                    for b in plan["board"] if b["phone_list"]]
+        # Only SCORED people reach the phone list (2026-10-23 scope); a call-first
+        # person outside the scope is named on the board post only.
+        people = [p for p in plan["primary"] if p.get("scored", True)] + [
+            {"name": b["name"], "phones": b["phone_list"]}
+            for b in plan["board"] if b["phone_list"]]
         res = _write_phones(uuid, owner_uuid, crm, people,
                             label=plan["subject"], dry_run=dry_run)
         tags = [TAG_SMARTSKIP_SKIPPED] + ([sta.TAG_TRESTLE_SCORED] if res["scored"] else [])
         _api.add_tags(uuid, tags)
         res["property_tags"] = tags
 
-        existing = find_family_post(_api.get_message_board(owner_uuid))
+        # Posts go on the PROPERTY board, where the team works; nothing is posted
+        # to an owner record (Jeff, 2026-10-21/23). Both boards are checked so an
+        # older owner-board family post still counts as already posted.
+        existing = find_family_post(_api.get_property_message_board(uuid)
+                                    + _api.get_message_board(owner_uuid))
         if existing and not repost:
             logger.warning("record already has a family post (%s) - not posting a second; "
                            "pass --repost to post anyway", existing.get("created"))
             res["posted"] = False
         else:
-            _api.post_message_board(owner_uuid, build_family_post(plan, tiers=res.get("tiers")))
+            _api.post_property_message_board(uuid, build_family_post(plan, tiers=res.get("tiers")))
             res["posted"] = True
         res.update(property_uuid=uuid)
         return res
@@ -433,7 +506,8 @@ def promote_record(street: str, city: str, state: str, *, only: set[str] | None 
     _api.set_dry_run(dry_run)
     try:
         uuid, owner_uuid, crm = _resolve(street, city, state)
-        post = find_relatives_post(_api.get_message_board(owner_uuid))
+        post = find_relatives_post(_api.get_property_message_board(uuid)
+                                   + _api.get_message_board(owner_uuid))
         if not post:
             raise SystemExit("no SmartSkip relatives post on this record's Message Board")
         rows = parse_board_post(post.get("message") or "")
@@ -468,7 +542,7 @@ def promote_record(street: str, city: str, state: str, *, only: set[str] | None 
         if res["scored"]:
             _api.add_tags(uuid, [sta.TAG_TRESTLE_SCORED])
         names = ", ".join(f"{p['name']} ({len(p['phones'])})" for p in people.values())
-        _api.post_message_board(owner_uuid,
+        _api.post_property_message_board(uuid,
             f"{PROMOTED_MARKER} ({date.today().isoformat()})\n"
             f"Added and scored {res['numbers']} number(s) after the primary numbers came up empty: "
             f"{names}.")

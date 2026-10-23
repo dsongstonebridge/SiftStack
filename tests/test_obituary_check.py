@@ -70,6 +70,10 @@ check("check(): the spouse trap ranks first, ahead of a matching obituary",
       res["summary"].startswith("OWNER IS A SURVIVOR"))
 check("check() with no pages: NO OBITUARY FOUND",
       oc.check(OWNER, city="Tulsa", pages=[])["summary"] == "NO OBITUARY FOUND")
+check("middle INITIAL matches the full middle name (Nancy E = Nancy Eileen)",
+      oc.middle_conflict("Nancy E Bridgewater", "Nancy Eileen Bridgewater Obituary") == "")
+check("middle initial still rules out a different letter",
+      oc.middle_conflict("Nancy E Bridgewater", "Nancy Jo Bridgewater Obituary") == "Jo")
 
 print(f"\n{failures} failure(s)")
 sys.exit(1 if failures else 0)

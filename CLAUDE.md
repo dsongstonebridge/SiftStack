@@ -1184,7 +1184,9 @@ DataSift skip trace). Run from `C:\Users\dsong\SiftStack-deepprospect` (kept at 
 its own `.env` copy with `SMARTSKIP_EMAIL` / `SMARTSKIP_PASSWORD`).
 
 **TRESTLE SCOPE (Jeff, 2026-10-23, standing; replaces the 2026-10-20 "score every
-number" rule).** Only numbers NOT already in the CRM are ever scored, and only for:
+number" rule; applies to ANY skip trace that returns relatives, not only this
+runner, see Spend discipline).** Only numbers NOT already in the CRM are ever scored,
+and only for:
 - **Living owner:** the owner (traced subject) and their spouse. Never relatives,
   children, in-laws or catch-all "Relative" rows.
 - **Deceased owner:** never the dead owner's own numbers; close family only: spouse,
@@ -2562,6 +2564,17 @@ count (28 rows -> 24 credits).
 **Ask the user before EVERY metered call, including Trestle** (standing
 instruction 2026-08-21, which explicitly retracted an earlier "stop asking").
 Do not infer authorization from a general "go ahead" earlier in a session.
+
+**Trestle scope whenever a skip trace returns RELATIVES** (Jeff, 2026-10-23,
+standing): SmartSkip, Enformion person search, or any other source, on any record
+type, whenever we can tell whether the owner is alive or dead. Score only numbers
+NOT already in the CRM, and only: living owner -> the owner (and co-owners on
+title) + spouse; deceased owner (by our own research first, else the vendor's flag
+or the record's data) -> never the dead owner's numbers, close family only
+(spouse, children, parents, siblings, PR). Never catch-all relatives or in-laws.
+Show Jeff a simple breakdown table before the Trestle spend. Can't tell alive from
+dead -> ask. Details and the levers that enforce it in the deep prospecting runner:
+the "TRESTLE SCOPE" paragraph under Deep prospecting.
 
 | Source | Rate | Billed on |
 |---|---|---|

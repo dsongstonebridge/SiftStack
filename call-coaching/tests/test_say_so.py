@@ -1,6 +1,7 @@
 """Offline tests for Jeff's rule (2026-10-26): no call is transcribed unless he
-names it, and a call is scored only if he approved it for transcription. No network, no spend: the paid step is a stub that records
-what it was asked to send.
+names it (the billed step), and every transcribed call is scored (free), while
+a call with no transcript never is. No network, no spend: the paid step is a
+stub that records what it was asked to send.
 
 Run from SiftStack root:  py -3 call-coaching/tests/test_say_so.py
 """
@@ -79,39 +80,40 @@ def main() -> int:
         rc = transcribe.run(commit=True, ids=["CA2"], send=send)
         check(f"only the named call is sent (rc={rc}, sent={sent})", rc == 0 and sent == ["CA2"])
 
-        # 5. the transcribed (named) call is approved for scoring; no other call is
-        calls = json.loads(cj.read_text(encoding="utf-8"))
-        approved = [c["call_id"] for c in calls if c.get("score_approved")]
-        check(f"only the transcribed call is approved ({approved})", approved == ["CA2"])
+        # 5. the transcribed call is queued for scoring; the untranscribed ones are not
         grade.cmd_queue()
         q = json.loads(grade.QUEUE_JSON.read_text(encoding="utf-8"))
         check(f"only the transcribed call is queued (queue={[x['call_id'] for x in q]})",
               [x["call_id"] for x in q] == ["CA2"])
 
-        # 6. a call never approved for transcription is never scored, even if it
-        #    somehow has a transcript and a report (e.g. sorted by hand)
+        # 6. a call with no transcript is never scored, even if it carries a rubric
         calls = json.loads(cj.read_text(encoding="utf-8"))
         ca3 = next(c for c in calls if c["call_id"] == "CA3")
-        ca3.update({"pipeline": "cold_call", "transcript_file": str(d / "x.md")})
+        ca3.update({"pipeline": "cold_call", "transcript_file": str(d / "missing.md")})
         cj.write_text(json.dumps(calls), encoding="utf-8")
         grade.cmd_queue()
         q = json.loads(grade.QUEUE_JSON.read_text(encoding="utf-8"))
-        check("hand-sorted unapproved call not queued", "CA3" not in [x["call_id"] for x in q])
+        check("untranscribed call not queued", "CA3" not in [x["call_id"] for x in q])
         rp = d / "report_CA3.md"
         rp.write_text("anything", encoding="utf-8")
-        check("unapproved report rejected", grade.check_report(rp, ca3) == [grade.NOT_APPROVED])
+        check("untranscribed report rejected", grade.check_report(rp, ca3) == [grade.NOT_APPROVED])
         check("report with no matching call rejected", grade.check_report(rp, None) != [])
 
-        # 7. there is no separate approve command that could open scoring
-        check("no approve command", not hasattr(grade, "cmd_approve"))
+        # 7. a transcript that exists, however it got there, is scored ("no matter what")
+        (d / "missing.md").write_text("AGENT: hi", encoding="utf-8")
+        grade.cmd_queue()
+        q = json.loads(grade.QUEUE_JSON.read_text(encoding="utf-8"))
+        check(f"every transcribed call queued ({[x['call_id'] for x in q]})",
+              sorted(x["call_id"] for x in q) == ["CA2", "CA3"])
 
-        # 8. a failed transcription does not approve the call
+        # 8. a failed transcription leaves no transcript, so nothing to score
         def boom(c):
             raise RuntimeError("network down")
         transcribe.run(commit=True, ids=["CA1"], send=boom)
         calls = json.loads(cj.read_text(encoding="utf-8"))
         ca1 = next(c for c in calls if c["call_id"] == "CA1")
-        check("failed transcription not approved", not ca1.get("score_approved"))
+        check("failed transcription not scorable", not grade.is_transcribed(ca1))
+        check("no approve command", not hasattr(grade, "cmd_approve"))
 
     print(f"{PASS} passed, {FAILED} failed")
     return 1 if FAILED else 0

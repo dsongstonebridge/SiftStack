@@ -5,9 +5,8 @@
 > **Nothing is transcribed or scored unless Jeff names the calls** (his rule,
 > 2026-10-26, enforced in code). `transcribe.py --commit` refuses to run
 > without `--call-id`, and there is no "all calls" option. Transcription is
-> the one gate (it is the billed step): a call Jeff approves for transcription
-> is automatically approved for scoring, and no other call can be scored. The
-> checker rejects any report for a call that was not approved.
+> the one gate (it is the billed step). Scoring is free, so **every transcribed
+> call is scored**, and a call with no transcript never is.
 
 Scores the team's recorded smrtPhone calls against three rubrics and turns them
 into coaching: one report per call, one scorecard per caller, one Excel
@@ -41,7 +40,7 @@ py -3 call-coaching/pull_calls.py          # free: list calls since 2026-09-28 (
 py -3 call-coaching/download.py            # free: download recordings
 py -3 call-coaching/transcribe.py          # free: prints the cost estimate only
 py -3 call-coaching/transcribe.py --commit --call-id CA1,CA2   # PAID, only the calls Jeff named
-py -3 call-coaching/grade.py queue         # which approved calls need a report
+py -3 call-coaching/grade.py queue         # every transcribed call that still needs a report
     (Claude grades each call in a Claude Code session, following GRADING.md)
 py -3 call-coaching/grade.py check         # rejects any report that breaks the rules
 py -3 call-coaching/export.py              # workbook + per-caller scorecards

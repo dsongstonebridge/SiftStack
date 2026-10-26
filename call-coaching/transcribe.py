@@ -20,9 +20,8 @@ NOTHING IS TRANSCRIBED UNLESS JEFF NAMES THE CALLS (his rule, 2026-10-26).
 everything" option. Only the ids listed are ever sent; an id that is not in
 calls.json stops the whole run before anything is spent.
 
-Approving a call for transcription is ALSO what approves it for scoring, and
-the only thing that does: each call transcribed here is marked
-score_approved. Calls Jeff never named are never transcribed or scored.
+Every transcribed call is scored (scoring is free); a call Jeff never named
+is never transcribed, so it is never scored.
 
 USAGE (from SiftStack root):
   py -3 call-coaching/transcribe.py                                  # estimate only, free
@@ -197,8 +196,7 @@ def run(commit: bool, ids: list[str], force: bool = False, min_seconds: int = 10
             text, tri = send(c)
             md = write_transcript(c, text, tri)
             save_json(TR_DIR / f"{c['call_id']}.json", tri)
-            c.update({"score_approved": True,      # Jeff approved it for transcription
-                      "score_approved_at": datetime.now().isoformat(timespec="seconds"),
+            c.update({"transcribed_at": datetime.now().isoformat(timespec="seconds"),
                       "transcript_file": str(md), "pipeline": tri.get("pipeline"),
                       "report_type": tri.get("report_type"),
                       "not_gradeable_reason": tri.get("not_gradeable_reason"),

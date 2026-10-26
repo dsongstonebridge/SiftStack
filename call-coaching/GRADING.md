@@ -6,10 +6,10 @@ breaks a mechanical rule. The judgment rules below are the grader's to keep.
 
 ## Steps
 
-0. **Only calls Jeff approved for transcription.** A call is approved for
-   scoring only by `transcribe.py --commit --call-id <ids>`, which runs only on
-   the calls he names. Every other call starts and stays NOT approved; `queue`
-   skips it and `check` rejects its report.
+0. **Every transcribed call, and only those.** Scoring is free; transcribing is
+   the billed step and runs only on calls Jeff names. So grade every call that
+   has a transcript (no need to ask), and never one that does not. `queue`
+   lists exactly those; `check` rejects a report for an untranscribed call.
 1. `py -3 call-coaching/grade.py queue`: lists each call that needs a report,
    with its rubric, its transcript, and the exact path the report must be
    written to. The rubric is picked from what was said on the call, not from

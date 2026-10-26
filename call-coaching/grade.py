@@ -19,12 +19,13 @@ call. This script is the part that keeps that honest:
               disclosure was missed
           A report that passes is marked graded in calls.json.
 
-A CALL IS SCORED ONLY IF JEFF APPROVED IT FOR TRANSCRIPTION (his rule,
-2026-10-26). Transcription is the one gate he opens, because it is the billed
-step: transcribe.py --commit --call-id <ids> marks each call it transcribes as
-approved for scoring, and nothing else can. Every call starts NOT approved;
-`queue` lists only approved calls; `check` rejects any report for a call that
-is not approved, so it never counts as graded and never reaches the workbook.
+EVERY TRANSCRIBED CALL IS SCORED, AND ONLY TRANSCRIBED CALLS (Jeff's rule,
+2026-10-26). Scoring is free; transcription is the billed step and the one gate
+he opens (transcribe.py --commit --call-id <ids>). Once money was spent on a
+call it is always scored, however the transcript came to exist. A call with no
+transcript is never scored: `queue` skips it and `check` rejects its report.
+Calls sorted as not gradeable (voicemail, wrong number, no conversation) go to
+the Connection Log, since there is no conversation to grade.
 
 USAGE (from SiftStack root):
   py -3 call-coaching/grade.py queue
@@ -57,9 +58,14 @@ def report_path(c: dict) -> Path:
 
 # ---------------------------------------------------------------- queue
 
-NOT_APPROVED = ("not approved for scoring: Jeff did not approve this call for "
-                "transcription (transcribe.py --commit --call-id <id>). Only calls he "
-                "approved for transcription are scored.")
+NOT_APPROVED = ("not transcribed: only transcribed calls are scored, and a call is "
+                "transcribed only when Jeff names it (transcribe.py --commit --call-id <id>).")
+
+
+def is_transcribed(c: dict) -> bool:
+    """The scoring gate: a transcript file exists for this call."""
+    tf = c.get("transcript_file")
+    return bool(tf) and Path(tf).is_file()
 
 
 def cmd_queue() -> int:
@@ -68,7 +74,7 @@ def cmd_queue() -> int:
     for c in calls:
         if is_excluded(c.get("caller")) or c.get("pipeline") not in PIPELINES:
             continue
-        if not c.get("score_approved"):
+        if not is_transcribed(c):
             continue
         rp = report_path(c)
         if c.get("graded") and rp.exists():
@@ -169,7 +175,7 @@ def table_rows(body: str) -> dict:
 def check_report(path: Path, call: dict | None) -> list[str]:
     if call is None:
         return ["no matching call in calls.json for this report"]
-    if not call.get("score_approved"):
+    if not is_transcribed(call):
         return [NOT_APPROVED]
     errs = []
     body, js = parse_report(path)

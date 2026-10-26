@@ -19,13 +19,14 @@ call. This script is the part that keeps that honest:
               disclosure was missed
           A report that passes is marked graded in calls.json.
 
-NOTHING IS SCORED UNLESS JEFF NAMES THE CALL (his rule, 2026-10-26). Every
-call starts NOT approved. `approve` marks only the ids he names; `queue` lists
-only approved calls; `check` rejects any report for a call that is not
-approved, so it never counts as graded and never reaches the workbook.
+A CALL IS SCORED ONLY IF JEFF APPROVED IT FOR TRANSCRIPTION (his rule,
+2026-10-26). Transcription is the one gate he opens, because it is the billed
+step: transcribe.py --commit --call-id <ids> marks each call it transcribes as
+approved for scoring, and nothing else can. Every call starts NOT approved;
+`queue` lists only approved calls; `check` rejects any report for a call that
+is not approved, so it never counts as graded and never reaches the workbook.
 
 USAGE (from SiftStack root):
-  py -3 call-coaching/grade.py approve CA1,CA2       # ONLY when Jeff names them
   py -3 call-coaching/grade.py queue
   py -3 call-coaching/grade.py check                 # every report
   py -3 call-coaching/grade.py check <report.md> ... # specific reports
@@ -37,11 +38,10 @@ import argparse
 import json
 import re
 import sys
-from datetime import datetime
 from pathlib import Path
 
 from cc_common import (CALLS_JSON, PIPELINES, QUEUE_JSON, REPORT_DIR, RUBRICS as RUBRIC_DIR,
-                       display_name, is_excluded, load_json, log, parse_ids, save_json, slug)
+                       display_name, is_excluded, load_json, log, save_json, slug)
 from rubric_spec import RUBRICS, band_for, compute
 
 CRIT_ROW = re.compile(r"^\|\s*(\d\.\d)\b(.*)$")
@@ -57,33 +57,9 @@ def report_path(c: dict) -> Path:
 
 # ---------------------------------------------------------------- queue
 
-NOT_APPROVED = ("not approved for scoring: Jeff has not named this call "
-                "(grade.py approve <id>). Nothing is scored without his say-so.")
-
-
-def cmd_approve(ids: list[str]) -> int:
-    """Mark the calls Jeff named as approved for scoring. Run ONLY when he
-    names them. Default for every call is NOT approved (his rule, 2026-10-26)."""
-    if not ids:
-        log("REFUSED: name the calls to approve, e.g. grade.py approve CA1,CA2.")
-        return 3
-    calls = load_json(CALLS_JSON, [])
-    by_id = {c["call_id"]: c for c in calls}
-    unknown = [i for i in ids if i not in by_id]
-    if unknown:
-        log(f"REFUSED: not in calls.json: {', '.join(unknown)}. Nothing was approved.")
-        return 3
-    for i in ids:
-        c = by_id[i]
-        c["score_approved"] = True
-        c["score_approved_at"] = datetime.now().isoformat(timespec="seconds")
-        if c.get("pipeline") not in PIPELINES:
-            log(f"  {i}: approved, but it is not transcribed or sorted into a rubric yet "
-                f"({c.get('pipeline') or 'not transcribed'}).")
-        else:
-            log(f"  {i}: approved for scoring ({c['pipeline']}).")
-    save_json(CALLS_JSON, calls)
-    return 0
+NOT_APPROVED = ("not approved for scoring: Jeff did not approve this call for "
+                "transcription (transcribe.py --commit --call-id <id>). Only calls he "
+                "approved for transcription are scored.")
 
 
 def cmd_queue() -> int:
@@ -336,14 +312,10 @@ def cmd_check(paths: list[str]) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(description="Grading queue + report checker")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    a = sub.add_parser("approve", help="approve the calls Jeff named for scoring")
-    a.add_argument("ids", help="comma-separated call ids")
     sub.add_parser("queue")
     c = sub.add_parser("check")
     c.add_argument("reports", nargs="*")
     args = ap.parse_args()
-    if args.cmd == "approve":
-        return cmd_approve(parse_ids(args.ids))
     return cmd_queue() if args.cmd == "queue" else cmd_check(args.reports)
 
 

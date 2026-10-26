@@ -1,5 +1,5 @@
-"""Offline tests for Jeff's rule (2026-10-26): no call is transcribed or scored
-unless he names it. No network, no spend: the paid step is a stub that records
+"""Offline tests for Jeff's rule (2026-10-26): no call is transcribed unless he
+names it, and a call is scored only if he approved it for transcription. No network, no spend: the paid step is a stub that records
 what it was asked to send.
 
 Run from SiftStack root:  py -3 call-coaching/tests/test_say_so.py
@@ -79,34 +79,39 @@ def main() -> int:
         rc = transcribe.run(commit=True, ids=["CA2"], send=send)
         check(f"only the named call is sent (rc={rc}, sent={sent})", rc == 0 and sent == ["CA2"])
 
-        # 5. transcribing does NOT approve scoring: CA2 is not in the grading queue
+        # 5. the transcribed (named) call is approved for scoring; no other call is
+        calls = json.loads(cj.read_text(encoding="utf-8"))
+        approved = [c["call_id"] for c in calls if c.get("score_approved")]
+        check(f"only the transcribed call is approved ({approved})", approved == ["CA2"])
         grade.cmd_queue()
         q = json.loads(grade.QUEUE_JSON.read_text(encoding="utf-8"))
-        check(f"transcribed but unapproved call not queued (queue={q})", q == [])
+        check(f"only the transcribed call is queued (queue={[x['call_id'] for x in q]})",
+              [x["call_id"] for x in q] == ["CA2"])
 
-        # 6. a report for an unapproved call is rejected and never marked graded
-        rp = d / "report_CA2.md"
-        rp.write_text("anything", encoding="utf-8")
+        # 6. a call never approved for transcription is never scored, even if it
+        #    somehow has a transcript and a report (e.g. sorted by hand)
         calls = json.loads(cj.read_text(encoding="utf-8"))
-        ca2 = next(c for c in calls if c["call_id"] == "CA2")
-        check("unapproved report rejected", grade.check_report(rp, ca2) == [grade.NOT_APPROVED])
+        ca3 = next(c for c in calls if c["call_id"] == "CA3")
+        ca3.update({"pipeline": "cold_call", "transcript_file": str(d / "x.md")})
+        cj.write_text(json.dumps(calls), encoding="utf-8")
+        grade.cmd_queue()
+        q = json.loads(grade.QUEUE_JSON.read_text(encoding="utf-8"))
+        check("hand-sorted unapproved call not queued", "CA3" not in [x["call_id"] for x in q])
+        rp = d / "report_CA3.md"
+        rp.write_text("anything", encoding="utf-8")
+        check("unapproved report rejected", grade.check_report(rp, ca3) == [grade.NOT_APPROVED])
         check("report with no matching call rejected", grade.check_report(rp, None) != [])
 
-        # 7. approve with nothing named / an unknown id: refused, nothing approved
-        check("approve with no ids refused", grade.cmd_approve([]) == 3)
-        check("approve unknown id refused", grade.cmd_approve(["CA2", "CAnope"]) == 3)
-        calls = json.loads(cj.read_text(encoding="utf-8"))
-        check("nothing approved after refusals", not any(c.get("score_approved") for c in calls))
+        # 7. there is no separate approve command that could open scoring
+        check("no approve command", not hasattr(grade, "cmd_approve"))
 
-        # 8. approving CA2 puts only CA2 in the queue
-        check("approve CA2", grade.cmd_approve(["CA2"]) == 0)
-        grade.cmd_queue()
-        q = json.loads(grade.QUEUE_JSON.read_text(encoding="utf-8"))
-        check(f"only the approved call is queued (queue={[x['call_id'] for x in q]})",
-              [x["call_id"] for x in q] == ["CA2"])
+        # 8. a failed transcription does not approve the call
+        def boom(c):
+            raise RuntimeError("network down")
+        transcribe.run(commit=True, ids=["CA1"], send=boom)
         calls = json.loads(cj.read_text(encoding="utf-8"))
-        others = [c["call_id"] for c in calls if c.get("score_approved") and c["call_id"] != "CA2"]
-        check(f"no other call approved ({others})", others == [])
+        ca1 = next(c for c in calls if c["call_id"] == "CA1")
+        check("failed transcription not approved", not ca1.get("score_approved"))
 
     print(f"{PASS} passed, {FAILED} failed")
     return 1 if FAILED else 0

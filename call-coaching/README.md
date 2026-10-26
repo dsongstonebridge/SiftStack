@@ -4,8 +4,9 @@
 >
 > **Nothing is transcribed or scored unless Jeff names the calls** (his rule,
 > 2026-10-26, enforced in code). `transcribe.py --commit` refuses to run
-> without `--call-id`, and there is no "all calls" option. Transcribing a call
-> does not approve it for scoring: `grade.py approve <id>` does, and the
+> without `--call-id`, and there is no "all calls" option. Transcription is
+> the one gate (it is the billed step): a call Jeff approves for transcription
+> is automatically approved for scoring, and no other call can be scored. The
 > checker rejects any report for a call that was not approved.
 
 Scores the team's recorded smrtPhone calls against three rubrics and turns them
@@ -40,7 +41,6 @@ py -3 call-coaching/pull_calls.py          # free: list calls since 2026-09-28 (
 py -3 call-coaching/download.py            # free: download recordings
 py -3 call-coaching/transcribe.py          # free: prints the cost estimate only
 py -3 call-coaching/transcribe.py --commit --call-id CA1,CA2   # PAID, only the calls Jeff named
-py -3 call-coaching/grade.py approve CA1,CA2   # only the calls Jeff named for scoring
 py -3 call-coaching/grade.py queue         # which approved calls need a report
     (Claude grades each call in a Claude Code session, following GRADING.md)
 py -3 call-coaching/grade.py check         # rejects any report that breaks the rules
@@ -59,7 +59,7 @@ Connection Log.
 | `GRADING.md` | Rules the grader follows: word-for-word quotes, evidence on every criterion, N/A limits, math |
 | `rubric_spec.py` | Criteria, weights and N/A rules the checker enforces. Change it together with a rubric |
 | `tests/test_grading.py` | Offline checks on the checker, math and tie tiers |
-| `tests/test_say_so.py` | Offline checks that nothing is transcribed or scored unless named |
+| `tests/test_say_so.py` | Offline checks that nothing is transcribed unless named, and only transcribed calls are scored |
 
 ## Output (gitignored, contains seller info)
 

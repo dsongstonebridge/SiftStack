@@ -244,6 +244,24 @@ def _daily_key() -> str:
     return "daily_number:" + date.today().isoformat()
 
 
+def spread_number(numbers: list[str], load: dict) -> str:
+    """The least-loaded number that may start a new record (Jeff, 2026-10-26).
+
+    Same gates as daily_number (health check + NEW_START_MAX_FLAGS), but the
+    batch is split across every number that passes instead of one. Load is
+    today's real sends plus what this batch has already given each number.
+    """
+    ranked = []
+    for n in numbers:
+        if not available_health(n) or not _clean_enough(n):
+            continue
+        ranked.append((store.sends_today(n) + load.get(n, 0), n))
+    if not ranked:
+        log.warning("no healthy number to start deep-prospect records on today")
+        return ""
+    return min(ranked)[1]
+
+
 def daily_number(numbers: list[str]) -> str:
     """Today's number for every NEW record (Jeff, 2026-10-06).
 

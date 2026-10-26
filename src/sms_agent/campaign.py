@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from typing import Optional
 
-from . import config, crm, respond, seed, sender_pool, store
+from . import config, crm, dp_numbers, respond, seed, sender_pool, store
 from .knowledge import touches
 
 log = logging.getLogger(__name__)
@@ -75,6 +75,10 @@ class Source:
     # Jeff, 2026-10-09: "continue" = finish sequences already started from this
     # source, but start nobody new (no touch 1) until he says so.
     continue_only: bool = False
+    # Jeff, 2026-10-26: `newnums` = a deep-prospect preset. Text ONLY the new
+    # SmartSkip Dial First/Second numbers (dp_numbers), each starting its own
+    # four touches, never the old numbers that forced the deep prospect.
+    new_numbers_only: bool = False
 
 
 SOURCES = [
@@ -98,12 +102,13 @@ def _sources_from_env(raw: str) -> list:
         if len(bits) < 2 or not bits[0]:
             raise ValueError(f"bad SMS_AGENT_CAMPAIGN_SOURCES entry: {part!r}")
         flags = {b.lower() for b in bits[2:]}
-        unknown = flags - {"deep", "1", "true", "continue", ""}
+        unknown = flags - {"deep", "1", "true", "continue", "newnums", ""}
         if unknown:
             raise ValueError(f"bad SMS_AGENT_CAMPAIGN_SOURCES flag {sorted(unknown)} in {part!r}")
         deep = bool(flags & {"deep", "1", "true"})
         out.append(Source(bits[0], float(bits[1]), deep=deep,
-                          continue_only="continue" in flags))
+                          continue_only="continue" in flags,
+                          new_numbers_only="newnums" in flags))
     return out
 
 
@@ -121,15 +126,17 @@ def _fingerprints() -> dict[int, list[str]]:
     identifies which touch a historical message came from.
     """
     out: dict[int, list[str]] = {}
-    for touch, (pool, noname) in enumerate(touches.POOLS, start=1):
-        marks = []
+    # Heir copy too (2026-10-26): deep-prospected relatives get it, and a
+    # touch the history cannot recognise is a touch 1 sent again forever.
+    pools = list(enumerate(touches.POOLS, start=1)) + list(enumerate(touches.HEIR_POOLS, start=1))
+    for touch, (pool, noname) in pools:
+        marks = out.setdefault(touch, [])
         for template in list(pool) + list(noname):
             # Longest literal run between merge fields, lowercased.
             literals = [p.strip() for p in re.split(r"\{[a-z]+\}", template)]
             best = max(literals, key=len)
             if len(best) >= 18:
                 marks.append(re.sub(r"\s+", " ", best.lower())[:60])
-        out[touch] = marks
     return out
 
 
@@ -275,6 +282,11 @@ class Plan:
     missing_presets: list = field(default_factory=list)
     # Tulsa fork: (record_uuid, text) board notes explaining a skip.
     board_notes: list = field(default_factory=list)
+    # Deep-prospected records: (source, record_uuid, street, {number: why}),
+    # why "" = new and eligible. What the review prints, number by number.
+    dp_review: list = field(default_factory=list)
+    # Records a cap stopped the build from even looking at, per source.
+    left_unvetted: dict = field(default_factory=dict)
 
 
 def build(sender_fallback: str = "", log_pages: int = 6,
@@ -300,6 +312,26 @@ def build(sender_fallback: str = "", log_pages: int = 6,
 
     history = prior_touches(sms_rows)
     plan = Plan()
+    # Every number we have EVER texted, touch or not (hand-typed texts too).
+    # A deep-prospected record's old numbers are in here; its new ones are not.
+    # phone -> FIRST date we texted it. dp_numbers only counts texts from
+    # before a record's deep prospect started, so this campaign's own touch 1
+    # does not turn its number "old" the next morning.
+    texted: dict = {}
+
+    def _first(phone: str, when: str) -> None:
+        phone, when = store.clean_phone(phone), str(when or "")[:10]
+        if phone and when and (phone not in texted or when < texted[phone]):
+            texted[phone] = when
+
+    for r in store._conn().execute(
+            "SELECT phone, min(created_at) w FROM messages WHERE direction='out' GROUP BY phone"):
+        _first(r["phone"], r["w"])
+    for r in store._conn().execute("SELECT phone, min(sent_at) w FROM sends GROUP BY phone"):
+        _first(r["phone"], r["w"])
+    for r in sms_rows:
+        if (r.get("direction") or "").lower() == "outbound":
+            _first(r.get("toNum"), r.get("date") or r.get("createdAt"))
     seen_phone: set = set()
 
     # Fetch every source's cohort up front. This is search paging only, no
@@ -349,13 +381,40 @@ def build(sender_fallback: str = "", log_pages: int = 6,
             if config.ONLY_RECORDS and row.get("uuid") not in config.ONLY_RECORDS:
                 continue  # Tulsa fork: launch allow-list
             phone = store.clean_phone(row.get("phone"))
-            if phone and phone in seen_phone:
+            dp_fresh = src.new_numbers_only and not row.get("_expanded")
+            # A DP search row's phone is usually an OLD number, so it says
+            # nothing about who this record's new numbers belong to.
+            if phone and phone in seen_phone and not dp_fresh:
                 plan.skipped_duplicate_person += 1
                 continue
 
+            # Tulsa fork (Jeff, 2026-10-26): deep-prospected record. Work out
+            # which numbers are NEW before anything else looks at a phone.
+            if dp_fresh:
+                uuid = row.get("uuid") or ""
+                run = dp_numbers.run_for(uuid)
+                rec = crm.get_record(uuid) if uuid else None
+                if not rec:
+                    why = "could not read the record"
+                else:
+                    events = crm.activity_log(uuid) if run else None
+                    verdicts = dp_numbers.classify(rec, run, texted, events)
+                    plan.dp_review.append((src.title, uuid, row.get("street") or "", verdicts))
+                    new = dp_numbers.new_numbers(verdicts)
+                    why = (dp_numbers.NO_RUN_REASON if run is None
+                           else "" if new else dp_numbers.NO_NEW_REASON)
+                if why:
+                    stage["holds"][why] = stage["holds"].get(why, 0) + 1
+                    plan.holds[why] = plan.holds.get(why, 0) + 1
+                    continue
+                row = dict(row)
+                row.pop("_needs_best_phone", None)
+                row["_dp_new"] = new
+
             # Tulsa fork: a Correct number overrides everything below.
             if config.CORRECT_NUMBER_FIRST and not row.get("_expanded"):
-                swapped, why = seed.apply_correct_number(row, dnc_numbers)
+                swapped, why = seed.apply_correct_number(row, dnc_numbers,
+                                                         only_numbers=row.get("_dp_new"))
                 if not swapped and why == seed.CORRECT_DNC_REASON:
                     plan.board_notes.append((row.get("uuid") or "", seed.correct_dnc_note(row)))
                 if not swapped:
@@ -372,11 +431,15 @@ def build(sender_fallback: str = "", log_pages: int = 6,
             # Tulsa fork: every qualifying number, not just the best. Expanded
             # rows go back on the front of the queue, so caps, touch history
             # and holds apply to each number exactly as to a single row.
-            if (config.TEXT_ALL_BEST and not row.get("_expanded")
+            if ((config.TEXT_ALL_BEST or row.get("_dp_new") is not None)
+                    and not row.get("_expanded")
                     and row.get("dial_tier") != "Correct"):
-                expanded = seed.all_textable_rows(row, dnc_numbers)
+                expanded = seed.all_textable_rows(row, dnc_numbers,
+                                                  only_numbers=row.get("_dp_new"))
                 if not expanded:
-                    why = "no Dial First or Second phone on the record"
+                    why = ("new SmartSkip numbers are not textable (status, line type or DNC)"
+                           if row.get("_dp_new") is not None
+                           else "no Dial First or Second phone on the record")
                     stage["holds"][why] = stage["holds"].get(why, 0) + 1
                     plan.holds[why] = plan.holds.get(why, 0) + 1
                     continue
@@ -460,7 +523,7 @@ def build(sender_fallback: str = "", log_pages: int = 6,
                 continue
             fetched[src.title] = due
             followups_only = True
-            take(src, (cap or len(due) * 10) - len(plan.candidates))
+            take(src, (cap - len(plan.candidates)) if cap else 10 ** 9)
             followups_only = False
             # Records mid-sequence stay out of today's new-number passes too.
             fetched[src.title] = [r for r in rows if r.get("uuid") not in due_records]
@@ -478,9 +541,15 @@ def build(sender_fallback: str = "", log_pages: int = 6,
                 break
             take(src, cap - len(plan.candidates))
     else:
+        # No cap means no quota (Jeff, 2026-10-14: everyone due gets a text).
+        # The quota used to be the source's ROW count while `taken` counts
+        # TEXTS, and one record expands to several numbers, so the loop
+        # stopped early and the last records were never looked at (12 of 55
+        # on the first DP dry run, 2026-10-26).
         for src in SOURCES:
-            take(src, len(fetched.get(src.title, [])))
+            take(src, 10 ** 9)
 
+    plan.left_unvetted = {t: len(r) for t, r in fetched.items() if r}
     plan.unreached = [s.title for s in SOURCES
                       if s.title in fetched and fetched[s.title]
                       and not plan.per_stage[s.title]["ready"]]

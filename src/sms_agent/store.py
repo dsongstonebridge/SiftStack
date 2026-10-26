@@ -15,7 +15,7 @@ import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any, Iterable, Iterator, Optional
 
 from . import config
 
@@ -287,7 +287,7 @@ def get_conversation(phone: str) -> Optional[dict]:
     return dict(row) if row else None
 
 
-def record_from_number(record_uuid: str) -> str:
+def record_from_number(record_uuid: str, phones: Optional[Iterable[str]] = None) -> str:
     """The sending number already used for ANY phone on this record.
 
     Jeff, 2026-10-05: every phone on one record is texted from the same
@@ -297,13 +297,28 @@ def record_from_number(record_uuid: str) -> str:
     row is written at staging time, so a batch staged and never sent (Ready to
     Call, 10/8) used to pin its phones to that day's number for good: 91 touch
     1s came back on a number that had since been carrier-flagged.
+
+    `phones` limits it to those phones (Jeff, 2026-10-26): a deep-prospected
+    record starts over on the day's clean number, so only the number that
+    texted its NEW SmartSkip phones counts, never the old FTM one. An empty
+    `phones` means nothing has been texted yet.
     """
     if not record_uuid:
         return ""
+    if phones is None:
+        row = _conn().execute(
+            "SELECT s.from_number FROM sends s JOIN phone_map p ON p.phone = s.phone "
+            "WHERE p.record_uuid=? ORDER BY s.sent_at LIMIT 1",
+            (record_uuid,),
+        ).fetchone()
+        return row[0] if row else ""
+    wanted = sorted({clean_phone(p) for p in phones} - {""})
+    if not wanted:
+        return ""
     row = _conn().execute(
-        "SELECT s.from_number FROM sends s JOIN phone_map p ON p.phone = s.phone "
-        "WHERE p.record_uuid=? ORDER BY s.sent_at LIMIT 1",
-        (record_uuid,),
+        "SELECT from_number FROM sends WHERE phone IN (%s) ORDER BY sent_at LIMIT 1"
+        % ",".join("?" * len(wanted)),
+        wanted,
     ).fetchone()
     return row[0] if row else ""
 

@@ -62,6 +62,39 @@ def already_ran_today() -> bool:
     return not store.mark_notified(f"campaign-{today}", STATE_KIND)
 
 
+def number_overloads() -> dict:
+    """{from_number: (planned today incl. already sent, cap)} for every number
+    whose queued texts for today would go past its daily cap."""
+    today = _now_local().strftime("%Y-%m-%d")
+    out = {}
+    rows = store._conn().execute(
+        "SELECT from_number, count(*) n FROM outbox WHERE status IN ('queued','held') "
+        "AND from_number != '' AND substr(not_before,1,10) <= ? GROUP BY from_number", (today,))
+    for r in rows:
+        n = r["from_number"]
+        cap = sender_pool.cap_for(n)
+        planned = r["n"] + store.sends_today(n)
+        if cap and planned > cap:
+            out[n] = (planned, cap)
+    return out
+
+
+def _warn_number_caps() -> None:
+    """Jeff, 2026-10-26: if we already KNOW a number will hit its cap today,
+    say so at queue time, not after the texts quietly fail to go."""
+    over = number_overloads()
+    if not over:
+        return
+    lines = "\n".join(f"  ...{n[-4:]}: {p} planned today, cap {c} ({p - c} would be held)"
+                      for n, (p, c) in sorted(over.items()))
+    escalate.alert(
+        "SMS campaign: a sending number will hit its cap today",
+        f"{lines}\n\nThose texts wait in the outbox until tomorrow unless the cap is "
+        "raised. Your call: raise the cap, or let them roll.",
+        kind="campaign",
+    )
+
+
 def run(force: bool = False, dry_run: bool = False) -> dict:
     """Build and release one day's batch. Safe to call every worker pass."""
     if not config.CAMPAIGN_ENABLED and not force:
@@ -80,6 +113,22 @@ def run(force: bool = False, dry_run: bool = False) -> dict:
     # candidates the cap then throws away.
     plan = campaign.build(limit=cap)
     ready = plan.candidates[:cap]
+
+    # NEVER silently short a day (Jeff, 2026-10-26). When the cap stops the
+    # build, say how much was left so a person can decide (raise the cap,
+    # split the day), instead of finding out from the KPI post.
+    if plan.hit_cap or len(plan.candidates) > cap:
+        left = "\n  ".join(f"{t}: {n} record(s) not looked at"
+                           for t, n in plan.left_unvetted.items()) or "none"
+        escalate.alert(
+            "SMS campaign: today's cap was hit, some texts will NOT go out",
+            f"Capacity today: {cap} texts (pool remaining). {len(ready)} queued.\n"
+            f"Cut after the cap: {max(0, len(plan.candidates) - cap)} ready text(s).\n"
+            f"Left unvetted:\n  {left}\n\n"
+            "Your call: raise SMS_AGENT_DAILY_CAP / SMS_AGENT_DAILY_NUMBER_CAP, "
+            "or let the rest go tomorrow.",
+            kind="campaign",
+        )
 
     # A source referenced BY NAME that does not resolve is a silent zero, and
     # renaming a preset in DataSift is a normal thing to do. This is the alarm
@@ -127,6 +176,7 @@ def run(force: bool = False, dry_run: bool = False) -> dict:
     released = 0
     for touch in (1, 2, 3, 4):
         released += seed.release(touch)
+    _warn_number_caps()
     result = {"queued": queued}
 
     summary = {

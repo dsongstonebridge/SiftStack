@@ -217,6 +217,23 @@ TEXT_ALL_BEST = _env("SMS_AGENT_TEXT_ALL_BEST", "0") in ("1", "true", "True")
 # cut follow-ups off (six of 23 due owners missed touch 2 in a dry run).
 FOLLOWUPS_FIRST = _env("SMS_AGENT_FOLLOWUPS_FIRST", "0") in ("1", "true", "True")
 
+# Tulsa fork (Jeff, 2026-10-26): deep-prospected records. A source flagged
+# `newnums` texts ONLY the Dial First/Second numbers the deep prospect's
+# SmartSkip run added, never the old numbers that forced the deep prospect.
+# This is the folder of deep prospect runs (one subfolder per property, each
+# with state.json + smartskip_export.csv). Unset = every DP row is held.
+DP_RUNS_DIR = _env("SMS_AGENT_DP_RUNS_DIR", "")
+# Jeff, 2026-10-26: DP touch 1s are split across every healthy, clean number
+# (least loaded first) instead of all landing on the day's one number.
+DP_SPREAD_NUMBERS = _env("SMS_AGENT_DP_SPREAD_NUMBERS", "0") in ("1", "true", "True")
+# Records Jeff cleared to start over even though an OLD number's reply
+# settled them before the deep prospect (comma-separated property uuids).
+DP_ALLOW_RECORDS = {x.strip() for x in _env("SMS_AGENT_DP_ALLOW_RECORDS", "").split(",") if x.strip()}
+# Individual numbers Jeff cleared to text on a DP record even though they are
+# old (10 digits, comma-separated). 2026-10-26: Irvington ...5334.
+DP_ALLOW_NUMBERS = {"".join(ch for ch in x if ch.isdigit())[-10:]
+                    for x in _env("SMS_AGENT_DP_ALLOW_NUMBERS", "").split(",") if x.strip()}
+
 # Tulsa fork (Jeff, 2026-10-06): each day, every NEW record starts on one
 # number, the cleanest by NumberVerifier flags, so callers can dial from the
 # number the owner already saw. Records already texted stay on their number.

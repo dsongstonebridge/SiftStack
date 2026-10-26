@@ -20,7 +20,7 @@ import threading
 import time
 from datetime import datetime, timezone
 
-from . import config, engine, sender_pool, store, transport
+from . import config, engine, escalate, sender_pool, store, transport
 
 log = logging.getLogger(__name__)
 
@@ -190,6 +190,17 @@ def drain_outbox(limit: int = 25) -> dict:
         if not ok:
             log.info("holding outbox %s: %s (%s)", row["id"], why, from_number)
             held += 1
+            if why.startswith("daily cap") and store.mark_notified(
+                    f"cap-{from_number}-{datetime.now(timezone.utc).date()}", "cap_hit"):
+                # Jeff, 2026-10-26: never a silent cap. Once per number per day.
+                try:
+                    escalate.alert(
+                        "SMS: a sending number hit its daily cap",
+                        f"...{from_number[-4:]}: {why}. Texts still queued "
+                        "on it are HELD until tomorrow. Your call: raise the cap or let them roll.",
+                        kind="campaign")
+                except Exception as exc:  # noqa: BLE001 - an alert must not stop sending
+                    log.warning("cap alert failed: %s", exc)
             continue
 
         # Never the same text to the same number twice (Jeff, 2026-10-09: on 10/8

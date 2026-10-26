@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Optional
 
-from . import config, crm, respond, sender_pool, store
+from . import config, crm, dp_numbers, respond, sender_pool, store
 from .knowledge import touches
 
 log = logging.getLogger(__name__)
@@ -58,6 +58,9 @@ class Candidate:
     status: str = "ready"
     touch: int = 0
     reasons: list[str] = field(default_factory=list)
+    # Deep-prospected records (Jeff, 2026-10-26): the record's NEW SmartSkip
+    # numbers. Non-empty marks the candidate as a DP restart.
+    dp_new: frozenset = frozenset()
 
     def hold(self, reason: str) -> "Candidate":
         self.status = "hold"
@@ -509,18 +512,36 @@ def post_skip_notes(notes: list) -> dict:
     return {"posted": posted, "skipped": skipped, "failed": failed}
 
 
-def apply_correct_number(row: dict, dnc_numbers: set) -> tuple[Optional[dict], str]:
+OLD_CORRECT_REASON = "only an old (pre-deep-prospect) number is marked Correct"
+
+
+def apply_correct_number(row: dict, dnc_numbers: set,
+                         only_numbers: Optional[frozenset] = None) -> tuple[Optional[dict], str]:
     """Build-time rule. Returns (row, "") with the row UNCHANGED when the record
     has no Correct number, so a record's touch sequence never hops numbers;
     (row on the Correct number, "") when it should be texted there; or
     (None, why) when the record gets no text at all.
+
+    `only_numbers` (deep-prospected records, Jeff 2026-10-26): only those
+    numbers may be texted. A new number marked Correct wins as usual; when the
+    only Correct number is an OLD one the record is held for Jeff to look at.
     """
     uuid = row.get("uuid") or ""
     rec = crm.get_record(uuid) if uuid else None
     if not rec:
         return None, "could not read the record"
+    correct = correct_phones(rec)
+    if only_numbers is not None and correct:
+        mine = [p for p in correct if store.clean_phone(p.get("number")) in only_numbers]
+        if not mine:
+            if uuid in config.DP_ALLOW_RECORDS:
+                # Jeff cleared this record: the old Correct number is simply
+                # not texted, and its new numbers go ahead as normal.
+                return row, ""
+            return None, OLD_CORRECT_REASON
+        correct = mine
     best, flagged = None, []
-    for p in correct_phones(rec):
+    for p in correct:
         number = store.clean_phone(p.get("number"))
         if len(number) != 10:
             continue
@@ -533,7 +554,7 @@ def apply_correct_number(row: dict, dnc_numbers: set) -> tuple[Optional[dict], s
         rank = 0 if (p.get("type") or "").upper() == "MOBILE" else 1
         if best is None or rank < best[0]:
             best = (rank, number)
-    if not correct_phones(rec):
+    if not correct:
         return row, ""
     if best is None and flagged:
         # Already talked to them: nothing for a human to decide, so no note.
@@ -674,9 +695,11 @@ def from_preset(title: str, limit: int = 0, keep_unresolved: bool = False,
 _TIER_RANK = {"Dial First": 0, "Dial Second": 1}
 
 
-def all_textable_rows(row: dict, dnc_numbers: set) -> list[dict]:
+def all_textable_rows(row: dict, dnc_numbers: set,
+                      only_numbers: Optional[frozenset] = None) -> list[dict]:
     """Tulsa fork (config.TEXT_ALL_BEST): one row per qualifying number on the
     record, best first. Same rules as resolve_best_phone, minus the "only one".
+    `only_numbers` limits it to those numbers (deep-prospected records).
     """
     rec = crm.get_record(row.get("uuid") or "") if row.get("uuid") else None
     if not rec:
@@ -688,6 +711,8 @@ def all_textable_rows(row: dict, dnc_numbers: set) -> list[dict]:
             continue
         number = store.clean_phone(p.get("number"))
         if len(number) != 10:
+            continue
+        if only_numbers is not None and number not in only_numbers:
             continue
         if number in dnc_numbers and not config.IGNORE_DNC_FLAG:
             continue
@@ -820,6 +845,14 @@ def build(rows: Iterable[dict], touch: int, sender_fallback: str = "",
         if len(phone) != 10:
             out.append(cand.hold("no usable phone"))
             continue
+        if row.get("_dp_new") is not None:
+            cand.dp_new = frozenset(row["_dp_new"])
+            if phone not in cand.dp_new:
+                # Belt and braces: campaign already limits DP rows to the new
+                # numbers. An old number reaching here is the one mistake this
+                # whole feature exists to prevent.
+                out.append(cand.hold("old number on a deep-prospected record"))
+                continue
         if not cand.street:
             out.append(cand.hold("no street address"))
             continue
@@ -874,7 +907,19 @@ def build(rows: Iterable[dict], touch: int, sender_fallback: str = "",
             # conversation is the same failure as two people texting at once.
             out.append(cand.hold("already replied; touch would interrupt a live thread"))
             continue
-        if config.STOP_ON_ANY_REPLY and not new_deal and _record_replied(cand.record_uuid):
+        if cand.dp_new and config.STOP_ON_ANY_REPLY and not new_deal and _record_replied(cand.record_uuid):
+            # Deep-prospected record (Jeff, 2026-10-26): a reply on one of the
+            # NEW numbers stops the record as usual. One that settled it from
+            # an OLD number, before the deep prospect, is a judgment call, so
+            # the record is held and shown rather than texted or dropped.
+            replied_by = store.get_meta(f"record_replied:{cand.record_uuid}")
+            if replied_by in cand.dp_new:
+                out.append(cand.hold("another number on this record already replied"))
+                continue
+            if cand.record_uuid not in config.DP_ALLOW_RECORDS:
+                out.append(cand.hold("an old number settled this record before the deep prospect"))
+                continue
+        if not cand.dp_new and config.STOP_ON_ANY_REPLY and not new_deal and _record_replied(cand.record_uuid):
             # Any line on this record answered. The owner replying from their
             # second number is still the owner replying.
             out.append(cand.hold("another number on this record already replied"))
@@ -891,9 +936,17 @@ def build(rows: Iterable[dict], touch: int, sender_fallback: str = "",
         else:
             cand.first = touches.clean_first(cand.owner_full)
 
+        # Deep-prospected record: the SmartSkip export says whose number this
+        # is. Their own first name, owner copy for an owner of record, heir
+        # copy for anyone else (Jeff, 2026-10-26).
+        variant = "owner"
+        if cand.dp_new:
+            rec = crm.get_record(cand.record_uuid) or {}
+            first, variant = dp_numbers.addressee(rec, dp_numbers.run_for(cand.record_uuid), phone)
+            cand.first = touches.clean_first(first) if first else ""
         # A number tagged Wife / Son / ... belongs to that relative, so the
         # greeting is their name, or no name; never the primary owner's.
-        if cand.record_uuid and crm.client():
+        elif cand.record_uuid and crm.client():
             rel_name = relation_addressee(cand.record_uuid, phone)
             if rel_name is not None:
                 cand.first = touches.clean_first(rel_name) if rel_name else ""
@@ -922,6 +975,7 @@ def build(rows: Iterable[dict], touch: int, sender_fallback: str = "",
                 addr=cand.street,
                 city=cand.city,
                 sender=cand.sender,
+                variant=variant,
             )
 
         # The record's own street line is exempt from the zip check: Tulsa
@@ -992,6 +1046,7 @@ def schedule(candidates: list[Candidate]) -> list[tuple[Candidate, str, str]]:
     pool_by_owner: dict[str, list[str]] = {}
     last_used: dict[str, datetime] = {}
     sticky: dict[str, str] = {}  # phone -> number, held for this run
+    spread_load: dict[str, int] = {}  # number -> texts given to it in this run (DP split)
     by_record: dict[str, str] = {}  # record -> number, held for this run
     now = datetime.now(timezone.utc)
     cursor = now
@@ -1025,11 +1080,24 @@ def schedule(candidates: list[Candidate]) -> list[tuple[Candidate, str, str]]:
         # 2026-10-12); a staged-but-never-sent assignment is not.
         existing = store.phone_sent_from(cand.phone)
         rec = cand.record_uuid or ""
-        rec_number = (by_record.get(rec) or store.record_from_number(rec)) if rec else ""
+        # A deep-prospected record starts over (Jeff, 2026-10-26): only a
+        # number that texted one of its NEW phones counts, so it lands on the
+        # day's clean number instead of the old FTM one.
+        if rec and cand.dp_new:
+            rec_number = by_record.get(rec) or store.record_from_number(rec, cand.dp_new)
+        else:
+            rec_number = (by_record.get(rec) or store.record_from_number(rec)) if rec else ""
         if existing in numbers:
             from_number = existing
         elif rec_number in numbers:
             from_number = rec_number
+        elif cand.dp_new and config.DP_SPREAD_NUMBERS:
+            # Jeff, 2026-10-26: DP restarts are split across every healthy,
+            # clean number, least loaded first. The record then stays on
+            # whichever number it got (by_record / record_from_number).
+            from_number = sender_pool.spread_number(numbers, spread_load)
+            if not from_number:
+                continue
         elif config.ONE_NUMBER_PER_DAY:
             # Jeff, 2026-10-06: every new record today starts on the day's
             # cleanest number, so callers can dial from the number they texted.
@@ -1039,6 +1107,7 @@ def schedule(candidates: list[Candidate]) -> list[tuple[Candidate, str, str]]:
         else:
             from_number = min(numbers, key=lambda n: (ready_at(n), last_used.get(n, now)))
         sticky[cand.phone] = from_number
+        spread_load[from_number] = spread_load.get(from_number, 0) + 1
         if rec:
             by_record.setdefault(rec, from_number)
 

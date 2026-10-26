@@ -929,6 +929,36 @@ Pulls real call recordings from the SmrtPhone web session, transcribes them with
 - **Grading:** Claude (in-session or via Workflow fan-out) scores each `worth_grading` transcript against the skill's `references/rubric.md`, writes per-call reports + per-caller scorecards to `output/call_coaching/reports/{pipeline}/`. Voicemails and wrong numbers are never scored.
 - **Rubric sources:** DataSift Call Playbook (Cold Caller / Lead Manager / Closer scripts + trainings), LEAD-M_1.MD, playbook research corpus + elite-call transcripts.
 
+### Tulsa call coaching: `call-coaching/` (built 2026-09, PAUSED)
+
+**This fork's coach is `call-coaching/`, not `src/call_coaching/`** (that is Ty's
+version, described above, and works differently: 60s cutoff, no spend gate).
+Runbook: `call-coaching/README.md`; grader rules: `call-coaching/GRADING.md`;
+Tulsa rubrics: `call-coaching/rubrics/`. Paused 2026-09-28 until a caller is
+hired. OpenRouter key added to `call-coaching/.env` 2026-10-23.
+
+**NOTHING IS TRANSCRIBED UNLESS JEFF NAMES THE CALLS; EVERY TRANSCRIBED CALL IS
+SCORED** (Jeff, 2026-10-26, enforced in code). Transcription is the billed step
+and the only gate he opens:
+- `transcribe.py --commit` REFUSES without `--call-id A,B`; there is no "all
+  calls" option, and an unknown id stops the run before anything is sent.
+  Without `--commit` it only prints the cost estimate.
+- Scoring is free (Claude in-session), so it needs no approval: `grade.py`
+  `queue`/`check` score every call that has a transcript (`is_transcribed()`),
+  however it got there, and reject a report for any call that has none. Grade
+  them right after transcribing without asking again.
+- Voicemails, wrong numbers and dead air are sorted `not_gradeable` and go to
+  the Connection Log, never scored. Jeff: "we'll probably never score a voicemail".
+- Do not run the coach from a branch older than commit 789a158 (e.g.
+  `sms-agent-diego` as of 2026-10-26): its copy has no spend gate.
+- Tests: `py -3 call-coaching/tests/test_say_so.py` (11 checks, stubbed paid
+  step) and `tests/test_grading.py` (14).
+
+Cost (live OpenRouter prices 2026-10-23, Gemini 2.5 Flash): audio $1/M tokens
+(1,920 tokens per minute = $0.00192/min) plus output $2.50/M, about
+$0.0025/min all in. Gemini's default "thinking" adds an unknown amount on top;
+turning it off was discussed, not built.
+
 ## Two-Way SMS Agent (build 1.0.38, 2026-08)
 
 `src/sms_agent/` sends outreach, reads replies in real time, classifies them, writes the result back to DataSift (phone status, opt-outs, lead status), and hands positive responses to a prospector in Slack. Full runbook: `src/sms_agent/README.md`.

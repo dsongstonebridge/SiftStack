@@ -77,7 +77,7 @@ def run(report_text: str) -> list[str]:
         t.write_text(TRANSCRIPT, encoding="utf-8")
         r = Path(d) / "report_CAtest.md"
         r.write_text(report_text, encoding="utf-8")
-        return grade.check_report(r, {"call_id": "CAtest", "pipeline": "cold_call", "transcript_file": str(t)})
+        return grade.check_report(r, {"call_id": "CAtest", "pipeline": "cold_call", "score_approved": True, "transcript_file": str(t)})
 
 
 def main() -> int:
@@ -139,7 +139,7 @@ def main() -> int:
         t.write_text(TRANSCRIPT, encoding="utf-8")
         rp = Path(d) / "r.md"
         rp.write_text(txt, encoding="utf-8")
-        errs = grade.check_report(rp, {"call_id": "CAtest", "pipeline": "closing", "transcript_file": str(t)})
+        errs = grade.check_report(rp, {"call_id": "CAtest", "pipeline": "closing", "score_approved": True, "transcript_file": str(t)})
     check("2.6 N/A caught", any("2.6 is always scored" in e for e in errs))
     check("4.2 cap caught", any("capped at 2" in e for e in errs))
     check("OK flag text required", any("OK disclosure missed" in e for e in errs))
@@ -164,7 +164,7 @@ def main() -> int:
         t.write_text(TRANSCRIPT, encoding="utf-8")
         rp = Path(d) / "r.md"
         rp.write_text(txt, encoding="utf-8")
-        errs = grade.check_report(rp, {"call_id": "CAtest", "pipeline": "lead_management", "transcript_file": str(t)})
+        errs = grade.check_report(rp, {"call_id": "CAtest", "pipeline": "lead_management", "score_approved": True, "transcript_file": str(t)})
     check("LM disallowed N/A caught", any("2.3 cannot be N/A" in e for e in errs))
 
     # 11. tie tiers: within 5 points = tied

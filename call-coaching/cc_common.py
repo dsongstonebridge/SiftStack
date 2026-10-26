@@ -49,6 +49,13 @@ def log(msg: str) -> None:
     print(msg, flush=True)
 
 
+def parse_ids(raw: str | None) -> list[str]:
+    """'A, B,C' -> ['A', 'B', 'C']. Jeff's rule (2026-10-26): nothing is
+    transcribed or scored unless he names the calls, so every paid or scoring
+    step takes an explicit list of call ids and there is no 'all' option."""
+    return [x.strip() for x in (raw or "").split(",") if x.strip()]
+
+
 # ---------------------------------------------------------------- secrets
 
 def _read_env_file(path: Path) -> dict:

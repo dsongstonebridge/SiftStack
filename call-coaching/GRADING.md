@@ -6,6 +6,10 @@ breaks a mechanical rule. The judgment rules below are the grader's to keep.
 
 ## Steps
 
+0. **Only calls Jeff names.** Never grade a call he has not named for scoring,
+   even if it is transcribed. When he names them, run
+   `py -3 call-coaching/grade.py approve <id>,<id>`. Every call starts NOT
+   approved; `queue` skips unapproved calls and `check` rejects their reports.
 1. `py -3 call-coaching/grade.py queue`: lists each call that needs a report,
    with its rubric, its transcript, and the exact path the report must be
    written to. The rubric is picked from what was said on the call, not from

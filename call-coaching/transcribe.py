@@ -15,11 +15,16 @@ Two passes per call, adapted from src/call_coaching/transcribe.py:
 Calls under --min-seconds (default 10) are not sent: they go straight to the
 Connection Log as "too short to be a conversation".
 
+NOTHING IS TRANSCRIBED UNLESS JEFF NAMES THE CALLS (his rule, 2026-10-26).
+--commit refuses to run without --call-id, and there is no "transcribe
+everything" option. Only the ids listed are ever sent; an id that is not in
+calls.json stops the whole run before anything is spent.
+
 USAGE (from SiftStack root):
-  py -3 call-coaching/transcribe.py                 # estimate only, free
-  py -3 call-coaching/transcribe.py --commit        # spend and transcribe
-  py -3 call-coaching/transcribe.py --commit --call-id CA...   # one call
-  py -3 call-coaching/transcribe.py --commit --force            # redo already-transcribed
+  py -3 call-coaching/transcribe.py                                  # estimate only, free
+  py -3 call-coaching/transcribe.py --call-id CA1,CA2                # estimate for named calls, free
+  py -3 call-coaching/transcribe.py --commit --call-id CA1,CA2       # PAID: only these calls
+  py -3 call-coaching/transcribe.py --commit --call-id CA1 --force   # redo one already transcribed
 """
 from __future__ import annotations
 
@@ -30,7 +35,7 @@ import re
 from pathlib import Path
 
 from cc_common import (CALLS_JSON, COST_PER_AUDIO_MIN, COST_PER_TRIAGE, TR_DIR, display_name,
-                       is_excluded, load_json, log, mmss, openrouter, save_json)
+                       is_excluded, load_json, log, mmss, openrouter, parse_ids, save_json)
 
 TRANSCRIBE_PROMPT = """Transcribe this real estate phone call. The company is Tulsa Homebuyers, a local home buyer in Tulsa, Oklahoma.
 Rules:
@@ -116,51 +121,75 @@ def write_transcript(c: dict, text: str, tri: dict) -> Path:
     return md
 
 
+def _send(c: dict) -> tuple[str, dict]:
+    """The PAID part: two OpenRouter calls for one recording."""
+    text = transcribe_audio(Path(c["recording_file"]), display_name(c.get("caller")))
+    tri = triage(text)
+    if tri.get("labels_swapped"):
+        text = swap_labels(text)
+    return text, tri
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Transcribe + sort call recordings (PAID with --commit)")
     ap.add_argument("--commit", action="store_true", help="actually call OpenRouter and spend")
-    ap.add_argument("--call-id")
+    ap.add_argument("--call-id", help="comma-separated call ids Jeff named; REQUIRED with --commit")
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--min-seconds", type=int, default=10)
     args = ap.parse_args()
+    return run(args.commit, parse_ids(args.call_id), args.force, args.min_seconds)
+
+
+def run(commit: bool, ids: list[str], force: bool = False, min_seconds: int = 10,
+        send=None) -> int:
+    """send(call) -> (text, triage) does the paid work; tests pass a stub."""
+    if commit and not ids:
+        log("REFUSED: --commit needs --call-id with the calls Jeff named. "
+            "Nothing is transcribed without his say-so. Nothing was sent.")
+        return 3
 
     calls = load_json(CALLS_JSON, [])
+    if ids:
+        known = {c["call_id"] for c in calls}
+        unknown = [i for i in ids if i not in known]
+        if unknown:
+            log(f"REFUSED: not in calls.json: {', '.join(unknown)}. Nothing was sent.")
+            return 3
+    wanted = set(ids)
     todo, too_short = [], []
     for c in calls:
-        if args.call_id and c["call_id"] != args.call_id:
+        if wanted and c["call_id"] not in wanted:
             continue
         if is_excluded(c.get("caller")) or not c.get("recording_file"):
             continue
-        if c.get("transcript_file") and not args.force:
+        if c.get("transcript_file") and not force:
             continue
-        if (c.get("duration_seconds") or 0) < args.min_seconds:
+        if (c.get("duration_seconds") or 0) < min_seconds:
             too_short.append(c)
         else:
             todo.append(c)
 
     for c in too_short:
         c.update({"pipeline": "not_gradeable", "not_gradeable_reason": "too_short",
-                  "report_type": None, "outcome": f"under {args.min_seconds}s, not transcribed"})
+                  "report_type": None, "outcome": f"under {min_seconds}s, not transcribed"})
     minutes = sum((c.get("duration_seconds") or 0) for c in todo) / 60
     est = minutes * COST_PER_AUDIO_MIN + len(todo) * COST_PER_TRIAGE
     log(f"{len(todo)} call(s) to transcribe, {minutes:.1f} audio minutes. Estimated cost ${est:.3f} "
         f"(~${COST_PER_AUDIO_MIN}/audio min + ~${COST_PER_TRIAGE}/call sort).")
     if too_short:
-        log(f"{len(too_short)} call(s) under {args.min_seconds}s go to the Connection Log without transcription.")
-    if not args.commit:
+        log(f"{len(too_short)} call(s) under {min_seconds}s go to the Connection Log without transcription.")
+    if not commit:
         save_json(CALLS_JSON, calls)
-        log("DRY RUN: nothing sent. Re-run with --commit to transcribe.")
+        log("DRY RUN: nothing sent. Transcribing needs Jeff to name the calls: "
+            "--commit --call-id <id>,<id>.")
         return 0
 
+    send = send or _send
     TR_DIR.mkdir(parents=True, exist_ok=True)
     errors = 0
     for i, c in enumerate(todo, 1):
-        name = display_name(c.get("caller"))
         try:
-            text = transcribe_audio(Path(c["recording_file"]), name)
-            tri = triage(text)
-            if tri.get("labels_swapped"):
-                text = swap_labels(text)
+            text, tri = send(c)
             md = write_transcript(c, text, tri)
             save_json(TR_DIR / f"{c['call_id']}.json", tri)
             c.update({"transcript_file": str(md), "pipeline": tri.get("pipeline"),

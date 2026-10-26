@@ -1,9 +1,12 @@
 # Call Coaching (Tulsa Homebuyers)
 
-> **Status: built, PAUSED 2026-09-28.** Revisit when a caller is hired. Nothing
-> here spends money until `transcribe.py --commit`. To restart: add the
-> OpenRouter key to `.env`, add the new caller to `callers.json`, then run the
-> steps below.
+> **Status: built, PAUSED 2026-09-28.** OpenRouter key added 2026-10-23.
+>
+> **Nothing is transcribed or scored unless Jeff names the calls** (his rule,
+> 2026-10-26, enforced in code). `transcribe.py --commit` refuses to run
+> without `--call-id`, and there is no "all calls" option. Transcribing a call
+> does not approve it for scoring: `grade.py approve <id>` does, and the
+> checker rejects any report for a call that was not approved.
 
 Scores the team's recorded smrtPhone calls against three rubrics and turns them
 into coaching: one report per call, one scorecard per caller, one Excel
@@ -36,8 +39,9 @@ set PYTHONIOENCODING=utf-8
 py -3 call-coaching/pull_calls.py          # free: list calls since 2026-09-28 (--days 7 for a week)
 py -3 call-coaching/download.py            # free: download recordings
 py -3 call-coaching/transcribe.py          # free: prints the cost estimate only
-py -3 call-coaching/transcribe.py --commit # PAID: ~$0.003 per audio minute
-py -3 call-coaching/grade.py queue         # which calls need a report
+py -3 call-coaching/transcribe.py --commit --call-id CA1,CA2   # PAID, only the calls Jeff named
+py -3 call-coaching/grade.py approve CA1,CA2   # only the calls Jeff named for scoring
+py -3 call-coaching/grade.py queue         # which approved calls need a report
     (Claude grades each call in a Claude Code session, following GRADING.md)
 py -3 call-coaching/grade.py check         # rejects any report that breaks the rules
 py -3 call-coaching/export.py              # workbook + per-caller scorecards
@@ -55,6 +59,7 @@ Connection Log.
 | `GRADING.md` | Rules the grader follows: word-for-word quotes, evidence on every criterion, N/A limits, math |
 | `rubric_spec.py` | Criteria, weights and N/A rules the checker enforces. Change it together with a rubric |
 | `tests/test_grading.py` | Offline checks on the checker, math and tie tiers |
+| `tests/test_say_so.py` | Offline checks that nothing is transcribed or scored unless named |
 
 ## Output (gitignored, contains seller info)
 

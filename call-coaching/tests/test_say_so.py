@@ -1,5 +1,5 @@
-"""Offline tests for Jeff's rule (2026-10-26): no call is transcribed unless he
-names it (the billed step), and every transcribed call is scored (free), while
+"""Offline tests for the user's rule (2026-10-26): no call is transcribed unless
+they name it (the billed step), and every transcribed call is scored (free), while
 a call with no transcript never is. No network, no spend: the paid step is a
 stub that records what it was asked to send.
 

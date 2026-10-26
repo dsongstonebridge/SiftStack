@@ -7,7 +7,7 @@ breaks a mechanical rule. The judgment rules below are the grader's to keep.
 ## Steps
 
 0. **Every transcribed call, and only those.** Scoring is free; transcribing is
-   the billed step and runs only on calls Jeff names. So grade every call that
+   the billed step and runs only on calls the user names. So grade every call that
    has a transcript (no need to ask), and never one that does not. `queue`
    lists exactly those; `check` rejects a report for an untranscribed call.
 1. `py -3 call-coaching/grade.py queue`: lists each call that needs a report,
@@ -15,8 +15,12 @@ breaks a mechanical rule. The judgment rules below are the grader's to keep.
    written to. The rubric is picked from what was said on the call, not from
    who dialed.
 2. For each call, read the WHOLE rubric file (`rubrics/cold_call.md`,
-   `lead_management.md` or `closing.md`, including its "Tulsa Homebuyers
-   changes" section) and the WHOLE transcript, then write the report.
+   `lead_management.md`, `combined.md` or `closing.md`, including its "Tulsa
+   Homebuyers changes" section) and the WHOLE transcript, then write the
+   report. A **combined** call also needs `cold_call.md` and
+   `lead_management.md` read in full, because its criteria point to theirs.
+   The transcript header says whether the user set the type ("type set by:
+   the user"); if so, never re-route it, grade it on that rubric.
 3. `py -3 call-coaching/grade.py check`: fix every failure and re-run until
    all pass. Only passing reports reach the workbook and scorecards.
 4. `py -3 call-coaching/export.py`: workbook and per-caller scorecards.
@@ -43,6 +47,8 @@ a different rubric. Do not silently re-route.
     was disconfirmed early (`"non_decision_maker": true`), which also allows
     categories 2, 3 and 4 to be N/A.
   - Closing: only when the situation never arose. **2.6 is never N/A.**
+  - Combined: categories 1 and 2 as for a cold call; **3.1, 3.2 and 3.3 are
+    never N/A**; in categories 4 to 7 only 7.4.
 - **The math must add up.** Category = average of its scored criteria
   (2 decimals). Total = sum of (category / 5 x weight), divided by the sum
   of the weights of the categories that have a score, x 100 (1 decimal).
@@ -98,7 +104,9 @@ End every report with the SCORES JSON block from the rubric, plus these keys:
  "recording_url": "https://rec.smrtphone.io/..."}
 ```
 
-`pipeline` is `cold_call`, `lead_management` or `closing`. Closing also needs
+`pipeline` is `cold_call`, `lead_management`, `combined` or `closing`.
+Combined also needs `parts` (`opening`, `switch`, `lead_management`, each the
+same math as the total over that part's categories). Closing also needs
 `ok_disclosure_missed` (null when no agreement stage was reached) and
 `ok_disclosure_missing`. Lead management may add `"non_decision_maker": true`.
 Short reports add `opener`, `conversion`, `conversion_attempted` per the rubric.

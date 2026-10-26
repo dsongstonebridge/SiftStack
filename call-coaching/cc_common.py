@@ -35,7 +35,7 @@ QUEUE_JSON = OUT / "grading_queue.json"
 BUSINESS_TZ = ZoneInfo("America/Chicago")
 CALLING_START = "2026-09-28"               # consistent calling began; nothing useful before
 
-PIPELINES = ("cold_call", "lead_management", "closing")
+PIPELINES = ("cold_call", "lead_management", "combined", "closing")
 
 # Windows consoles default to cp1252; force utf-8 so names and quotes never crash a run.
 for _s in (sys.stdout, sys.stderr):
@@ -50,8 +50,8 @@ def log(msg: str) -> None:
 
 
 def parse_ids(raw: str | None) -> list[str]:
-    """'A, B,C' -> ['A', 'B', 'C']. Jeff's rule (2026-10-26): nothing is
-    transcribed or scored unless he names the calls, so every paid or scoring
+    """'A, B,C' -> ['A', 'B', 'C']. The user's rule (2026-10-26):
+    nothing is transcribed unless they name the calls, so every paid or scoring
     step takes an explicit list of call ids and there is no 'all' option."""
     return [x.strip() for x in (raw or "").split(",") if x.strip()]
 

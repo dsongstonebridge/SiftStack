@@ -2,18 +2,26 @@
 
 > **Status: built, PAUSED 2026-09-28.** OpenRouter key added 2026-10-23.
 >
-> **Nothing is transcribed or scored unless Jeff names the calls** (his rule,
+> **Nothing is transcribed unless the user names the calls** (rule set
 > 2026-10-26, enforced in code). `transcribe.py --commit` refuses to run
 > without `--call-id`, and there is no "all calls" option. Transcription is
 > the one gate (it is the billed step). Scoring is free, so **every transcribed
 > call is scored**, and a call with no transcript never is.
 
-Scores the team's recorded smrtPhone calls against three rubrics and turns them
+Scores the team's recorded smrtPhone calls against four rubrics and turns them
 into coaching: one report per call, one scorecard per caller, one Excel
 workbook. Built per person, so a new hire is one line in `callers.json`.
 
-The rubric a call gets (cold call, lead management, closing, or not
-gradeable) is decided by **what is said on the call**, not by who made it.
+The rubric a call gets (cold call, lead management, combined, closing, or
+not gradeable) is decided by **what is said on the call**, not by who made it.
+
+**Combined** (added 2026-10-26) is a cold call that rolls straight into lead
+management on the same call, which is how Diego works while he does both jobs.
+It is graded in three parts: the opening on the cold-call criteria, the switch
+on new criteria, and the rest on the lead-management criteria, with a score
+for each part. See `rubrics/combined.md`. The user can set any call's type
+when naming it (`--call-id CA1:combined`), and that always wins over the
+sorting step.
 
 ## Where the calls come from (verified 2026-09-28)
 
@@ -39,7 +47,8 @@ set PYTHONIOENCODING=utf-8
 py -3 call-coaching/pull_calls.py          # free: list calls since 2026-09-28 (--days 7 for a week)
 py -3 call-coaching/download.py            # free: download recordings
 py -3 call-coaching/transcribe.py          # free: prints the cost estimate only
-py -3 call-coaching/transcribe.py --commit --call-id CA1,CA2   # PAID, only the calls Jeff named
+py -3 call-coaching/transcribe.py --commit --call-id CA1,CA2   # PAID, only the calls the user named
+py -3 call-coaching/transcribe.py --commit --call-id CA1:combined   # same, with the type set by the user
 py -3 call-coaching/grade.py queue         # every transcribed call that still needs a report
     (Claude grades each call in a Claude Code session, following GRADING.md)
 py -3 call-coaching/grade.py check         # rejects any report that breaks the rules
@@ -54,6 +63,7 @@ Connection Log.
 | File | What it is |
 |---|---|
 | `rubrics/cold_call.md`, `lead_management.md`, `closing.md` | Tulsa Homebuyers rubrics (each lists its changes at the top) |
+| `rubrics/combined.md` | Cold call rolled into lead management on one call; reuses the two rubrics' criteria by number plus the switch |
 | `rubrics/1-..., 2-..., 3-...` | DataSift originals, unchanged |
 | `GRADING.md` | Rules the grader follows: word-for-word quotes, evidence on every criterion, N/A limits, math |
 | `rubric_spec.py` | Criteria, weights and N/A rules the checker enforces. Change it together with a rubric |

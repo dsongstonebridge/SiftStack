@@ -937,8 +937,8 @@ Runbook: `call-coaching/README.md`; grader rules: `call-coaching/GRADING.md`;
 Tulsa rubrics: `call-coaching/rubrics/`. Paused 2026-09-28 until a caller is
 hired. OpenRouter key added to `call-coaching/.env` 2026-10-23.
 
-**NOTHING IS TRANSCRIBED UNLESS JEFF NAMES THE CALLS; EVERY TRANSCRIBED CALL IS
-SCORED** (Jeff, 2026-10-26, enforced in code). Transcription is the billed step
+**NOTHING IS TRANSCRIBED UNLESS THE USER NAMES THE CALLS; EVERY TRANSCRIBED CALL IS
+SCORED** (Diego, 2026-10-26, enforced in code). Transcription is the billed step
 and the only gate he opens:
 - `transcribe.py --commit` REFUSES without `--call-id A,B`; there is no "all
   calls" option, and an unknown id stops the run before anything is sent.
@@ -948,11 +948,32 @@ and the only gate he opens:
   however it got there, and reject a report for any call that has none. Grade
   them right after transcribing without asking again.
 - Voicemails, wrong numbers and dead air are sorted `not_gradeable` and go to
-  the Connection Log, never scored. Jeff: "we'll probably never score a voicemail".
+  the Connection Log, never scored. Diego: "we'll probably never score a voicemail".
 - Do not run the coach from a branch older than commit 789a158 (e.g.
   `sms-agent-diego` as of 2026-10-26): its copy has no spend gate.
 - Tests: `py -3 call-coaching/tests/test_say_so.py` (11 checks, stubbed paid
-  step) and `tests/test_grading.py` (14).
+  step), `tests/test_combined.py` (24) and `tests/test_grading.py` (14).
+
+**COMBINED CALLS (2026-10-26).** Roles for now: Diego is cold caller AND lead
+manager, Jeff is the closer, no cold caller hired yet. Diego usually rolls a
+cold call straight into lead management while he has the seller (booking a
+callback with himself would be strange). Neither single rubric grades that
+fairly: cold call 5.4 scores 0 for "no booking attempt" and lead management
+1.1 scores 0 for "no prior conversation". So a fourth type, `combined`
+(`rubrics/combined.md`), grades it in three parts: Part A opening on cold-call
+criteria (cold cats 1 and 3, 25%), Part B the switch (new 3.1-3.3: earned it,
+asked permission, set time/agenda/result; never N/A, 10%), Part C on
+lead-management criteria (LM cats 2-5, 65%; tonality judged over the whole
+call). JSON carries `parts` (opening / switch / lead_management, each /100),
+checked by `rubric_spec.compute_parts`. Reused criteria point to the source
+rubrics BY NUMBER and a test fails if their names drift. No short version.
+- **The user's type always wins:** `--call-id CA1:combined` (also `cold`,
+  `lm`, `closing`). Without one, the sorting step decides and suggests the
+  switch line; the transcript header records who set it. Diego chose telling
+  us the type as the safer route, since spotting the exact switch is the
+  hard part for the model.
+- Once a cold caller is hired and the roles split, calls go back to plain
+  cold_call / lead_management with no rubric change needed.
 
 Cost (live OpenRouter prices 2026-10-23, Gemini 2.5 Flash): audio $1/M tokens
 (1,920 tokens per minute = $0.00192/min) plus output $2.50/M, about

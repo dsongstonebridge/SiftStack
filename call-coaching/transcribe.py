@@ -8,26 +8,34 @@ Two passes per call, adapted from src/call_coaching/transcribe.py:
   1. AUDIO -> transcript with AGENT / SELLER labels and bracketed delivery
      notes ([long pause 4s], [rushed], [warm tone]...). The model hears the
      call, so tonality notes are real, not guessed from text.
-  2. TEXT -> sort: cold_call / lead_management / closing / not_gradeable,
-     full vs short report, outcome. Decided by WHAT IS SAID, never by who
-     dialed: Diego makes both cold calls and follow-ups.
+  2. TEXT -> sort: cold_call / lead_management / combined / closing /
+     not_gradeable, full vs short report, outcome, and for a combined call the
+     line where it switches. Decided by WHAT IS SAID, never by who dialed:
+     Diego makes both cold calls and follow-ups, and often rolls a cold call
+     straight into lead management (combined).
 
 Calls under --min-seconds (default 10) are not sent: they go straight to the
 Connection Log as "too short to be a conversation".
 
-NOTHING IS TRANSCRIBED UNLESS JEFF NAMES THE CALLS (his rule, 2026-10-26).
+NOTHING IS TRANSCRIBED UNLESS THE USER NAMES THE CALLS (rule set 2026-10-26).
 --commit refuses to run without --call-id, and there is no "transcribe
 everything" option. Only the ids listed are ever sent; an id that is not in
-calls.json stops the whole run before anything is spent.
+calls.json, or an unknown call type, stops the whole run before anything is
+spent.
 
-Every transcribed call is scored (scoring is free); a call Jeff never named
-is never transcribed, so it is never scored.
+THE USER CAN SET THE CALL TYPE: --call-id CA1:combined,CA2:cold. Their type
+always wins over the sorting step's; the transcript header records both.
+Types: cold (cold_call), lm (lead_management), combined, closing.
+
+Every transcribed call is scored (scoring is free); a call the user never
+named is never transcribed, so it is never scored.
 
 USAGE (from SiftStack root):
-  py -3 call-coaching/transcribe.py                                  # estimate only, free
-  py -3 call-coaching/transcribe.py --call-id CA1,CA2                # estimate for named calls, free
-  py -3 call-coaching/transcribe.py --commit --call-id CA1,CA2       # PAID: only these calls
-  py -3 call-coaching/transcribe.py --commit --call-id CA1 --force   # redo one already transcribed
+  py -3 call-coaching/transcribe.py                                     # estimate only, free
+  py -3 call-coaching/transcribe.py --call-id CA1,CA2                   # estimate for named calls, free
+  py -3 call-coaching/transcribe.py --commit --call-id CA1,CA2          # PAID: only these calls
+  py -3 call-coaching/transcribe.py --commit --call-id CA1:combined     # PAID, type set by the user
+  py -3 call-coaching/transcribe.py --commit --call-id CA1 --force      # redo one already transcribed
 """
 from __future__ import annotations
 
@@ -60,16 +68,18 @@ TRIAGE_PROMPT = """You are sorting a transcribed call from Tulsa Homebuyers (a l
 The same person often makes both cold calls and follow-up calls, so decide ONLY from what is said.
 
 Return STRICT JSON only, no fences, with these keys:
-  pipeline: one of cold_call | lead_management | closing | not_gradeable
-    cold_call = first touch with the owner: the agent is introducing the reason for the call ("calling about the property on...", "any plans for it?"). No sign of an earlier conversation with this seller.
-    lead_management = follow-up or qualification of an existing lead: refers to an earlier conversation, text, or callback, or digs into motivation, timeline, condition, price, roadblocks, and books a next call. No offer number from us.
+  pipeline: one of cold_call | lead_management | combined | closing | not_gradeable
+    cold_call = first touch with the owner: the agent is introducing the reason for the call ("calling about the property on...", "any plans for it?"). No sign of an earlier conversation with this seller. Captures early motivation at most and books a callback or ends.
+    lead_management = follow-up or qualification of an existing lead: refers to an earlier conversation, text, or callback, then digs into motivation, timeline, condition, price, roadblocks, and books a next call. No offer number from us.
+    combined = a FIRST touch (no sign of an earlier conversation) where the agent, on this same call, goes on into full qualification: digs into the pillars (motivation, timeline, condition, price), roadblocks, or a next step toward an offer, instead of only booking a callback. No offer number from us.
     closing = the agent presents or negotiates an offer, discusses our price or terms (cash or creative/seller-finance terms), renegotiates, or walks through or signs a contract.
     not_gradeable = no live two-way conversation with the owner or a decision-maker.
   not_gradeable_reason: null, or one of voicemail | wrong_number | no_answer | dead_air | dropped | non_decision_maker | not_a_seller_call
     (not_a_seller_call = vendor, personal, buyer, or internal call)
   report_type: "full" or "short" or null
-    short = the seller DECLINED ("no", "not interested", "not for sale", opt-out, or hung up) within roughly the first 30 seconds with no real property conversation beyond the decline. Only cold_call and lead_management can be short. Anything with a callback set, a deferral ("call me next week"), or engagement beyond the decline is full. When unsure, full. null when not_gradeable.
+    short = the seller DECLINED ("no", "not interested", "not for sale", opt-out, or hung up) within roughly the first 30 seconds with no real property conversation beyond the decline. Only cold_call and lead_management can be short (a combined or closing call is always full). Anything with a callback set, a deferral ("call me next week"), or engagement beyond the decline is full. When unsure, full. null when not_gradeable.
   outcome: short phrase, e.g. "booked follow-up", "callback", "not now", "no", "opt-out", "offer made", "contract signed", "voicemail"
+  switch_at: for combined only, the first AGENT line (word for word) where the agent moves from the cold-call job into deeper qualification, with its mm:ss if you can tell, e.g. "02:14 Do you have about 10 minutes right now?"; null otherwise
   labels_swapped: true if the AGENT-labeled speaker is actually the owner and SELLER is our agent (decide by content)
   seller_name: string or null
   property_mentioned: street mentioned on the call, or null
@@ -92,12 +102,57 @@ def triage(transcript: str) -> dict:
     m = re.search(r"\{.*\}", raw, re.S)
     if not m:
         return {"pipeline": "not_gradeable", "not_gradeable_reason": "triage_failed", "summary": raw[:200]}
-    out = json.loads(m.group(0))
-    if out.get("pipeline") == "closing" and out.get("report_type") == "short":
-        out["report_type"] = "full"      # the closer rubric has no short report
+    return _normalize(json.loads(m.group(0)))
+
+
+def _normalize(out: dict) -> dict:
+    if out.get("pipeline") in ("closing", "combined") and out.get("report_type") != "full":
+        out["report_type"] = "full"      # these rubrics have no short report
     if out.get("pipeline") == "not_gradeable":
         out["report_type"] = None
+    if out.get("pipeline") != "combined":
+        out["switch_at"] = None
     return out
+
+
+TYPE_ALIASES = {
+    "cold": "cold_call", "cold_call": "cold_call", "coldcall": "cold_call",
+    "lm": "lead_management", "lead": "lead_management", "lead_management": "lead_management",
+    "combined": "combined", "combo": "combined", "both": "combined",
+    "closing": "closing", "close": "closing", "closer": "closing",
+}
+
+
+def parse_specs(specs: list[str]) -> tuple[list[str], dict, list[str]]:
+    """['CA1:combined', 'CA2'] -> (['CA1', 'CA2'], {'CA1': 'combined'}, bad_types)."""
+    ids, types, bad = [], {}, []
+    for s in specs:
+        cid, _, t = s.partition(":")
+        cid, t = cid.strip(), t.strip().lower()
+        ids.append(cid)
+        if t:
+            if t in TYPE_ALIASES:
+                types[cid] = TYPE_ALIASES[t]
+            else:
+                bad.append(s)
+    return ids, types, bad
+
+
+def apply_user_type(tri: dict, user_type: str | None) -> dict:
+    """The user's call type always wins. Keeps what the sorting step said."""
+    tri["ai_pipeline"] = tri.get("pipeline")
+    if not user_type:
+        tri["type_source"] = "detected"
+        return tri
+    tri["type_source"] = "user"
+    if tri.get("pipeline") == "not_gradeable":
+        log(f"  WARNING: set as {user_type} by the user, but the sorting step saw no live "
+            f"conversation ({tri.get('not_gradeable_reason')}). Using the user's type; check the transcript.")
+        tri["not_gradeable_reason"] = None
+    tri["pipeline"] = user_type
+    if tri.get("report_type") is None:
+        tri["report_type"] = "full"
+    return _normalize(tri)
 
 
 def swap_labels(text: str) -> str:
@@ -118,6 +173,10 @@ def write_transcript(c: dict, text: str, tri: dict) -> Path:
         f"- DataSift record: {c.get('record_url')}",
         f"- recording: {c.get('recording_url')}",
         f"- sorted as: {tri.get('pipeline')} / {tri.get('report_type')} / outcome: {tri.get('outcome')}",
+        f"- type set by: " + ("the user" + (f" (sorting step said {tri.get('ai_pipeline')})"
+                                             if tri.get("ai_pipeline") != tri.get("pipeline") else "")
+                              if tri.get("type_source") == "user" else "detected by the sorting step"),
+        *([f"- switch at (suggested): {tri.get('switch_at')}"] if tri.get("pipeline") == "combined" else []),
         f"- labels: {'were swapped by the transcriber and have been corrected' if tri.get('labels_swapped') else 'ok'}",
         "", "## Transcript", "",
     ])
@@ -137,7 +196,8 @@ def _send(c: dict) -> tuple[str, dict]:
 def main() -> int:
     ap = argparse.ArgumentParser(description="Transcribe + sort call recordings (PAID with --commit)")
     ap.add_argument("--commit", action="store_true", help="actually call OpenRouter and spend")
-    ap.add_argument("--call-id", help="comma-separated call ids Jeff named; REQUIRED with --commit")
+    ap.add_argument("--call-id", help="comma-separated call ids the user named, each optionally "
+                    "with :type (cold, lm, combined, closing); REQUIRED with --commit")
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--min-seconds", type=int, default=10)
     args = ap.parse_args()
@@ -146,10 +206,16 @@ def main() -> int:
 
 def run(commit: bool, ids: list[str], force: bool = False, min_seconds: int = 10,
         send=None) -> int:
-    """send(call) -> (text, triage) does the paid work; tests pass a stub."""
+    """ids: call ids, each optionally 'id:type'. send(call) -> (text, triage)
+    does the paid work; tests pass a stub."""
+    ids, types, bad = parse_specs(ids)
+    if bad:
+        log(f"REFUSED: unknown call type in {', '.join(bad)} (use cold, lm, combined or closing). "
+            "Nothing was sent.")
+        return 3
     if commit and not ids:
-        log("REFUSED: --commit needs --call-id with the calls Jeff named. "
-            "Nothing is transcribed without his say-so. Nothing was sent.")
+        log("REFUSED: --commit needs --call-id with the calls the user named. "
+            "Nothing is transcribed without their say-so. Nothing was sent.")
         return 3
 
     calls = load_json(CALLS_JSON, [])
@@ -184,7 +250,7 @@ def run(commit: bool, ids: list[str], force: bool = False, min_seconds: int = 10
         log(f"{len(too_short)} call(s) under {min_seconds}s go to the Connection Log without transcription.")
     if not commit:
         save_json(CALLS_JSON, calls)
-        log("DRY RUN: nothing sent. Transcribing needs Jeff to name the calls: "
+        log("DRY RUN: nothing sent. Transcribing needs the user to name the calls: "
             "--commit --call-id <id>,<id>.")
         return 0
 
@@ -194,10 +260,12 @@ def run(commit: bool, ids: list[str], force: bool = False, min_seconds: int = 10
     for i, c in enumerate(todo, 1):
         try:
             text, tri = send(c)
+            tri = apply_user_type(tri, types.get(c["call_id"]))
             md = write_transcript(c, text, tri)
             save_json(TR_DIR / f"{c['call_id']}.json", tri)
             c.update({"transcribed_at": datetime.now().isoformat(timespec="seconds"),
                       "transcript_file": str(md), "pipeline": tri.get("pipeline"),
+                      "type_source": tri.get("type_source"), "switch_at": tri.get("switch_at"),
                       "report_type": tri.get("report_type"),
                       "not_gradeable_reason": tri.get("not_gradeable_reason"),
                       "outcome": tri.get("outcome"), "summary": tri.get("summary")})

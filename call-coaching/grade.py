@@ -19,9 +19,9 @@ call. This script is the part that keeps that honest:
               disclosure was missed
           A report that passes is marked graded in calls.json.
 
-EVERY TRANSCRIBED CALL IS SCORED, AND ONLY TRANSCRIBED CALLS (Jeff's rule,
+EVERY TRANSCRIBED CALL IS SCORED, AND ONLY TRANSCRIBED CALLS (the user's rule,
 2026-10-26). Scoring is free; transcription is the billed step and the one gate
-he opens (transcribe.py --commit --call-id <ids>). Once money was spent on a
+the user opens (transcribe.py --commit --call-id <ids>). Once money was spent on a
 call it is always scored, however the transcript came to exist. A call with no
 transcript is never scored: `queue` skips it and `check` rejects its report.
 Calls sorted as not gradeable (voicemail, wrong number, no conversation) go to
@@ -43,7 +43,7 @@ from pathlib import Path
 
 from cc_common import (CALLS_JSON, PIPELINES, QUEUE_JSON, REPORT_DIR, RUBRICS as RUBRIC_DIR,
                        display_name, is_excluded, load_json, log, save_json, slug)
-from rubric_spec import RUBRICS, band_for, compute
+from rubric_spec import RUBRICS, band_for, compute, compute_parts
 
 CRIT_ROW = re.compile(r"^\|\s*(\d\.\d)\b(.*)$")
 QUOTE = re.compile(r"[\"“]([^\"“”]{3,}?)[\"”]")
@@ -59,7 +59,7 @@ def report_path(c: dict) -> Path:
 # ---------------------------------------------------------------- queue
 
 NOT_APPROVED = ("not transcribed: only transcribed calls are scored, and a call is "
-                "transcribed only when Jeff names it (transcribe.py --commit --call-id <id>).")
+                "transcribed only when the user names it (transcribe.py --commit --call-id <id>).")
 
 
 def is_transcribed(c: dict) -> bool:
@@ -200,7 +200,7 @@ def check_report(path: Path, call: dict | None) -> list[str]:
     if ctype == "short":
         short = spec["short"]
         if not short:
-            errs.append("the closing rubric has no short report; grade it as a full call")
+            errs.append(f"the {spec['title']} rubric has no short report; grade it as a full call")
         else:
             allowed = set(short["opener"]) | {short["conversion"]}
             extra = set(crit) - allowed
@@ -227,6 +227,7 @@ def check_report(path: Path, call: dict | None) -> list[str]:
         if not spec["na_any"]:
             non_dm = bool(js.get("non_decision_maker"))
             ok = set(spec["na_allowed"])
+            ok |= {k for k in spec["criteria"] if k.split(".")[0] in spec.get("na_any_categories", ())}
             if non_dm:
                 ok |= {k for k in spec["criteria"] if k.split(".")[0] in spec["non_dm_categories"]}
             for k in sorted(nulls - ok):
@@ -244,6 +245,11 @@ def check_report(path: Path, call: dict | None) -> list[str]:
         band = "FAIL" if str(js.get("auto_fail", "PASS")).upper() != "PASS" else (band_for(total) if total is not None else None)
         if js.get("band") != band:
             errs.append(f"band should be {band!r}, JSON has {js.get('band')!r}")
+        for name, want in compute_parts(pipe, crit).items():
+            got = (js.get("parts") or {}).get(name)
+            if (want is None) != (got is None) or (want is not None and abs(want - float(got)) > 0.15):
+                errs.append(f"part '{name}' should be {want} (same math as the total, over its "
+                            f"categories), JSON has {got}")
         if not re.search(r"(?i)N/A criteria and weight redistribution\s*:", body):
             errs.append("missing the line 'N/A criteria and weight redistribution: ...'")
         if pipe == "closing":

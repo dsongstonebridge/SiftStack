@@ -237,12 +237,12 @@ check("living owner: name-only obituaries are left out of the PDF", "Obit Strang
         {"verdict": "LIKELY", "title": "Obit Stranger", "url": "u", "dod": ""}]}, "b", {}, decedent=False))
 
 # ── owner status is research-verified, never SmartSkip (2026-10-27) ──
-# Replay of 1735 E 61st St: a name-only "PROBABLE" obituary plus SmartSkip's
-# deceased flag was called a death, and the Idaho "son" was a stranger.
+# Replay of the 2026-10-27 same-name incident: a name-only "PROBABLE" obituary plus SmartSkip's
+# deceased flag was called a death, and the out-of-state "son" was a stranger.
 _probable = {"candidates": [{"verdict": "PROBABLE (Tulsa, age 71, veteran)"}]}
 _confirmed = {"candidates": [{"verdict": "CONFIRMED (survivors name known family)"}]}
-check("61st St replay: name-only obituary cannot make the owner VERIFIED DEAD",
-      raises(lambda: dps.owner_status_line("dead", "Tulsa obituary, age 71, veteran", "John Webster",
+check("same-name replay: name-only obituary cannot make the owner VERIFIED DEAD",
+      raises(lambda: dps.owner_status_line("dead", "Tulsa obituary, age 70, veteran", "Paul Fenwick",
                                            obits=_probable)))
 check("SmartSkip cited as proof -> refused, either way",
       raises(lambda: dps.owner_status_line("dead", "SmartSkip flags him deceased", "J W",
@@ -261,7 +261,7 @@ check("dead on a filing, no obituary -> VERIFIED DEAD line",
 check("alive with a source -> VERIFIED ALIVE line",
       dps.owner_status_line("alive", "owner answered Diego's call 10/27", "J W")
       .startswith("OWNER STATUS: VERIFIED ALIVE - J W"))
-_unv = dps.owner_status_line("unverified", "", "John Webster", obits=_probable)
+_unv = dps.owner_status_line("unverified", "", "Paul Fenwick", obits=_probable)
 check("unverified -> NOT VERIFIED line that says not to tell anyone the owner died",
       _unv.startswith("OWNER STATUS: NOT VERIFIED") and "Do not tell anyone the owner died" in _unv)
 for flag in ("decedent", "owner_deceased"):

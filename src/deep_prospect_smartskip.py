@@ -273,7 +273,7 @@ def build_board_post(plan: dict, *, today: str | None = None) -> str:
 
 OWNER_STATUSES = ("dead", "alive", "unverified")
 # Sources that can prove a death without an obituary. SmartSkip is never one
-# (v5 gotcha 1; 1735 E 61st St, 2026-10-27).
+# (v5 gotcha 1; same-name incident, 2026-10-27).
 _FILING_PROOF = re.compile(r"probate|PB-\d|court|death certificate|letters|order appointing|"
                            r"filing|petition", re.I)
 
@@ -282,8 +282,9 @@ def owner_status_line(status: str, proof: str, owner: str, *, obits: dict | None
     """The first line of every deep prospecting board post and PDF (Jeff,
     2026-10-27): what OUR research says about whether the owner is alive or
     dead, never SmartSkip's deceased flag. Refuses a claim the evidence does
-    not carry: 1735 E 61st St was called as an heir case on a name-only
-    obituary plus SmartSkip's flag, and the 'son' was a stranger in Idaho."""
+    not carry: on 2026-10-27 a record was called as an heir case on a name-only
+    obituary plus SmartSkip's flag, and the 'son' was a same-name stranger
+    in another state."""
     status = (status or "").strip().lower()
     proof = (proof or "").strip()
     if status not in OWNER_STATUSES:

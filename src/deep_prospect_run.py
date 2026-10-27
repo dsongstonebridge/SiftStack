@@ -1,6 +1,7 @@
 """Deep prospect one DataSift record, start to finish, in three commands.
 
-    1. start   FREE. Reads the record, runs the obituary check, builds the
+    1. start   FREE. Reads the record, runs the obituary check and the owner
+               profile (Assessor, Treasurer, LOCCAT, CRM, web, identity), builds the
                SmartSkip upload and runs SmartSkip's free count. Stops and
                prints what the charge would be.
     2. charge  BILLS SmartSkip (~$0.15 per hit, the saved card). Waits for the
@@ -49,6 +50,7 @@ import config
 import datasift_api as _api
 import deep_prospect_smartskip as dps
 import obituary_check
+import owner_profile
 import skip_trace_agent as sta
 import smartskip_parse
 
@@ -268,6 +270,16 @@ def cmd_start(a) -> int:
     obit_txt = obituary_check.report(obits)
     (run / "obituary_check.txt").write_text(obit_txt, encoding="utf-8")
 
+    # Everything free on the OWNER, not just death searches (Jeff, 2026-10-27).
+    profile = owner_profile.build(person=person, street=a.street, city=row["Property City"] or a.city,
+                                  state=a.state, property_uuid=uuid, owner_uuid=owner_uuid,
+                                  owner_rec=owner, known=known + ([a.spouse] if a.spouse else []))
+    (run / "owner_profile.json").write_text(json.dumps(profile, indent=2, default=str),
+                                            encoding="utf-8")
+    profile_txt = owner_profile.report(profile)
+    (run / "owner_profile.txt").write_text(profile_txt, encoding="utf-8")
+    print("\n" + profile_txt.encode("ascii", "replace").decode("ascii"))
+
     ss = _smartskip()
     entry = ss.submit(ss.Session(), str(inp), {})
     state = {"street": a.street, "city": a.city, "state": a.state, "property_uuid": uuid,
@@ -319,7 +331,19 @@ def cmd_charge(a) -> int:
     for r in rec["relatives"]:
         print(f"  {r['name']:<28} {r['canon_rel']:<10} age {r.get('age') or '?':<4} "
               f"{len(r['phones'])} number(s){'  [flagged deceased]' if r.get('deceased') else ''}")
-    print(f"\nNext: read obituary_check.txt, decide the primary, then\n"
+    known = []
+    oj = run / "obituary_check.json"
+    if oj.exists():
+        known = json.loads(oj.read_text(encoding="utf-8")).get("known") or []
+    flags = owner_profile.identity_after_smartskip(rec, known, home_state=state.get("state") or "OK")
+    block = "\n== Identity check (after SmartSkip)\n" + "\n".join(f"- {f}" for f in flags) + "\n"
+    pt = run / "owner_profile.txt"
+    if pt.exists() and "Identity check (after SmartSkip)" not in pt.read_text(encoding="utf-8"):
+        pt.write_text(pt.read_text(encoding="utf-8").rstrip() + "\n" + block, encoding="utf-8")
+    elif not pt.exists():
+        pt.write_text(block.lstrip(), encoding="utf-8")
+    print(block)
+    print(f"\nNext: read obituary_check.txt and owner_profile.txt, decide the primary, then\n"
           f"python src/deep_prospect_run.py finish --run {run.as_posix()} --primary ... --basis \"...\"")
     return 0
 
@@ -328,7 +352,7 @@ def cmd_charge(a) -> int:
 
 def research_pack(state: dict, plan: dict, obits: dict, basis: str, phone_tags: dict,
                   notes: str = "", decedent: bool = True, owner_dead: bool = False,
-                  status_line: str = "") -> str:
+                  status_line: str = "", profile: str = "") -> str:
     lines = [f"# Deep Prospecting: {state['street']}, {state['city']} {state['state']}", ""]
     if status_line:
         lines += [f"**{status_line}**", ""]
@@ -394,6 +418,10 @@ def research_pack(state: dict, plan: dict, obits: dict, basis: str, phone_tags: 
               "the obituary decides."]
     if notes.strip():
         lines += ["", "## Research notes", "", notes.strip()]
+    if profile.strip():
+        lines += ["", "## Owner profile (county, CRM, web, identity)", ""]
+        for ln in profile.strip().splitlines()[2:]:
+            lines.append(f"### {ln[3:]}" if ln.startswith("== ") else ln)
     return "\n".join(lines)
 
 
@@ -403,7 +431,7 @@ def cmd_finish(a) -> int:
     if not state.get("export"):
         raise SystemExit("no SmartSkip results yet - run charge first")
     # Owner alive/dead comes from OUR research, never SmartSkip's flag, and
-    # tops every post (Jeff, 2026-10-27, after 1735 E 61st St).
+    # tops every post (Jeff, 2026-10-27, after a same-name mix-up).
     obits = json.loads((run / "obituary_check.json").read_text(encoding="utf-8"))
     status = getattr(a, "owner_status", None)
     if not status:
@@ -435,7 +463,9 @@ def cmd_finish(a) -> int:
     notes = Path(notes_file).read_text(encoding="utf-8") if notes_file else ""
     md = research_pack(state, plan, obits, a.basis, tags, notes, decedent=a.decedent,
                        owner_dead=bool(getattr(a, "owner_deceased", False)),
-                       status_line=status_line)
+                       status_line=status_line,
+                       profile=(run / "owner_profile.txt").read_text(encoding="utf-8")
+                       if (run / "owner_profile.txt").exists() else "")
     md_path = run / f"Deep_Prospecting_{slug(state['street'])}.md"
     md_path.write_text(md, encoding="utf-8")
     from deep_prospect_pdf import generate_pdf

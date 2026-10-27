@@ -19,6 +19,7 @@
     python src/deep_prospect_run.py charge --run output/deep_prospect/123-main-st
     python src/deep_prospect_run.py finish --run output/deep_prospect/123-main-st \
         --primary "Susan Smith" --relationship "Susan Smith=Daughter" \
+        --owner-status dead --status-proof "obituary (Ninde) names Susan as daughter" \
         --basis "Mary died 2026-08-02 (Legacy, Ninde Funeral Home); widowed; Susan is PR" --commit
 
 Rules (Jeff, 2026-10-16): SmartSkip only on records he names for deep
@@ -326,9 +327,12 @@ def cmd_charge(a) -> int:
 # ── 3. finish (DRY RUN until --commit) ────────────────────────────────
 
 def research_pack(state: dict, plan: dict, obits: dict, basis: str, phone_tags: dict,
-                  notes: str = "", decedent: bool = True, owner_dead: bool = False) -> str:
-    lines = [f"# Deep Prospecting: {state['street']}, {state['city']} {state['state']}",
-             "", f"Prepared {date.today().isoformat()}. Searched: **{state['searched']}** "
+                  notes: str = "", decedent: bool = True, owner_dead: bool = False,
+                  status_line: str = "") -> str:
+    lines = [f"# Deep Prospecting: {state['street']}, {state['city']} {state['state']}", ""]
+    if status_line:
+        lines += [f"**{status_line}**", ""]
+    lines += [f"Prepared {date.today().isoformat()}. Searched: **{state['searched']}** "
              f"(at the {state['searched_at']} address).", "",
              "## Who to call first", "", basis or "(no basis given)", ""]
     on_list = plan.get("phone_list_numbers")
@@ -398,6 +402,18 @@ def cmd_finish(a) -> int:
     state = _load(run)
     if not state.get("export"):
         raise SystemExit("no SmartSkip results yet - run charge first")
+    # Owner alive/dead comes from OUR research, never SmartSkip's flag, and
+    # tops every post (Jeff, 2026-10-27, after 1735 E 61st St).
+    obits = json.loads((run / "obituary_check.json").read_text(encoding="utf-8"))
+    status = getattr(a, "owner_status", None)
+    if not status:
+        raise SystemExit("--owner-status is required: dead, alive or unverified")
+    if (a.decedent or getattr(a, "owner_deceased", False)) and status != "dead":
+        raise SystemExit("--decedent / --owner-deceased need --owner-status dead, verified by an "
+                         "obituary confirmed against known family or a filing. Otherwise the owner "
+                         "is unverified and nobody is an heir yet.")
+    status_line = dps.owner_status_line(status, getattr(a, "status_proof", ""),
+                                        state["searched"], obits=obits)
     rec = dps.pick_record(smartskip_parse.parse(str(run / state["export"])), None)
     # The SmartSkip row carries the property address we sent; the DataSift
     # record is resolved from the run's own address so the two cannot drift.
@@ -408,18 +424,18 @@ def cmd_finish(a) -> int:
                           score_drop=getattr(a, "no_score", None),
                           owner_deceased=True if getattr(a, "owner_deceased", False) else None)
     dry = not a.commit
-    res = dps.write_record(rec, plan, dry_run=dry, repost=a.repost)
+    res = dps.write_record(rec, plan, dry_run=dry, repost=a.repost, status_line=status_line)
 
     tags: dict[str, list[str]] = {}
     if not dry:
         owner = _api.get_owner(state["owner_uuid"]) or {}
         tags = {sta.norm_phone(p.get("number")): sorted(p.get("tags") or [])
                 for p in owner.get("phones") or []}
-    obits = json.loads((run / "obituary_check.json").read_text(encoding="utf-8"))
     notes_file = getattr(a, "notes", None)
     notes = Path(notes_file).read_text(encoding="utf-8") if notes_file else ""
     md = research_pack(state, plan, obits, a.basis, tags, notes, decedent=a.decedent,
-                       owner_dead=bool(getattr(a, "owner_deceased", False)))
+                       owner_dead=bool(getattr(a, "owner_deceased", False)),
+                       status_line=status_line)
     md_path = run / f"Deep_Prospecting_{slug(state['street'])}.md"
     md_path.write_text(md, encoding="utf-8")
     from deep_prospect_pdf import generate_pdf
@@ -441,12 +457,12 @@ def cmd_finish(a) -> int:
                 raise SystemExit(f"PDF upload did not land: Documents tab holds {names}")
         # PROPERTY board, where the team works; never the owner's (Jeff, 2026-10-21/23).
         _api.post_property_message_board(state["property_uuid"],
-            f"{PDF_MARKER} ({date.today().isoformat()})\n"
+            f"{status_line}\n{PDF_MARKER} ({date.today().isoformat()})\n"
             f"Full research (obituary, family, who to call) is in this record's Documents tab: "
             f"{os.path.basename(pdf)}")
     finally:
         _api.set_dry_run(False)
-    state.update(finished=not dry, primary=a.primary, basis=a.basis)
+    state.update(finished=not dry, primary=a.primary, basis=a.basis, owner_status=status_line)
     _save(run, state)
     print(("DRY RUN - nothing written, nothing billed. " if dry else "") + json.dumps(res))
     print(f"PDF: {pdf}" + ("" if dry else f" (uploaded: {doc.get('filename') or doc})"))
@@ -477,6 +493,12 @@ def main(argv=None) -> int:
     f.add_argument("--primary", action="append", required=True)
     f.add_argument("--relationship", action="append")
     f.add_argument("--basis", default="", help="why these are the primary people")
+    f.add_argument("--owner-status", required=True, choices=dps.OWNER_STATUSES,
+                   help="what OUR research verifies about the owner, printed at the top of every "
+                        "post and the PDF. dead needs an obituary confirmed against known family or "
+                        "a filing; SmartSkip's deceased flag never counts (2026-10-27)")
+    f.add_argument("--status-proof", default="",
+                   help="the source that verifies it (required for dead/alive)")
     f.add_argument("--decedent", action="store_true",
                    help="the obituary or probate filing CONFIRMS the searched person died: "
                         "label them Decedent, not Owner (always true on a probate search)")

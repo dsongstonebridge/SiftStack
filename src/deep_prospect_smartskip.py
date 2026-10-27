@@ -271,12 +271,50 @@ def build_board_post(plan: dict, *, today: str | None = None) -> str:
     return "\n".join(lines)
 
 
+OWNER_STATUSES = ("dead", "alive", "unverified")
+# Sources that can prove a death without an obituary. SmartSkip is never one
+# (v5 gotcha 1; 1735 E 61st St, 2026-10-27).
+_FILING_PROOF = re.compile(r"probate|PB-\d|court|death certificate|letters|order appointing|"
+                           r"filing|petition", re.I)
+
+
+def owner_status_line(status: str, proof: str, owner: str, *, obits: dict | None = None) -> str:
+    """The first line of every deep prospecting board post and PDF (Jeff,
+    2026-10-27): what OUR research says about whether the owner is alive or
+    dead, never SmartSkip's deceased flag. Refuses a claim the evidence does
+    not carry: 1735 E 61st St was called as an heir case on a name-only
+    obituary plus SmartSkip's flag, and the 'son' was a stranger in Idaho."""
+    status = (status or "").strip().lower()
+    proof = (proof or "").strip()
+    if status not in OWNER_STATUSES:
+        raise SystemExit(f"--owner-status must be one of {', '.join(OWNER_STATUSES)}")
+    if "smartskip" in proof.lower():
+        raise SystemExit("--status-proof cites SmartSkip. SmartSkip's deceased flag is not proof "
+                         "either way; cite the obituary, the filing, or a conversation.")
+    confirmed = [c for c in (obits or {}).get("candidates", [])
+                 if str(c.get("verdict", "")).startswith("CONFIRMED")]
+    if status in ("dead", "alive") and not proof:
+        raise SystemExit(f"--owner-status {status} needs --status-proof (the source that verifies it)")
+    if status == "dead" and not confirmed and not _FILING_PROOF.search(proof):
+        raise SystemExit("--owner-status dead needs an obituary CONFIRMED against known family "
+                         "(obituary_check.json) or a filing/court/death-certificate source in "
+                         "--status-proof. A name match is not enough: use --owner-status unverified.")
+    if status == "alive" and confirmed:
+        raise SystemExit("--owner-status alive contradicts a CONFIRMED obituary in obituary_check.json")
+    if status == "dead":
+        return f"OWNER STATUS: VERIFIED DEAD - {owner}. Proof: {proof}"
+    if status == "alive":
+        return f"OWNER STATUS: VERIFIED ALIVE - {owner}. Proof: {proof}"
+    return (f"OWNER STATUS: NOT VERIFIED - our research has not confirmed whether {owner} is alive "
+            "or dead. Do not tell anyone the owner died." + (f" Notes: {proof}" if proof else ""))
+
+
 def _fmt(num: str) -> str:
     return f"{num[:3]}-{num[3:6]}-{num[6:]}" if len(num) == 10 and num.isdigit() else num
 
 
 def build_family_post(plan: dict, *, today: str | None = None,
-                      tiers: dict[str, str] | None = None) -> str:
+                      tiers: dict[str, str] | None = None, status_line: str = "") -> str:
     """Who is who, for a caller looking at a list of scored numbers: a dial
     sheet on its own (Jeff, 2026-10-20), each number with its dial tier, or
     "board only" for a number kept off the phone list and never scored
@@ -293,7 +331,8 @@ def build_family_post(plan: dict, *, today: str | None = None,
             return BOARD_ONLY
         return tiers.get(num) or "not scored yet"
 
-    lines = [f"{FAMILY_MARKER_V2} ({today})",
+    lines = ([status_line] if status_line else []) + [
+             f"{FAMILY_MARKER_V2} ({today})",
              f"Traced: {plan['subject']}. Call first: "
              + ", ".join(p["name"] for p in plan["primary"]) + ".",
              "Name | relationship | number | dial tier. Numbers marked '" + BOARD_ONLY
@@ -465,7 +504,8 @@ def _write_phones(property_uuid: str, owner_uuid: str, rec: dict, people: list[d
     return out
 
 
-def write_record(rec: dict, plan: dict, *, dry_run: bool = True, repost: bool = False) -> dict:
+def write_record(rec: dict, plan: dict, *, dry_run: bool = True, repost: bool = False,
+                 status_line: str = "") -> dict:
     """`write`: every number to the phone list, scored; who-is-who on the board."""
     _api.set_dry_run(dry_run)
     try:
@@ -492,7 +532,8 @@ def write_record(rec: dict, plan: dict, *, dry_run: bool = True, repost: bool = 
                            "pass --repost to post anyway", existing.get("created"))
             res["posted"] = False
         else:
-            _api.post_property_message_board(uuid, build_family_post(plan, tiers=res.get("tiers")))
+            _api.post_property_message_board(uuid, build_family_post(
+                plan, tiers=res.get("tiers"), status_line=status_line))
             res["posted"] = True
         res.update(property_uuid=uuid)
         return res
@@ -575,6 +616,9 @@ def main(argv: list[str] | None = None) -> int:
     w.add_argument("--relationship", action="append", help="NAME=Relationship correction")
     w.add_argument("--decedent", action="store_true",
                    help="research CONFIRMS the traced subject died: label them Decedent, not Owner")
+    w.add_argument("--owner-status", required=True, choices=OWNER_STATUSES,
+                   help="what OUR research verifies about the owner (never SmartSkip's flag)")
+    w.add_argument("--status-proof", default="", help="the source that verifies it")
     w.add_argument("--repost", action="store_true")
     w.add_argument("--commit", action="store_true", help="actually write and bill Trestle")
     p = sub.add_parser("promote", help="old-rule records only: board relatives -> phone list")
@@ -589,13 +633,16 @@ def main(argv: list[str] | None = None) -> int:
 
     if a.cmd == "write":
         rec = pick_record(smartskip_parse.parse(a.export), a.input_name)
+        if a.decedent and a.owner_status != "dead":
+            raise SystemExit("--decedent needs --owner-status dead (research-verified)")
         plan = build_plan(rec, a.primary, _overrides(a.relationship), subject_deceased=a.decedent)
+        line = owner_status_line(a.owner_status, a.status_proof, plan["subject"])
         n = (sum(len(p["phones"]) for p in plan["primary"])
              + sum(len(b["phone_list"]) for b in plan["board"]))
         print(f"PHONE LIST: {n} numbers, all Trestle scored (about ${n * 0.015:.2f}). Call first:",
               "; ".join(f"{p['name']} ({len(p['phones'])})" for p in plan["primary"]))
-        print("-" * 60 + "\n" + build_family_post(plan) + "\n" + "-" * 60)
-        res = write_record(rec, plan, dry_run=dry, repost=a.repost)
+        print("-" * 60 + "\n" + build_family_post(plan, status_line=line) + "\n" + "-" * 60)
+        res = write_record(rec, plan, dry_run=dry, repost=a.repost, status_line=line)
     else:
         only = {s.strip() for s in a.only.split(",")} if a.only else None
         res = promote_record(a.street, a.city, a.state, only=only, dry_run=dry)

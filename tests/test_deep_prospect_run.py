@@ -152,7 +152,8 @@ def finish(commit, repost=False):
     return run.cmd_finish(argparse.Namespace(
         run=str(tmp), primary=["Susan Smith"], relationship=["Susan Smith=Daughter"],
         basis="Robert died Aug 2 2026 (obituary); widowed; Susan is the daughter and PR",
-        decedent=True, repost=repost, commit=commit))
+        decedent=True, repost=repost, commit=commit, owner_status="dead",
+        status_proof="probate PB-2026-0001 names Susan Smith as PR"))
 
 
 finish(commit=False)
@@ -169,13 +170,18 @@ check("commit: her number tagged Daughter",
       "Daughter" in next(p for p in fake.phones if p["number"] == "9185550201")["tags"])
 check("commit: PDF uploaded to Documents", len(fake.uploads) == 1)
 check("commit: board has the family post and the PDF line",
-      any(m.startswith(dps.FAMILY_MARKER_V2) for m in fake.board)
-      and any(m.startswith(run.PDF_MARKER) for m in fake.board))
+      any(dps.FAMILY_MARKER_V2 in m for m in fake.board)
+      and any(run.PDF_MARKER in m for m in fake.board))
+check("commit: BOTH board posts open with the verified owner status (2026-10-27)",
+      len(fake.board) == 2 and all(m.startswith("OWNER STATUS: VERIFIED DEAD - Robert Smith")
+                                   for m in fake.board))
 check("commit: confirmed death labels the subject Decedent, not Owner",
       any("Decedent (traced subject)" in m for m in fake.board)
       and not any("Owner (traced subject)" in m for m in fake.board))
 md = next(p for p in tmp.iterdir() if p.suffix == ".md").read_text(encoding="utf-8")
 check("research pack names the basis and the obituary", "Susan is the daughter" in md and "example.test/obit" in md)
+check("research pack: owner status sits right under the title",
+      md.split("\n")[2].startswith("**OWNER STATUS: VERIFIED DEAD"))
 check("research pack lists the deceased owner as a board relative", "Robert Smith" in md and "Mark Smith" in md)
 
 n_board, n_up = len(fake.board), len(fake.uploads)
@@ -229,6 +235,46 @@ check("owner deceased, traced person living: PDF says so, not 'treated as LIVING
 check("living owner: name-only obituaries are left out of the PDF", "Obit Stranger" not in run.research_pack(
     _ST, {"primary": [], "board": []}, {"summary": "", "candidates": [
         {"verdict": "LIKELY", "title": "Obit Stranger", "url": "u", "dod": ""}]}, "b", {}, decedent=False))
+
+# ── owner status is research-verified, never SmartSkip (2026-10-27) ──
+# Replay of 1735 E 61st St: a name-only "PROBABLE" obituary plus SmartSkip's
+# deceased flag was called a death, and the Idaho "son" was a stranger.
+_probable = {"candidates": [{"verdict": "PROBABLE (Tulsa, age 71, veteran)"}]}
+_confirmed = {"candidates": [{"verdict": "CONFIRMED (survivors name known family)"}]}
+check("61st St replay: name-only obituary cannot make the owner VERIFIED DEAD",
+      raises(lambda: dps.owner_status_line("dead", "Tulsa obituary, age 71, veteran", "John Webster",
+                                           obits=_probable)))
+check("SmartSkip cited as proof -> refused, either way",
+      raises(lambda: dps.owner_status_line("dead", "SmartSkip flags him deceased", "J W",
+                                           obits=_confirmed))
+      and raises(lambda: dps.owner_status_line("alive", "smartskip says alive", "J W")))
+check("dead or alive without a source -> refused",
+      raises(lambda: dps.owner_status_line("dead", "", "J W", obits=_confirmed))
+      and raises(lambda: dps.owner_status_line("alive", "", "J W")))
+check("alive against a CONFIRMED obituary -> refused",
+      raises(lambda: dps.owner_status_line("alive", "spoke with him", "J W", obits=_confirmed)))
+check("dead on a CONFIRMED obituary -> VERIFIED DEAD line",
+      dps.owner_status_line("dead", "Legacy obituary names his daughter", "J W", obits=_confirmed)
+      .startswith("OWNER STATUS: VERIFIED DEAD - J W. Proof: Legacy"))
+check("dead on a filing, no obituary -> VERIFIED DEAD line",
+      "VERIFIED DEAD" in dps.owner_status_line("dead", "probate PB-2026-0760", "J W", obits=_probable))
+check("alive with a source -> VERIFIED ALIVE line",
+      dps.owner_status_line("alive", "owner answered Diego's call 10/27", "J W")
+      .startswith("OWNER STATUS: VERIFIED ALIVE - J W"))
+_unv = dps.owner_status_line("unverified", "", "John Webster", obits=_probable)
+check("unverified -> NOT VERIFIED line that says not to tell anyone the owner died",
+      _unv.startswith("OWNER STATUS: NOT VERIFIED") and "Do not tell anyone the owner died" in _unv)
+for flag in ("decedent", "owner_deceased"):
+    kw = dict(run=str(tmp), primary=["Susan Smith"], relationship=None, basis="b", repost=False,
+              commit=False, owner_status="unverified", status_proof="", decedent=False,
+              owner_deceased=False)
+    kw[flag] = True
+    check(f"--{flag.replace('_', '-')} with an unverified owner -> refused",
+          raises(lambda: run.cmd_finish(argparse.Namespace(**kw))))
+check("finish without --owner-status -> refused",
+      raises(lambda: run.cmd_finish(argparse.Namespace(
+          run=str(tmp), primary=["Susan Smith"], relationship=None, basis="b", decedent=False,
+          repost=False, commit=False))))
 
 print(f"\n{failures} failure(s)")
 sys.exit(1 if failures else 0)

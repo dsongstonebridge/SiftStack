@@ -84,9 +84,117 @@ def _read_export(path: Path) -> list[dict]:
                 "first": (row.get("First Name") or "").strip(),
                 "last": (row.get("Last Name") or "").strip(),
                 "relationship": (row.get("Relationship") or row.get("Possible Type") or "").strip(),
+                "dead": (row.get("Deceased") or "").strip().lower() == "true",
                 "phones": phones,
             })
     return people
+
+
+def _dead_from_basis(basis: str) -> set:
+    """{(first, last)} named as having died in the run's research basis.
+
+    Needs first AND last in the phrase, so "Lenord Sr. very likely died" does
+    not mark his living namesake son (the export's Subject) dead.
+    """
+    out = set()
+    for m in re.finditer(r"([A-Z][A-Za-z.' ]{2,60}?)\s+(?:died|passed away|is deceased)", basis):
+        words = [_norm_name(w) for w in m.group(1).split() if _norm_name(w)]
+        if len(words) >= 2:
+            out.add((words[0], words[-1]))
+    return out
+
+
+# Obituary-check verdicts that say nothing ties an obituary to the owner.
+# Anything else (POSSIBLE, PROBABLE, LIKELY, CONFIRMED, unreadable, missing)
+# means we are not confident the owner is alive.
+OWNER_ALIVE_VERDICTS = ("NO OBITUARY FOUND", "DIFFERENT PERSON", "UNRELATED", "OWNER IS A SURVIVOR")
+
+
+def _owner_maybe_dead(folder: Path) -> bool:
+    path = folder / "obituary_check.json"
+    try:
+        summary = str(json.loads(path.read_text(encoding="utf-8")).get("summary") or "")
+    except (OSError, ValueError):
+        return True
+    return not summary.upper().startswith(OWNER_ALIVE_VERDICTS)
+
+
+def _is_subject(person: dict) -> bool:
+    return (person.get("relationship") or "").strip().lower() == "subject"
+
+
+def is_dead(run: Optional[dict], person: Optional[dict]) -> bool:
+    if not person:
+        return False
+    if person.get("dead"):
+        return True
+    if (run or {}).get("owner_dead") and _is_subject(person):
+        return True
+    key = (_norm_name(person.get("first")), _norm_name(person.get("last")))
+    return key in ((run or {}).get("dead") or set())
+
+
+def heir_namesake_ok(run: Optional[dict], phone: str) -> bool:
+    """May this number's living heir be greeted by a first name a dead person
+    on the record also had? (Jeff 2026-10-28: never a dead person's name unless
+    it is also the heir's name.)
+
+    Only when the number belongs to a living non-subject relative, no dead
+    person is listed on the same number (it could be the decedent's old
+    phone), and every dead person with that first name is the subject the deep
+    prospect was about. A dead uncle or a death we cannot place keeps no name.
+
+    The heir's LAST name must differ from every dead namesake's. SmartSkip
+    often lists the decedent a second time as a "Relative" under her own full
+    name (2719 S 80th E Ave: Carolyn Gray, dead owner, also a Carolyn Gray
+    relative row), and a same-full-name son cannot be told apart from that.
+    """
+    person = person_for(run or {}, phone)
+    if not person or _is_subject(person) or is_dead(run, person):
+        return False
+    first = _norm_name(person.get("first"))
+    last = _norm_name(person.get("last"))
+    if not first or not last:
+        return False
+    people = (run or {}).get("people") or []
+    dead_keys = {(_norm_name(p.get("first")), _norm_name(p.get("last")))
+                 for p in people if is_dead(run, p)} | set((run or {}).get("dead") or set())
+    if any(f == first and (l == last or not l) for f, l in dead_keys):
+        return False
+    n = store.clean_phone(phone)
+    if any(n in p["phones"] and is_dead(run, p) for p in people):
+        return False
+    key = lambda p: (_norm_name(p.get("first")), _norm_name(p.get("last")))  # noqa: E731
+    subjects = {key(p) for p in people if _is_subject(p)}
+    dead_same = [p for p in people if is_dead(run, p) and _norm_name(p.get("first")) == first]
+    basis_same = {k for k in ((run or {}).get("dead") or set()) if k[0] == first}
+    if not dead_same and not basis_same:
+        return False
+    # The death must be CONFIRMED (SmartSkip flag or "<name> died" in the
+    # research), not merely an obituary check that could not clear the owner:
+    # 200 Oak Ridge Dr's owner Kimberly Welch is "believed living", and its
+    # Kimberly Wilson relative may be her under her maiden name.
+    if any(not (p.get("dead") or key(p) in ((run or {}).get("dead") or set())) for p in dead_same):
+        return False
+    # The heir's surname inside the decedent's own full name ("Bonnie Marie
+    # Pingrey Baker died") means a maiden name: likely the decedent herself.
+    for m in re.finditer(r"([A-Z][A-Za-z.' ]{2,60}?)\s+(?:died|passed away|is deceased)",
+                         str((run or {}).get("basis") or "")):
+        words = {_norm_name(w) for w in m.group(1).split()}
+        if first in words and last in words:
+            return False
+    # A dead "Relative" row under the subject's own full name is the subject.
+    return (all(_is_subject(p) or key(p) in subjects for p in dead_same)
+            and all(k in subjects for k in basis_same))
+
+
+def dead_first_names(run: Optional[dict]) -> set:
+    """Lower-case first names of everyone on this run known to be dead."""
+    names = {f for f, _ in ((run or {}).get("dead") or set())}
+    for p in (run or {}).get("people") or []:
+        if is_dead(run, p):
+            names.add(_norm_name(p.get("first")))
+    return names - {""}
 
 
 def _load_runs(root: Path) -> dict:
@@ -107,7 +215,19 @@ def _load_runs(root: Path) -> dict:
         except (OSError, csv.Error) as exc:
             log.warning("unreadable SmartSkip export %s: %s", export, exc)
             continue
-        run = runs.setdefault(uuid, {"started": "", "people": [], "folders": []})
+        run = runs.setdefault(uuid, {"started": "", "people": [], "folders": [], "dead": set(),
+                                     "owner_dead": False})
+        # Who died, per the deep prospect's own research: "<First ... Last> died".
+        # Jeff, 2026-10-26: never greet a dead person by name.
+        run["dead"] |= _dead_from_basis(str(state.get("basis") or ""))
+        run["basis"] = " ".join(x for x in (run.get("basis", ""), str(state.get("basis") or "")) if x)
+        # The obituary check outranks the research summary (Jeff 2026-10-26,
+        # 2719 S 80th E Ave: summary said "believed LIVING", obituary check
+        # said "LIKELY THE OWNER'S OBITUARY", and the owner had died). Any
+        # verdict short of "nothing found for the owner" means the owner may
+        # be dead, so the owner's name never goes in a text.
+        if _owner_maybe_dead(state_path.parent):
+            run["owner_dead"] = True
         started = str(state.get("started") or "")
         # Two runs on one property: the EARLIEST start decides what counts as
         # "called before the deep prospect", which is the stricter reading.
@@ -130,11 +250,16 @@ def run_for(record_uuid: str) -> Optional[dict]:
 
 
 def person_for(run: dict, phone: str) -> Optional[dict]:
+    """Who this number belongs to. A number SmartSkip lists under several
+    people (the decedent AND a daughter, 4527 W Madison Pl) goes to a LIVING
+    person; the first row is often the dead subject. Only when every holder is
+    dead is a dead person returned, and addressee() then sends it with no name."""
     n = store.clean_phone(phone)
-    for p in run.get("people") or []:
-        if n in p["phones"]:
+    holders = [p for p in run.get("people") or [] if n in p["phones"]]
+    for p in holders:
+        if not is_dead(run, p):
             return p
-    return None
+    return holders[0] if holders else None
 
 
 def _called_before(events: list, phone: str, started: str) -> str:
@@ -195,6 +320,9 @@ def classify(rec: dict, run: Optional[dict], texted: dict,
             out[n] = "was already on the record before SmartSkip (" + ", ".join(sorted(tags & OLD_SOURCE_TAGS)) + ")"
         elif person_for(run, n) is None:
             out[n] = "not in this record's SmartSkip results"
+        # A dead or possibly dead owner's own number is still texted when it
+        # passes the normal rules (Jeff 2026-10-27: a death only ever takes the
+        # NAME out of the text, never the text itself; addressee() handles that).
         elif n in texted and (not started or str(texted[n])[:10] < started):
             out[n] = f"texted {str(texted[n])[:10]}, before the deep prospect"
         elif events is None:
@@ -211,10 +339,17 @@ def new_numbers(verdicts: dict) -> frozenset:
     return frozenset(n for n, why in verdicts.items() if not why)
 
 
-def _is_owner(person: dict, rec: dict) -> bool:
-    """Is this SmartSkip person an owner of record (primary or secondary)?"""
+def _is_owner(person: dict, rec: dict, run: Optional[dict] = None) -> bool:
+    """Is this SmartSkip person an owner of record (primary or secondary)?
+
+    A relative who shares a DEAD owner's name (John Webster's son John
+    Webster, 1735 E 61st St) is a namesake, not the owner."""
     first, last = _norm_name(person.get("first")), _norm_name(person.get("last"))
     if not first or not last:
+        return False
+    if (person.get("relationship") or "").lower() != "subject" and any(
+            is_dead(run, p) and _norm_name(p.get("first")) == first and _norm_name(p.get("last")) == last
+            for p in (run or {}).get("people") or []):
         return False
     owners = []
     owner = rec.get("owner") if isinstance(rec.get("owner"), dict) else {}
@@ -238,5 +373,20 @@ def addressee(rec: dict, run: Optional[dict], phone: str) -> tuple[str, str]:
     person = person_for(run or {}, phone)
     if not person:
         return "", "heir"
-    variant = "owner" if _is_owner(person, rec) else "heir"
-    return person.get("first") or "", variant
+    if is_dead(run, person):
+        # Known dead: whoever answers now is family, so the heir copy, no name.
+        # Only POSSIBLY dead (an obituary check short of a clear answer): they
+        # may well be the one who answers, so the owner copy, still no name.
+        possibly = (run or {}).get("owner_dead") and _is_subject(person) and not (
+            person.get("dead") or (_norm_name(person.get("first")), _norm_name(person.get("last")))
+            in ((run or {}).get("dead") or set()))
+        return "", "owner" if possibly and _is_owner(person, rec, run) else "heir"
+    variant = "owner" if _is_owner(person, rec, run) else "heir"
+    first = person.get("first") or ""
+    # Jeff, 2026-10-26: never put a dead person's name in a text. A living
+    # relative who shares a decedent's first name gets no name either, unless
+    # heir_namesake_ok() places that death on the subject and not on this
+    # number (Jeff 2026-10-28: fine when it is also the heir's name).
+    if _norm_name(first) in dead_first_names(run) and not heir_namesake_ok(run, phone):
+        first = ""
+    return first, variant

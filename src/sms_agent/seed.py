@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Optional
 
-from . import config, crm, dp_numbers, respond, sender_pool, store
+from . import config, crm, death_check, dp_numbers, respond, sender_pool, store
 from .knowledge import touches
 
 log = logging.getLogger(__name__)
@@ -364,6 +364,35 @@ def _name_from_notes(texts: list, words: tuple, avoid: str) -> str:
                 if name not in _NAME_STOP and name.lower() != (avoid or "").lower():
                     return name
     return ""
+
+
+# Not "probate": there the CRM owner is the living PR, not the decedent.
+DECEASED_TAGS = {"deceased", "owner deceased", "obituary"}
+
+
+def dead_name(rec: dict, first: str, run: Optional[dict] = None) -> bool:
+    """Would greeting `first` risk naming a dead person on this record?
+
+    True when the first name belongs to anyone a deep prospect found dead, or
+    when the record is tagged deceased/obituary and the name is the
+    primary owner's (the owner of record on such a record is the decedent).
+    """
+    f = re.sub(r"[^a-z]", "", (first or "").lower())
+    if not f:
+        return False
+    if f in dp_numbers.dead_first_names(run):
+        return True
+    owner = rec.get("owner") if isinstance(rec.get("owner"), dict) else {}
+    # A deep prospect that could not rule out the owner's death: never the
+    # owner's name, whoever's number it is.
+    if (run or {}).get("owner_dead") and re.sub(r"[^a-z]", "", (owner.get("first_name") or "").lower()) == f:
+        return True
+    tags = {(t.get("title") or t.get("name") or "") if isinstance(t, dict) else str(t)
+            for t in (rec.get("tags") or [])}
+    if {t.strip().lower() for t in tags} & DECEASED_TAGS:
+        if re.sub(r"[^a-z]", "", (owner.get("first_name") or "").lower()) == f:
+            return True
+    return False
 
 
 def relation_addressee(record_uuid: str, phone: str) -> Optional[str]:
@@ -940,16 +969,35 @@ def build(rows: Iterable[dict], touch: int, sender_fallback: str = "",
         # is. Their own first name, owner copy for an owner of record, heir
         # copy for anyone else (Jeff, 2026-10-26).
         variant = "owner"
+        heir_namesake = False
         if cand.dp_new:
             rec = crm.get_record(cand.record_uuid) or {}
-            first, variant = dp_numbers.addressee(rec, dp_numbers.run_for(cand.record_uuid), phone)
+            run = dp_numbers.run_for(cand.record_uuid)
+            first, variant = dp_numbers.addressee(rec, run, phone)
             cand.first = touches.clean_first(first) if first else ""
+            heir_namesake = bool(cand.first) and dp_numbers.heir_namesake_ok(run, phone)
         # A number tagged Wife / Son / ... belongs to that relative, so the
         # greeting is their name, or no name; never the primary owner's.
         elif cand.record_uuid and crm.client():
             rel_name = relation_addressee(cand.record_uuid, phone)
             if rel_name is not None:
                 cand.first = touches.clean_first(rel_name) if rel_name else ""
+
+        # Jeff, 2026-10-26: NEVER put a dead person's name in a text. Name
+        # only when we are confident that person is alive; otherwise no name.
+        # Exception (Jeff 2026-10-28): the dead owner's name is fine when it is
+        # also the living heir's name and the heir's own number is texted.
+        if cand.first and cand.record_uuid and crm.client() and not heir_namesake:
+            if dead_name(crm.get_record(cand.record_uuid) or {}, cand.first,
+                         dp_numbers.run_for(cand.record_uuid)):
+                cand.first = ""
+        # Every source on the record (both Message Boards, notes, tags, the
+        # activity log, the deep prospect's research): a name any of them ties
+        # to a death never goes in a text, and an unreadable source means no
+        # name at all (Jeff 2026-10-26, 2719 S 80th E Ave).
+        if cand.first and not death_check.name_allowed(cand.record_uuid, cand.first,
+                                                       heir_namesake=heir_namesake):
+            cand.first = ""
 
         if cand.record_uuid and not cand.county:
             cand.county = crm.deal_context(cand.record_uuid).get("county", "")

@@ -29,6 +29,12 @@ os.environ.update({
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from sms_agent import campaign, config, crm, dp_numbers, seed, store  # noqa: E402
+from sms_agent import death_check  # noqa: E402
+
+# Offline: no CRM to read, so the full death check would (correctly) allow no
+# names at all. Sections 1-13 test the other rules; section 14 tests this one.
+_real_forbidden = death_check.forbidden_names
+death_check.forbidden_names = lambda u, rec=None: set()
 from sms_agent.knowledge import touches  # noqa: E402
 
 config.TOUCH_SOURCE = "pool"
@@ -53,6 +59,7 @@ folder.mkdir(parents=True)
 (folder / "state.json").write_text(json.dumps({
     "street": STREET, "city": "Owasso", "property_uuid": REC,
     "started": "2026-10-23", "export": "smartskip_export.csv"}), encoding="utf-8")
+(folder / "obituary_check.json").write_text(json.dumps({"summary": "NO OBITUARY FOUND"}), encoding="utf-8")
 with (folder / "smartskip_export.csv").open("w", newline="", encoding="utf-8") as fh:
     w = csv.writer(fh)
     w.writerow(["First Name", "Last Name", "Relationship", "Phone 1 number", "Phone 1 type",
@@ -244,6 +251,166 @@ with store.tx() as cx:
 scheduler._warn_number_caps()
 check("cap overload alerts with the count",
       ALERTS and "...0007: 3 planned today, cap 2 (1 would be held)" in ALERTS[0][1], ALERTS)
+
+# ---- 12. NEVER greet a dead person (Jeff 2026-10-26, 4527 W Madison Pl:
+# "Hi Bonnie" went to her daughter's number because SmartSkip listed it under
+# the dead subject first).
+run_d = {"started": "2026-10-23", "dead": dp_numbers._dead_from_basis(
+             "Bonnie Marie Pingrey Baker died 01/07/2026 (obituary)."),
+         "people": [
+             {"first": "Bonnie", "last": "Baker", "relationship": "Subject", "dead": True,
+              "phones": ["9185102350", "9182311374"]},
+             {"first": "MONET", "last": "RODRIGUES", "relationship": "Relative", "dead": False,
+              "phones": ["9185198534", "9185102350"]}]}
+rec_d = {"owner": {"first_name": "Bonnie", "last_name": "Baker", "phones": [
+    ph("9185102350", "SmartSkip", "Dial First"), ph("9182311374", "SmartSkip", "Dial First")]}}
+first, variant = dp_numbers.addressee(rec_d, run_d, "9185102350")
+check("a number shared with the decedent greets the living holder", first == "MONET", (first, variant))
+check("never the dead subject's name", "bonnie" not in first.lower())
+vd = dp_numbers.classify(rec_d, run_d, {}, [])
+check("the decedent's own number is still texted (Jeff 10/27)", vd["9182311374"] == "", vd)
+check("...with no name and heir copy",
+      dp_numbers.addressee(rec_d, run_d, "9182311374") == ("", "heir"),
+      dp_numbers.addressee(rec_d, run_d, "9182311374"))
+check("the shared number is still textable", vd["9185102350"] == "", vd)
+check("'Lenord Sr. likely died' keeps the name Lenord out of every text (not sure = no name)",
+      "lenord" in dp_numbers.dead_first_names(
+          {"dead": dp_numbers._dead_from_basis("Lenord Sr. very likely died (see notes)")}))
+check("basis with first and last marks the decedent dead",
+      ("bonnie", "baker") in run_d["dead"], run_d["dead"])
+run_w = {"started": "2026-10-23", "dead": set(), "people": [
+    {"first": "John", "last": "Webster", "relationship": "Subject", "dead": True, "phones": ["2083057824"]},
+    {"first": "JOHN", "last": "WEBSTER", "relationship": "Relative", "dead": False,
+     "phones": ["2083057824", "2082848474"]}]}
+rec_w = {"owner": {"first_name": "John", "last_name": "Webster", "phones": []}}
+first, variant = dp_numbers.addressee(rec_w, run_w, "2082848474")
+# Jeff 2026-10-28: a dead person's name is fine when it is also the heir's.
+# SAME full name: could be the decedent listed twice (2719 S 80th E Ave), so no name.
+check("same-full-name 'son' of a dead owner: still no name, heir copy",
+      (first, variant) == ("", "heir"), (first, variant))
+check("...the namesake exception does not apply to a same-full-name relative",
+      not dp_numbers.heir_namesake_ok(run_w, "2082848474"))
+run_cg = {"started": "2026-10-23", "dead": dp_numbers._dead_from_basis("Carolyn J Gray died 6/9/2026."),
+          "people": [
+              {"first": "Carolyn", "last": "Gray", "relationship": "Subject", "dead": False, "phones": ["9180001111"]},
+              {"first": "CAROLYN", "last": "GRAY", "relationship": "Relative", "dead": False, "phones": ["9180002222"]},
+              {"first": "Carolyn", "last": "Price", "relationship": "Relative", "dead": False, "phones": ["9180003333"]}]}
+rec_cg = {"owner": {"first_name": "Carolyn", "last_name": "Gray"}}
+check("2719 S 80th E: a 'Relative' row under the dead owner's full name never gets her name",
+      dp_numbers.addressee(rec_cg, run_cg, "9180002222")[0] == ""
+      and not dp_numbers.heir_namesake_ok(run_cg, "9180002222"))
+# Jeff 2026-10-28: a dead person's name is fine when it is also the heir's.
+check("living heir Carolyn PRICE of dead owner Carolyn Gray: her name (Jeff 10/28)",
+      dp_numbers.addressee(rec_cg, run_cg, "9180003333") == ("Carolyn", "heir")
+      and dp_numbers.heir_namesake_ok(run_cg, "9180003333"),
+      dp_numbers.addressee(rec_cg, run_cg, "9180003333"))
+run_ok = {"started": "2026-10-23", "owner_dead": True, "dead": set(),
+          "basis": "Kimberly Welch is the borrower and is believed living.", "people": [
+              {"first": "Kimberly", "last": "Welch", "relationship": "Subject", "dead": False, "phones": ["9180004444"]},
+              {"first": "KIMBERLY", "last": "WILSON", "relationship": "Relative", "dead": False, "phones": ["9180005555"]}]}
+check("200 Oak Ridge: owner only POSSIBLY dead -> a namesake relative gets no name",
+      not dp_numbers.heir_namesake_ok(run_ok, "9180005555")
+      and dp_numbers.addressee({"owner": {"first_name": "Kimberly"}}, run_ok, "9180005555")[0] == "")
+run_bp = {"started": "2026-10-23", "basis": "Bonnie Marie Pingrey Baker died 01/07/2026 (obituary).",
+          "dead": dp_numbers._dead_from_basis("Bonnie Marie Pingrey Baker died 01/07/2026 (obituary)."),
+          "people": [
+              {"first": "Bonnie", "last": "Baker", "relationship": "Subject", "dead": True, "phones": ["9180006666"]},
+              {"first": "BONNIE", "last": "PINGREY", "relationship": "Relative", "dead": False, "phones": ["9180007777"]}]}
+check("maiden name: 'Bonnie Pingrey' relative of 'Bonnie Marie Pingrey Baker died' gets no name",
+      not dp_numbers.heir_namesake_ok(run_bp, "9180007777"))
+run_cs = dict(run_cg, people=run_cg["people"][:2] + [dict(run_cg["people"][2], phones=["9180001111"])])
+check("...but not on a number the dead owner also held",
+      not dp_numbers.heir_namesake_ok(run_cs, "9180001111"))
+run_u = {"started": "2026-10-23", "dead": set(), "people": [
+    {"first": "Mary", "last": "Webster", "relationship": "Subject", "dead": True, "phones": ["2083050001"]},
+    {"first": "John", "last": "Webster", "relationship": "Relative", "dead": True, "phones": ["2083050002"]},
+    {"first": "John", "last": "Price", "relationship": "Relative", "dead": False, "phones": ["2083050003"]}]}
+check("a namesake of a dead NON-owner relative still gets no name",
+      dp_numbers.addressee({"owner": {"first_name": "Mary"}}, run_u, "2083050003")[0] == ""
+      and not dp_numbers.heir_namesake_ok(run_u, "2083050003"))
+check("no dead namesake at all: the exception does not apply",
+      not dp_numbers.heir_namesake_ok(run_d, "9185198534"))
+check("seed guard: deceased-tagged record never greets its owner",
+      seed.dead_name({"tags": ["deceased"], "owner": {"first_name": "Bonnie"}}, "Bonnie"))
+check("seed guard: untagged record keeps the owner's name",
+      not seed.dead_name({"tags": [], "owner": {"first_name": "Bonnie"}}, "Bonnie"))
+check("seed guard: a name a deep prospect found dead is never used",
+      seed.dead_name({}, "Bonnie", run_d))
+
+# ---- 13. the obituary check outranks the summary (2719 S 80th E Ave: summary
+# said "believed LIVING", obituary check said "LIKELY THE OWNER'S OBITUARY").
+import tempfile, json as _json
+from pathlib import Path as _P
+for verdict, want in [("LIKELY THE OWNER'S OBITUARY (name + place match)", True),
+                      ("POSSIBLE (name matches, place not confirmed)", True),
+                      ("CONFIRMED (survivors include)", True),
+                      ("UNRELATED / WEAK (no name match)", False),
+                      ("NO OBITUARY FOUND", False),
+                      ("OWNER IS A SURVIVOR (someone else's obituary)", False)]:
+    with tempfile.TemporaryDirectory() as td:
+        (_P(td) / "obituary_check.json").write_text(_json.dumps({"summary": verdict}), encoding="utf-8")
+        check(f"obituary verdict {verdict[:20]!r} -> owner maybe dead = {want}",
+              dp_numbers._owner_maybe_dead(_P(td)) is want)
+with tempfile.TemporaryDirectory() as td:
+    check("missing obituary check -> not confident the owner is alive", dp_numbers._owner_maybe_dead(_P(td)))
+run_g = {"started": "2026-10-23", "dead": set(), "owner_dead": True, "people": [
+    {"first": "Carolyn", "last": "Gray", "relationship": "Subject", "dead": False,
+     "phones": ["9188847404", "9186711890"]},
+    {"first": "DONALD", "last": "BARNES", "relationship": "Relative", "dead": False,
+     "phones": ["9186711890"]}]}
+rec_g = {"owner": {"first_name": "Carolyn", "last_name": "Gray", "phones": [
+    ph("9188847404", "SmartSkip", "Dial First"), ph("9186711890", "SmartSkip", "Dial First")]}}
+first, variant = dp_numbers.addressee(rec_g, run_g, "9186711890")
+check("owner not cleared: her son's shared number greets the son", first == "DONALD", (first, variant))
+vg = dp_numbers.classify(rec_g, run_g, {}, [])
+check("owner not cleared: her own number is still texted (Jeff 10/27)", vg["9188847404"] == "", vg)
+check("...owner copy, no name (possibly dead, may be the one answering)",
+      dp_numbers.addressee(rec_g, run_g, "9188847404") == ("", "owner"),
+      dp_numbers.addressee(rec_g, run_g, "9188847404"))
+# 11516 E 179th St N (Jeff 10/27): obituary check only POSSIBLE, so Jason's own
+# number 918-289-1770 was held all day. It must be texted, just without his name.
+run_j = {"started": "2026-10-23", "dead": set(), "owner_dead": True, "people": [
+    {"first": "Jason", "last": "Rosser", "relationship": "Subject", "dead": False,
+     "phones": ["9186390488", "9182891770"]}]}
+rec_j = {"owner": {"first_name": "Jason", "last_name": "Rosser", "phones": [
+    ph("9182891770", "SmartSkip", "Dial First")]}}
+check("POSSIBLE obituary: owner's own number is texted",
+      dp_numbers.classify(rec_j, run_j, {}, [])["9182891770"] == "")
+check("POSSIBLE obituary: owner copy, no name",
+      dp_numbers.addressee(rec_j, run_j, "9182891770") == ("", "owner"),
+      dp_numbers.addressee(rec_j, run_j, "9182891770"))
+check("seed guard: owner not cleared -> never the owner's name",
+      seed.dead_name({"owner": {"first_name": "Carolyn"}}, "Carolyn", run_g))
+
+# ---- 14. every source is read: a Message Board line alone bans the name
+from sms_agent import death_check as dc
+cands = {"carolyn", "deanna", "donald", "hannah", "lucas"}
+check("board 'Decedent: Carolyn J. Gray | Died: 6/9/2026' bans Carolyn",
+      "carolyn" in dc.banned_from_texts(["Decedent: Carolyn J. Gray | Died: 6/9/2026"], cands, set()))
+check("survivor list does not ban the living",
+      "hannah" not in dc.banned_from_texts(
+          ["Survived by: is survived by his wife, Hannah Hoffmeister of Broken Arrow"], cands, set()))
+check("'OWNER DECEASED' with no name bans the owner",
+      "deanna" in dc.banned_from_texts(["OWNER DECEASED -- the petition names no living heir."],
+                                       cands, {"deanna"}))
+check("deep prospect template text bans nobody",
+      not dc.banned_from_texts([
+          "Numbers marked 'board only' were not scored (living owner: owner + spouse only; "
+          "deceased owner: close family only).", "OBITUARY CHECK: Lucas Salisbury (Owasso, OK)"],
+          cands, {"lucas"}))
+_saved = dc.forbidden_names
+dc.forbidden_names = lambda u, rec=None: {dc.ALL}
+check("a record that could not be fully read gets no name", not dc.name_allowed("x", "Donald"))
+dc.forbidden_names = lambda u, rec=None: {"carolyn"}
+check("a banned name is refused, a cleared one allowed",
+      not dc.name_allowed("x", "Carolyn") and dc.name_allowed("x", "Donald"))
+check("no record uuid -> no name", not dc.name_allowed("", "Donald"))
+check("heir namesake: the dead owner's name is allowed for the living heir",
+      dc.name_allowed("x", "Carolyn", heir_namesake=True))
+dc.forbidden_names = lambda u, rec=None: {dc.ALL}
+check("heir namesake on an unreadable record: still no name",
+      not dc.name_allowed("x", "Carolyn", heir_namesake=True))
+dc.forbidden_names = _saved
 
 print(f"\n{len(FAILS)} failure(s)")
 sys.exit(1 if FAILS else 0)

@@ -137,6 +137,13 @@ def _fingerprints() -> dict[int, list[str]]:
             best = max(literals, key=len)
             if len(best) >= 18:
                 marks.append(re.sub(r"\s+", " ", best.lower())[:60])
+    # Touch 2 wordings tested on 2026-10-27 (Jeff) that are not in the pool.
+    # They went out as touch 2, so the history has to count them as touch 2,
+    # or those numbers get touch 2 again instead of moving on to touch 3.
+    out.setdefault(2, []).extend([
+        "following up on my last text. is",
+        "i reached out the other day about",
+    ])
     return out
 
 

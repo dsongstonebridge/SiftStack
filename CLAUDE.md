@@ -18,6 +18,27 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 8. **REI Skill Library:** 21 Claude Co-Work skill files (`.skill`/`.plugin` ZIPs) for distribution to DataSift community via [learn.datasift.ai/claude-skills-rei](https://learn.datasift.ai/claude-skills-rei). Skills teach Claude specific REI workflows when uploaded to Co-Work sessions or Projects.
 
+## Working with Jeff (read first; his frustrations, 2026-10-27/28)
+
+Jeff has had to correct how I work several times in a row. These are standing rules:
+
+- **Talk like a human.** Plain words, short sentences. Say what happens to his records,
+  texts and money, not which function changes. No code names, jargon or internal labels
+  unless he asks. If he says it doesn't make sense, rewrite it more simply; don't repeat it.
+- **Don't push him for answers.** Lay out the plan, then stop and wait. Don't fire a menu
+  of questions right after a long explanation. When a question is really needed, ask one
+  clear question.
+- **Build only what he asked for.** Don't invent rules, flags, overrides or extra
+  machinery. If an idea is mine and not Jeff's or Ty's (e.g. Ty's deep-prospecting v5
+  method), say so plainly and leave it out unless he says yes. On 2026-10-28 I proposed
+  blocking out-of-state numbers and heirs, plus "tie/untie" override flags. Jeff:
+  unnecessary, bulky, and it risked dropping real heirs. None of that came from him.
+- **Don't overcorrect after a mistake.** A reprimand means fix the actual problem, not lock
+  down the whole pipeline. After the wrong John Webster (2026-10-27: a same-name stranger in
+  Idaho named as the heir), what he wanted was deeper research when the wrong person is
+  possible, and a stop to ask him only when it is really unclear.
+- **Repeat back before building** anything big, or whenever he asks. Then wait for his yes.
+
 ## Commands
 
 ```bash
@@ -1876,6 +1897,17 @@ it. `_create_records_for_batch()` now partitions rows by whether they actually e
 clean rows proceed to creation in the same run, and only the flagged rows are held back (reported
 in the review sheet) for a later manual pass. Mirrors how `apply_buy_box()` already splits
 kept/rejected rows rather than failing the whole batch on one exclusion.
+
+**THE TREASURER HAS REQUIRED A CAPTCHA SINCE 2026-10-27** (Cloudflare Turnstile; every search
+answers HTTP 403 `captcha_required`). `search_owner_name()` used to swallow that and return
+`[]`, so this fallback quietly found nothing and wrote no note. It now raises
+`TreasurerBlocked`. The check stops after the first refusal and writes `Treasurer Check:
+Not checked: the Treasurer site requires a captcha. The Assessor found nothing, so there is
+likely no property. Check by hand if worth it: https://oktaxrolls.com/search/Tulsa`. Jeff
+(2026-10-28): no paid solve. If the Assessor has nothing, there is likely no property anyway,
+and he checks by hand when he thinks it's worth it. The check is passed once per browser
+session (the site's `human.js`), so a paid solve would cost about $0.0015 per run, not per
+search, if he ever changes his mind.
 
 ### Known gaps
 

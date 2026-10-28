@@ -1596,10 +1596,11 @@ def _treasurer_true_negative_check(row: dict, candidates: list[tuple[str, str]])
     #: tax-payer timeline, pulled for every corroborated hit now, not only
     #: to disambiguate an heir's own property.
     findings: list[tuple[str, str, dict, list[dict]]] = []
+    blocked = []                    # set once the site answers with its captcha
 
     def _search_one(label: str, name: str) -> list[tuple[str, str, dict, list[dict]]]:
         name = str(name or "").strip()
-        if not name:
+        if not name or blocked:
             return []
         parts = [p.strip(".,") for p in name.replace(",", " ").split() if p.strip(".,")]
         while len(parts) > 1 and parts[-1].upper() in _SUFFIXES:
@@ -1610,6 +1611,9 @@ def _treasurer_true_negative_check(row: dict, candidates: list[tuple[str, str]])
 
         try:
             hits = treasurer.search_owner_name(last, first)
+        except treasurer.TreasurerBlocked:
+            blocked.append(name)
+            return []
         except Exception as e:                    # noqa: BLE001 - free lookup; never lose the row
             logging.debug("  treasurer: search error for %s: %s", name, e)
             return []
@@ -1661,6 +1665,17 @@ def _treasurer_true_negative_check(row: dict, candidates: list[tuple[str, str]])
             findings.extend(_search_one(label, name))
 
     if not findings:
+        if blocked:
+            # Say so instead of reading the refusal as "owns nothing". The
+            # Assessor already found nothing, so there is likely no property;
+            # this is a hand check if Jeff thinks it is worth it (2026-10-28).
+            row["Treasurer Check"] = (
+                "Not checked: the Treasurer site requires a captcha. The Assessor found "
+                "nothing, so there is likely no property. Check by hand if worth it: "
+                f"{treasurer.MANUAL_SEARCH_URL}")
+            logging.warning("  treasurer: not checked for %s (captcha); Assessor found nothing, "
+                            "likely no property. Hand check: %s",
+                            row.get("Decedent Name") or blocked[0], treasurer.MANUAL_SEARCH_URL)
         return
 
     row["Treasurer Check"] = "; ".join(

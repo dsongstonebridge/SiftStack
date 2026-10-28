@@ -71,6 +71,14 @@ logger = logging.getLogger(__name__)
 
 BASE_URL = "https://oktaxrolls.com"
 SEARCH_URL = f"{BASE_URL}/searchResult/Tulsa/owner_name"
+#: Where a person checks the tax roll by hand while the captcha is up.
+MANUAL_SEARCH_URL = f"{BASE_URL}/search/Tulsa"
+
+
+class TreasurerBlocked(Exception):
+    """The site refused the search with its captcha (HTTP 403
+    "captcha_required", since 2026-10-27). Raised instead of returning [],
+    which reads exactly like "this person owns nothing"."""
 DETAIL_URL = f"{BASE_URL}/owner_details/Tulsa"
 HISTORY_URL = f"{BASE_URL}/owner_history/Tulsa"
 
@@ -200,8 +208,12 @@ def search_owner_name(
 
     try:
         resp = session.post(SEARCH_URL, params=params, data=data, timeout=timeout)
+        if resp.status_code == 403 and "captcha" in resp.text[:300].lower():
+            raise TreasurerBlocked(resp.text[:120])
         resp.raise_for_status()
         raw_rows = resp.json().get("data", [])
+    except TreasurerBlocked:
+        raise
     except Exception as e:
         logger.warning("Treasurer owner-name search error (%s %s): %s", last_name, business_name, e)
         return []

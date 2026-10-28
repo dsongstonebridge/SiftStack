@@ -82,17 +82,11 @@ c = op.assessor_section("4410 E 99th St", "Tulsa", "Paul Fenwick", search=lambda
 check("assessor: no account -> 'not checked', never a silent empty", c["status"] == "not checked")
 check("street query drops suffix and ordinal", op.street_query("4410 E 99th St") == "4410 E 99")
 
-# ── Treasurer ─────────────────────────────────────────────────────────
-t = op.treasurer_section("Paul Fenwick", "12345678901234", search=lambda **k: [],
-                         blocked=lambda: "the Treasurer site now requires a captcha")
-check("treasurer: a captcha block reads 'not checked', not 'owns nothing'",
-      t["status"] == "not checked" and "captcha" in t["findings"][0])
-t = op.treasurer_section("Paul Fenwick", "12345678901234", blocked=lambda: "",
-                         search=lambda **k: [{"parcel_id": "12345-67-89-01234", "tax_year": 2025,
-                                             "tax_data_id": "X"}],
-                         history=lambda tid: [{"year": 2025, "paid_by": "FENWICK PAUL"}])
-check("treasurer: rows on this parcel and payer history reported",
-      "2025" in t["findings"][0] and any("FENWICK PAUL" in f for f in t["findings"]))
+# ── Treasurer: a link to check by hand (Jeff, 2026-10-28) ────────────
+t = op.treasurer_section("Paul Fenwick", "12345678901234")
+check("treasurer: never searched, gives a link to check by hand",
+      t["status"] == "check by hand" and op.TREASURER_SEARCH_URL in t["findings"][0]
+      and "Paul Fenwick" in t["findings"][0] and "12345678901234" in t["findings"][0])
 
 # ── LOCCAT ────────────────────────────────────────────────────────────
 
@@ -150,8 +144,9 @@ check("web: obituary sites left to the obituary check", "legacy.com" not in wt)
 
 # ── identity ──────────────────────────────────────────────────────────
 ib = op.identity_before("Paul Fenwick", ["9185550103", "2085550101", "3035550104"], "OK")
-check("identity before: out-of-state numbers on the record flagged",
-      "2 of 3" in ib["findings"][0] and "208" in ib["findings"][0])
+check("identity before: out-of-state numbers are noted only, not called the wrong person",
+      "2 of 3" in ib["findings"][0] and "noted only" in ib["findings"][0]
+      and "different person" not in ib["findings"][0])
 check("identity before: all in-state reads clean",
       "all in-state" in op.identity_before("A B", ["9185551212"], "OK")["findings"][0])
 # Replay of the 2026-10-27 same-name incident: the owner shares an out-of-state mobile with an out-of-state
@@ -164,12 +159,35 @@ REC = {"first": "PAUL", "last": "FENWICK",
                       "mailing_state": "ID", "phones": []},
                      {"name": "LINDA ORMSBY", "canon_rel": "Relative", "mailing_city": "TULSA",
                       "mailing_state": "OK", "phones": []}]}
-ia = "\n".join(op.identity_after_smartskip(REC, ["Linda Ormsby"]))
-check("same-name replay: shared number with an out-of-state same-name 'son' -> MERGED IDENTITY",
-      "MERGED IDENTITY" in ia and "2085550101" in ia and "BOISE" in ia)
-check("same-name replay: out-of-state relative with no tie to known family flagged",
-      "MARLA QUINCE" in ia and "not tied to any known family" in ia)
-check("in-state known family is not flagged", "LINDA ORMSBY" not in ia)
+# Mix-up levels (Jeff, 2026-10-28): strong = shared number with a same-name
+# person in another state; maybe = same name in another state, nothing shared;
+# out-of-state numbers or relatives on their own are never flagged.
+f = op.identity_findings(REC)
+check("strong: shared number with a same-name out-of-state relative",
+      [x["level"] for x in f] == ["strong"] and "208-555-0101" in f[0]["text"] and "Boise, ID" in f[0]["text"])
+check("out-of-state relative with a different name is not flagged",
+      not any("Marla" in x["text"] for x in f))
+REC_MAYBE = dict(REC, relatives=[dict(REC["relatives"][0], phones=[{"number": "2085550102"}])])
+fm = op.identity_findings(REC_MAYBE)
+check("maybe: same-name relative in another state, no shared number", [x["level"] for x in fm] == ["maybe"])
+REC_PLAIN = {"first": "PAUL", "last": "FENWICK",
+             "subject_phones": [{"number": "9185550103"}, {"number": "3035550104"}],
+             "relatives": [{"name": "DANA FENWICK", "canon_rel": "Child", "mailing_city": "DALLAS",
+                            "mailing_state": "TX", "phones": [{"number": "2145550105"}]},
+                           {"name": "PAUL FENWICK", "canon_rel": "Child", "mailing_city": "TULSA",
+                            "mailing_state": "OK", "phones": [{"number": "9185550103"}]}]}
+check("no flag: owner's out-of-state number, an out-of-state child, an in-state same-name son",
+      op.identity_findings(REC_PLAIN) == [])
+check("profile text: no flags reads as no sign of a mix-up",
+      "No sign" in op.identity_after_smartskip(REC_PLAIN)[0])
+check("profile text: strong finding labelled STRONG",
+      op.identity_after_smartskip(REC)[0].startswith("STRONG: "))
+check("note: nothing to say -> empty", op.mixup_note([]) == "")
+check("note: strong carries Jeff's call",
+      op.mixup_note(f, "Jeff: skip the 208 numbers").startswith("POSSIBLE MIX-UP (likely): ")
+      and "Jeff's call: Jeff: skip the 208 numbers" in op.mixup_note(f, "Jeff: skip the 208 numbers"))
+check("note: maybe says scoring went ahead as usual",
+      op.mixup_note(fm).startswith("POSSIBLE MIX-UP (maybe): ") and "Scored as usual" in op.mixup_note(fm))
 
 rep = op.report({"person": "Paul Fenwick", "street": "4410 E 99th St", "city": "Tulsa",
                  "sections": [a, t, lc]})

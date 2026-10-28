@@ -9,9 +9,8 @@ be found on the owner, not just death searches. Sources (all free):
      goes, and the values table (a 3%/yr taxable rise is the Oklahoma
      homestead cap; a $0 net assessed value is a full exemption, usually the
      100% disabled veteran one). Both are things a living owner filed.
-  2. Tulsa County Treasurer: who has been paying the taxes. The site began
-     answering "captcha_required" on 2026-10-27; solving it costs money, so
-     this section reports "not checked" instead of paying.
+  2. Tulsa County Treasurer: a link to check by hand. The site has required
+     a captcha since 2026-10-27, and Jeff chose a manual check over a paid solve.
   3. County Clerk land records (LOCCAT): recorded documents naming the owner,
      split into this parcel and other parcels (namesakes).
   4. Our CRM: the record's Message Boards, call and text history, phone
@@ -19,9 +18,9 @@ be found on the owner, not just death searches. Sources (all free):
   5. The web beyond obituaries: search results that mention the owner with
      the street, the city or known family. People-search pages are listed,
      never opened.
-  6. Identity check: out-of-state numbers and mailing addresses, and after
-     SmartSkip, numbers the owner shares with an out-of-state same-name
-     relative (the 2026-10-27 same-name pattern).
+  6. Identity check: after SmartSkip, signs the owner was mixed up with a
+     different person of the same name (strong: they share a number; maybe:
+     same name in another state). Out-of-state numbers alone are noted only.
 
 Court records (OSCN) are deliberately left out (Jeff, 2026-10-27).
 
@@ -233,59 +232,18 @@ def assessor_section(street: str, city: str, person: str, *,
 
 # ── 2. Treasurer ──────────────────────────────────────────────────────
 
-def treasurer_blocked() -> str:
-    """Why the Treasurer search cannot be read right now, or "". Needed because
-    tulsa_treasurer.search_owner_name() logs a 403 and returns [], which reads
-    exactly like 'this person owns nothing' (caught live 2026-10-27)."""
-    import tulsa_treasurer as tt
-    try:
-        r = requests.post(tt.SEARCH_URL, headers=tt._HEADERS, timeout=30,
-                          params={"from_years": "2025", "to_year": "2026", "first_name": "",
-                                  "last_name": "SMITH", "business_owner_name": "",
-                                  "show_unpaid_only": "0", "total_record": "1", "show_records": "1"},
-                          data={"draw": "1", "start": "0", "length": "1"})
-    except Exception as e:                          # noqa: BLE001
-        return f"Treasurer unreachable: {e}"
-    if r.status_code == 403 or "captcha" in r.text[:300].lower():
-        return ("the Treasurer site now requires a captcha (since 2026-10-27). Solving it costs "
-                "about $0.0015 a search; ask Jeff before adding it.")
-    return "" if r.ok else f"Treasurer answered HTTP {r.status_code}"
+TREASURER_SEARCH_URL = "https://oktaxrolls.com/search/Tulsa"
 
 
-def treasurer_section(person: str, parcel_id: str, *, search: Callable | None = None,
-                      history: Callable | None = None, blocked: Callable | None = None) -> dict:
-    import tulsa_treasurer as tt
-    search = search or tt.search_owner_name
-    history = history or tt.get_owner_history
-    blocked = blocked or treasurer_blocked
+def treasurer_section(person: str, parcel_id: str) -> dict:
+    """A link to check by hand, not a search (Jeff, 2026-10-28). The site has
+    required a captcha since 2026-10-27 and Jeff chose a manual check over a
+    paid solve."""
     sec = _section("Tulsa County Treasurer")
-    toks = person.split()
-    if len(toks) < 2:
-        return _not_checked(sec, "no first and last name")
-    why = blocked()
-    if why:
-        return _not_checked(sec, why)
-    try:
-        rows = search(last_name=toks[-1], first_name=toks[0]) or []
-    except Exception as e:                          # noqa: BLE001
-        if "403" in str(e) or "captcha" in str(e).lower():
-            return _not_checked(sec, "the Treasurer site now requires a captcha (since 2026-10-27). "
-                                     "Solving it costs about $0.0015 a search; ask Jeff before adding it.")
-        return _not_checked(sec, f"Treasurer error: {e}")
-    want = re.sub(r"\D", "", parcel_id or "")
-    mine = [r for r in rows if want and re.sub(r"\D", "", r.get("parcel_id") or "") == want]
-    sec["data"]["rows"] = len(rows)
-    if not mine:
-        sec["findings"].append(f"{len(rows)} tax-roll row(s) under {person}, none on this parcel.")
-        return sec
-    years = sorted({r.get("tax_year") for r in mine if r.get("tax_year")})
-    sec["findings"].append(f"Tax roll lists {person} on this parcel for {', '.join(map(str, years))}.")
-    try:
-        payers = history(mine[0]["tax_data_id"]) or []
-        for p in payers[:6]:
-            sec["findings"].append("Paid " + " | ".join(str(v) for v in p.values() if v))
-    except Exception as e:                          # noqa: BLE001
-        sec["findings"].append(f"Payer history not read: {e}")
+    sec["status"] = "check by hand"
+    sec["findings"].append(f"Not searched automatically (captcha). Check by hand: {TREASURER_SEARCH_URL}"
+                           f" - search owner name {person}"
+                           + (f", or parcel {parcel_id}" if parcel_id else "") + ".")
     return sec
 
 
@@ -472,13 +430,15 @@ def web_section(person: str, street: str, city: str, state: str, known: list[str
 
 def identity_before(person: str, crm_phones: list[str], crm_mailing_state: str,
                     home_state: str = "OK") -> dict:
+    """For information only. Out-of-state numbers are common on real owners (an
+    old move, a cell kept from another state), so they are noted, never treated
+    as a sign of the wrong person on their own (Jeff, 2026-10-28)."""
     sec = _section("Identity check (before SmartSkip)")
     out = [p for p in crm_phones if area_code(p) and area_code(p) not in OK_AREA_CODES]
     if out:
         sec["findings"].append(
             f"{len(out)} of {len(crm_phones)} number(s) on the record are out of state "
-            f"({', '.join(sorted({area_code(p) for p in out}))}): an old move, or a different "
-            f"person named {person}. Confirm before calling them as the owner.")
+            f"({', '.join(sorted({area_code(p) for p in out}))}). Common on real owners; noted only.")
     if crm_mailing_state and crm_mailing_state.upper() != home_state:
         sec["findings"].append(f"Owner mailing address is in {crm_mailing_state}, not {home_state}.")
     if not sec["findings"]:
@@ -486,29 +446,63 @@ def identity_before(person: str, crm_phones: list[str], crm_mailing_state: str,
     return sec
 
 
-def identity_after_smartskip(rec: dict, known: list[str], home_state: str = "OK") -> list[str]:
-    """Flags on a SmartSkip result: the owner's own numbers out of state, and
-    numbers the owner SHARES with an out-of-state relative of the same name,
-    which is two people merged into one (2026-10-27 same-name incident)."""
-    f: list[str] = []
+def _fmt_num(n: str) -> str:
+    return f"{n[:3]}-{n[3:6]}-{n[6:]}" if len(n) == 10 and n.isdigit() else n
+
+
+def identity_findings(rec: dict, home_state: str = "OK") -> list[dict]:
+    """Signs that SmartSkip mixed the owner up with a different person of the
+    same name (the 2026-10-27 same-name incident). Each finding is
+    {"level": "strong" | "maybe", "text": plain-English reason}.
+
+    strong: the owner shares a number with a relative of the SAME name who
+            lives in another state. Stop and ask Jeff before scoring.
+    maybe:  a relative with the owner's name lives in another state, with no
+            shared number. Score as usual; leave a note.
+
+    Out-of-state numbers or out-of-state relatives on their own are NOT
+    flagged: real owners and heirs have them all the time (Jeff, 2026-10-28)."""
+    out: list[dict] = []
     subj = {p["number"] for p in rec.get("subject_phones") or []}
     owner = f"{rec.get('first', '')} {rec.get('last', '')}".strip()
-    out = sorted(n for n in subj if area_code(n) and area_code(n) not in OK_AREA_CODES)
-    if out:
-        f.append(f"SmartSkip gave the owner {len(out)} out-of-state number(s) ({', '.join(out)}). "
-                 "These may belong to a different person with the same name.")
     for r in rec.get("relatives") or []:
-        shared = subj & {p["number"] for p in r.get("phones") or []}
+        name = r.get("name") or ""
         st = (r.get("mailing_state") or "").upper()
-        tied = any(same_person_name(k, r.get("name") or "") for k in known)
-        if shared and same_person_name(owner, r.get("name") or "") and st and st != home_state:
-            f.append(f"MERGED IDENTITY: the owner shares {', '.join(sorted(shared))} with "
-                     f"'{r['name']}' ({r.get('canon_rel')}, {r.get('mailing_city')}, {st}). That is "
-                     "very likely a DIFFERENT person with the same name. Do not call them as family.")
-        elif st and st != home_state and not tied and r.get("canon_rel") not in ("Associate",):
-            f.append(f"'{r['name']}' ({r.get('canon_rel')}, {r.get('mailing_city')}, {st}) is not "
-                     "tied to any known family. SmartSkip's label alone is not proof of family.")
-    return f or ["No identity problems seen in the SmartSkip result."]
+        if not (st and st != home_state.upper() and same_person_name(owner, name)):
+            continue
+        where = ", ".join(x for x in ((r.get("mailing_city") or "").title(), st) if x)
+        shared = sorted(subj & {p["number"] for p in r.get("phones") or []})
+        if shared:
+            out.append({"level": "strong", "text": (
+                f"SmartSkip may have merged the owner with a different {name.title()} in {where}: "
+                f"they share {', '.join(_fmt_num(n) for n in shared)}, and SmartSkip calls that "
+                f"person a {r.get('canon_rel') or 'relative'}.")})
+        else:
+            out.append({"level": "maybe", "text": (
+                f"SmartSkip lists a {name.title()} in {where} as a {r.get('canon_rel') or 'relative'}. "
+                "Same name as the owner, so the results may mix the two up.")})
+    return out
+
+
+def identity_after_smartskip(rec: dict, known: list[str] | None = None,
+                             home_state: str = "OK") -> list[str]:
+    """The owner-profile lines for identity_findings()."""
+    f = identity_findings(rec, home_state)
+    return [f"{x['level'].upper()}: {x['text']}" for x in f] or [
+        "No sign that SmartSkip mixed the owner up with someone else."]
+
+
+def mixup_note(findings: list[dict], jeff_call: str = "") -> str:
+    """The line under the owner status at the top of every board post and the
+    PDF, or "" when there is nothing to say (Jeff, 2026-10-28)."""
+    if not findings:
+        return ""
+    strong = [x["text"] for x in findings if x["level"] == "strong"]
+    if strong:
+        return ("POSSIBLE MIX-UP (likely): " + " ".join(strong)
+                + (f" Jeff's call: {jeff_call}" if jeff_call else ""))
+    return ("POSSIBLE MIX-UP (maybe): " + " ".join(x["text"] for x in findings)
+            + " Scored as usual; worth a second look before calling.")
 
 
 # ── the whole profile ─────────────────────────────────────────────────

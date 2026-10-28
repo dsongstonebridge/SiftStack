@@ -272,13 +272,15 @@ def build_board_post(plan: dict, *, today: str | None = None) -> str:
 
 
 OWNER_STATUSES = ("dead", "alive", "unverified")
+CONFIDENCE_LEVELS = ("high", "medium")
 # Sources that can prove a death without an obituary. SmartSkip is never one
 # (v5 gotcha 1; same-name incident, 2026-10-27).
 _FILING_PROOF = re.compile(r"probate|PB-\d|court|death certificate|letters|order appointing|"
                            r"filing|petition", re.I)
 
 
-def owner_status_line(status: str, proof: str, owner: str, *, obits: dict | None = None) -> str:
+def owner_status_line(status: str, proof: str, owner: str, *, obits: dict | None = None,
+                      confidence: str = "") -> str:
     """The first line of every deep prospecting board post and PDF (Jeff,
     2026-10-27): what OUR research says about whether the owner is alive or
     dead, never SmartSkip's deceased flag. Refuses a claim the evidence does
@@ -287,6 +289,7 @@ def owner_status_line(status: str, proof: str, owner: str, *, obits: dict | None
     in another state."""
     status = (status or "").strip().lower()
     proof = (proof or "").strip()
+    confidence = (confidence or "").strip().lower()
     if status not in OWNER_STATUSES:
         raise SystemExit(f"--owner-status must be one of {', '.join(OWNER_STATUSES)}")
     if "smartskip" in proof.lower():
@@ -302,12 +305,18 @@ def owner_status_line(status: str, proof: str, owner: str, *, obits: dict | None
                          "--status-proof. A name match is not enough: use --owner-status unverified.")
     if status == "alive" and confirmed:
         raise SystemExit("--owner-status alive contradicts a CONFIRMED obituary in obituary_check.json")
+    # How sure we are, on the same line (Jeff, 2026-10-28). Unverified is low
+    # by definition; a low-confidence "dead" or "alive" is really unverified.
+    if status in ("dead", "alive") and confidence not in CONFIDENCE_LEVELS:
+        raise SystemExit(f"--owner-status {status} needs --confidence high or medium "
+                         "(if it is lower than that, use --owner-status unverified)")
     if status == "dead":
-        return f"OWNER STATUS: VERIFIED DEAD - {owner}. Proof: {proof}"
+        return f"OWNER STATUS: DECEASED ({confidence} confidence) - {owner}. Proof: {proof}"
     if status == "alive":
-        return f"OWNER STATUS: VERIFIED ALIVE - {owner}. Proof: {proof}"
-    return (f"OWNER STATUS: NOT VERIFIED - our research has not confirmed whether {owner} is alive "
-            "or dead. Do not tell anyone the owner died." + (f" Notes: {proof}" if proof else ""))
+        return f"OWNER STATUS: LIVING ({confidence} confidence) - {owner}. Proof: {proof}"
+    return (f"OWNER STATUS: NOT VERIFIED (low confidence) - our research has not confirmed whether "
+            f"{owner} is living or deceased. Do not tell anyone the owner died."
+            + (f" Notes: {proof}" if proof else ""))
 
 
 def _fmt(num: str) -> str:
@@ -620,6 +629,8 @@ def main(argv: list[str] | None = None) -> int:
     w.add_argument("--owner-status", required=True, choices=OWNER_STATUSES,
                    help="what OUR research verifies about the owner (never SmartSkip's flag)")
     w.add_argument("--status-proof", default="", help="the source that verifies it")
+    w.add_argument("--confidence", choices=CONFIDENCE_LEVELS,
+                   help="how sure the research is (needed for dead/alive)")
     w.add_argument("--repost", action="store_true")
     w.add_argument("--commit", action="store_true", help="actually write and bill Trestle")
     p = sub.add_parser("promote", help="old-rule records only: board relatives -> phone list")
@@ -637,7 +648,8 @@ def main(argv: list[str] | None = None) -> int:
         if a.decedent and a.owner_status != "dead":
             raise SystemExit("--decedent needs --owner-status dead (research-verified)")
         plan = build_plan(rec, a.primary, _overrides(a.relationship), subject_deceased=a.decedent)
-        line = owner_status_line(a.owner_status, a.status_proof, plan["subject"])
+        line = owner_status_line(a.owner_status, a.status_proof, plan["subject"],
+                                 confidence=a.confidence or "")
         n = (sum(len(p["phones"]) for p in plan["primary"])
              + sum(len(b["phone_list"]) for b in plan["board"]))
         print(f"PHONE LIST: {n} numbers, all Trestle scored (about ${n * 0.015:.2f}). Call first:",

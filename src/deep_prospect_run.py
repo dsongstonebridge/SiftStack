@@ -20,7 +20,7 @@
     python src/deep_prospect_run.py charge --run output/deep_prospect/123-main-st
     python src/deep_prospect_run.py finish --run output/deep_prospect/123-main-st \
         --primary "Susan Smith" --relationship "Susan Smith=Daughter" \
-        --owner-status dead --status-proof "obituary (Ninde) names Susan as daughter" \
+        --owner-status dead --confidence high --status-proof "obituary (Ninde) names Susan as daughter" \
         --basis "Mary died 2026-08-02 (Legacy, Ninde Funeral Home); widowed; Susan is PR" --commit
 
 Rules (Jeff, 2026-10-16): SmartSkip only on records he names for deep
@@ -335,6 +335,9 @@ def cmd_charge(a) -> int:
     oj = run / "obituary_check.json"
     if oj.exists():
         known = json.loads(oj.read_text(encoding="utf-8")).get("known") or []
+    findings = owner_profile.identity_findings(rec, home_state=state.get("state") or "OK")
+    state["identity"] = findings
+    _save(run, state)
     flags = owner_profile.identity_after_smartskip(rec, known, home_state=state.get("state") or "OK")
     block = "\n== Identity check (after SmartSkip)\n" + "\n".join(f"- {f}" for f in flags) + "\n"
     pt = run / "owner_profile.txt"
@@ -343,6 +346,10 @@ def cmd_charge(a) -> int:
     elif not pt.exists():
         pt.write_text(block.lstrip(), encoding="utf-8")
     print(block)
+    if any(f["level"] == "strong" for f in findings):
+        # Likely two people merged: Jeff decides before anything is scored (2026-10-28).
+        print("STOP: SmartSkip likely merged two people. Ask Jeff before finish, then pass his "
+              "decision as --mixup-call \"...\".")
     print(f"\nNext: read obituary_check.txt and owner_profile.txt, decide the primary, then\n"
           f"python src/deep_prospect_run.py finish --run {run.as_posix()} --primary ... --basis \"...\"")
     return 0
@@ -355,7 +362,7 @@ def research_pack(state: dict, plan: dict, obits: dict, basis: str, phone_tags: 
                   status_line: str = "", profile: str = "") -> str:
     lines = [f"# Deep Prospecting: {state['street']}, {state['city']} {state['state']}", ""]
     if status_line:
-        lines += [f"**{status_line}**", ""]
+        lines += [f"**{ln}**" for ln in status_line.splitlines()] + [""]
     lines += [f"Prepared {date.today().isoformat()}. Searched: **{state['searched']}** "
              f"(at the {state['searched_at']} address).", "",
              "## Who to call first", "", basis or "(no basis given)", ""]
@@ -441,8 +448,20 @@ def cmd_finish(a) -> int:
                          "obituary confirmed against known family or a filing. Otherwise the owner "
                          "is unverified and nobody is an heir yet.")
     status_line = dps.owner_status_line(status, getattr(a, "status_proof", ""),
-                                        state["searched"], obits=obits)
+                                        state["searched"], obits=obits,
+                                        confidence=getattr(a, "confidence", None) or "")
     rec = dps.pick_record(smartskip_parse.parse(str(run / state["export"])), None)
+    # A likely mix-up (owner shares a number with a same-name person in another
+    # state) waits for Jeff's call; a maybe is only noted (Jeff, 2026-10-28).
+    findings = owner_profile.identity_findings(rec, home_state=state.get("state") or "OK")
+    call = (getattr(a, "mixup_call", None) or "").strip()
+    if any(f["level"] == "strong" for f in findings) and not call:
+        raise SystemExit("SmartSkip likely merged two people:\n  "
+                         + "\n  ".join(f["text"] for f in findings if f["level"] == "strong")
+                         + "\nAsk Jeff, then re-run with --mixup-call \"<his decision>\".")
+    note = owner_profile.mixup_note(findings, call)
+    if note:
+        status_line = f"{status_line}\n{note}"
     # The SmartSkip row carries the property address we sent; the DataSift
     # record is resolved from the run's own address so the two cannot drift.
     rec.update(property_address=state["street"], property_city=state["city"],
@@ -529,6 +548,10 @@ def main(argv=None) -> int:
                         "a filing; SmartSkip's deceased flag never counts (2026-10-27)")
     f.add_argument("--status-proof", default="",
                    help="the source that verifies it (required for dead/alive)")
+    f.add_argument("--confidence", choices=dps.CONFIDENCE_LEVELS,
+                   help="how sure the research is that the owner is dead/alive (needed for those)")
+    f.add_argument("--mixup-call",
+                   help="Jeff's decision when charge said SmartSkip likely merged two people")
     f.add_argument("--decedent", action="store_true",
                    help="the obituary or probate filing CONFIRMS the searched person died: "
                         "label them Decedent, not Owner (always true on a probate search)")

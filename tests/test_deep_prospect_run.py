@@ -152,7 +152,7 @@ def finish(commit, repost=False):
     return run.cmd_finish(argparse.Namespace(
         run=str(tmp), primary=["Susan Smith"], relationship=["Susan Smith=Daughter"],
         basis="Robert died Aug 2 2026 (obituary); widowed; Susan is the daughter and PR",
-        decedent=True, repost=repost, commit=commit, owner_status="dead",
+        decedent=True, repost=repost, commit=commit, owner_status="dead", confidence="high",
         status_proof="probate PB-2026-0001 names Susan Smith as PR"))
 
 
@@ -173,7 +173,7 @@ check("commit: board has the family post and the PDF line",
       any(dps.FAMILY_MARKER_V2 in m for m in fake.board)
       and any(run.PDF_MARKER in m for m in fake.board))
 check("commit: BOTH board posts open with the verified owner status (2026-10-27)",
-      len(fake.board) == 2 and all(m.startswith("OWNER STATUS: VERIFIED DEAD - Robert Smith")
+      len(fake.board) == 2 and all(m.startswith("OWNER STATUS: DECEASED (high confidence) - Robert Smith")
                                    for m in fake.board))
 check("commit: confirmed death labels the subject Decedent, not Owner",
       any("Decedent (traced subject)" in m for m in fake.board)
@@ -181,7 +181,7 @@ check("commit: confirmed death labels the subject Decedent, not Owner",
 md = next(p for p in tmp.iterdir() if p.suffix == ".md").read_text(encoding="utf-8")
 check("research pack names the basis and the obituary", "Susan is the daughter" in md and "example.test/obit" in md)
 check("research pack: owner status sits right under the title",
-      md.split("\n")[2].startswith("**OWNER STATUS: VERIFIED DEAD"))
+      md.split("\n")[2].startswith("**OWNER STATUS: DECEASED (high confidence)"))
 check("research pack lists the deceased owner as a board relative", "Robert Smith" in md and "Mark Smith" in md)
 
 n_board, n_up = len(fake.board), len(fake.uploads)
@@ -253,17 +253,23 @@ check("dead or alive without a source -> refused",
       and raises(lambda: dps.owner_status_line("alive", "", "J W")))
 check("alive against a CONFIRMED obituary -> refused",
       raises(lambda: dps.owner_status_line("alive", "spoke with him", "J W", obits=_confirmed)))
-check("dead on a CONFIRMED obituary -> VERIFIED DEAD line",
-      dps.owner_status_line("dead", "Legacy obituary names his daughter", "J W", obits=_confirmed)
-      .startswith("OWNER STATUS: VERIFIED DEAD - J W. Proof: Legacy"))
-check("dead on a filing, no obituary -> VERIFIED DEAD line",
-      "VERIFIED DEAD" in dps.owner_status_line("dead", "probate PB-2026-0760", "J W", obits=_probable))
-check("alive with a source -> VERIFIED ALIVE line",
-      dps.owner_status_line("alive", "owner answered Diego's call 10/27", "J W")
-      .startswith("OWNER STATUS: VERIFIED ALIVE - J W"))
+check("dead on a CONFIRMED obituary -> DECEASED line with confidence",
+      dps.owner_status_line("dead", "Legacy obituary names his daughter", "J W", obits=_confirmed,
+                            confidence="high")
+      .startswith("OWNER STATUS: DECEASED (high confidence) - J W. Proof: Legacy"))
+check("dead on a filing, no obituary -> DECEASED line",
+      "DECEASED (medium confidence)" in dps.owner_status_line(
+          "dead", "probate PB-2026-0760", "J W", obits=_probable, confidence="medium"))
+check("alive with a source -> LIVING line with confidence",
+      dps.owner_status_line("alive", "owner answered a call 10/27", "J W", confidence="high")
+      .startswith("OWNER STATUS: LIVING (high confidence) - J W"))
+check("dead or alive without a confidence level -> refused",
+      raises(lambda: dps.owner_status_line("alive", "homestead claimed 2026", "J W"))
+      and raises(lambda: dps.owner_status_line("dead", "probate PB-1", "J W", confidence="low")))
 _unv = dps.owner_status_line("unverified", "", "Paul Fenwick", obits=_probable)
-check("unverified -> NOT VERIFIED line that says not to tell anyone the owner died",
-      _unv.startswith("OWNER STATUS: NOT VERIFIED") and "Do not tell anyone the owner died" in _unv)
+check("unverified -> NOT VERIFIED (low confidence) line that says not to tell anyone the owner died",
+      _unv.startswith("OWNER STATUS: NOT VERIFIED (low confidence)")
+      and "Do not tell anyone the owner died" in _unv)
 for flag in ("decedent", "owner_deceased"):
     kw = dict(run=str(tmp), primary=["Susan Smith"], relationship=None, basis="b", repost=False,
               commit=False, owner_status="unverified", status_proof="", decedent=False,
@@ -275,6 +281,36 @@ check("finish without --owner-status -> refused",
       raises(lambda: run.cmd_finish(argparse.Namespace(
           run=str(tmp), primary=["Susan Smith"], relationship=None, basis="b", decedent=False,
           repost=False, commit=False))))
+
+# ── mix-up check (Jeff, 2026-10-28) ──
+_real = run.owner_profile.identity_findings
+_strong = [{"level": "strong", "text": "SmartSkip may have merged the owner with a different "
+                                       "Robert Smith in Boise, ID: they share 208-555-0101."}]
+run.owner_profile.identity_findings = lambda rec, home_state="OK": _strong
+check("likely mix-up and no Jeff's call -> finish refuses before anything is written",
+      raises(lambda: finish(commit=True, repost=True)))
+
+
+def finish_call(call):
+    return run.cmd_finish(argparse.Namespace(
+        run=str(tmp), primary=["Susan Smith"], relationship=["Susan Smith=Daughter"], basis="b",
+        decedent=True, repost=True, commit=True, owner_status="dead", confidence="high",
+        status_proof="probate PB-2026-0001", mixup_call=call))
+
+
+fake.board.clear()
+finish_call("Jeff: go ahead, numbers checked")
+check("likely mix-up with Jeff's call -> both posts carry the note under the owner status",
+      len(fake.board) == 2 and all(m.split("\n")[1].startswith("POSSIBLE MIX-UP (likely): ")
+                                   and "Jeff's call: Jeff: go ahead" in m.split("\n")[1]
+                                   for m in fake.board))
+run.owner_profile.identity_findings = lambda rec, home_state="OK": [
+    {"level": "maybe", "text": "SmartSkip lists a Robert Smith in Boise, ID as a Child."}]
+fake.board.clear()
+finish_call("")
+check("maybe -> no stop, scored as usual, note under the owner status",
+      len(fake.board) == 2 and all("POSSIBLE MIX-UP (maybe): " in m.split("\n")[1] for m in fake.board))
+run.owner_profile.identity_findings = _real
 
 print(f"\n{failures} failure(s)")
 sys.exit(1 if failures else 0)

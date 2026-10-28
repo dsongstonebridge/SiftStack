@@ -1208,6 +1208,30 @@ family by relationship, what is excluded, and why any record scores nothing. The
   (John Webster the owner vs John Webster his son). An exact full name beats an
   initial-only namesake automatically.
 
+**Owner status, confidence and mix-up notes (2026-10-27/28).** Every board post and the PDF
+open with what OUR research says about the owner, never SmartSkip's deceased flag:
+`OWNER STATUS: DECEASED (high|medium confidence)`, `LIVING (high|medium confidence)`, or
+`NOT VERIFIED (low confidence) ... Do not tell anyone the owner died`. `finish` needs
+`--owner-status`, `--status-proof` (never citing SmartSkip), and `--confidence` for
+dead/alive. Dead needs an obituary confirmed against known family, or a filing.
+Underneath, when one applies, goes a mix-up line. It comes from
+`owner_profile.identity_findings()`:
+- **Likely** (the owner shares a number with a same-name person in another state, the
+  John Webster case): `charge` prints STOP. Claude tells Jeff BEFORE any
+  Trestle spend, and `finish` refuses until `--mixup-call "<Jeff's decision>"`, which is
+  printed on the line.
+- **Maybe** (a same-name relative in another state, no shared number): no stop. Scored
+  exactly as usual, with a "worth a second look" note.
+- **Out-of-state numbers or relatives on their own are NEVER flagged** (Jeff, 2026-10-28:
+  real owners and heirs have them all the time, and he does not want to risk losing them).
+  Nothing is blocked, removed or left unscored because of a mix-up flag. Scoring follows
+  the Trestle scope above, unchanged.
+`start` also writes a free owner profile (`owner_profile.txt`: Assessor title, deeds,
+tax-bill mailing, exemptions by year; County Clerk land records; CRM history; web results
+tied to the street, city or known family). The Treasurer is NOT searched (captcha since
+2026-10-27, no paid solve per Jeff). The profile gives a link to check it by hand:
+https://oktaxrolls.com/search/Tulsa
+
 ```bash
 python src/deep_prospect_run.py start  --street "123 Main St" --city Tulsa \
     --search-person "Mary Smith" --search-at property --spouse "John Smith" \

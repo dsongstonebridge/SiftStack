@@ -29,7 +29,7 @@ TOUCH2 = [
     "Hi {first}, I reached out the other day and wasn't sure my text went through. Is {addr} your place? {sender} here.",
     "Hey, sorry to bother you! Did you get my message about {addr}? Just want to make sure I have the right contact. I'm {sender}.",
     "Hi {first}! {sender} again. Sometimes my texts don't go through, so I wanted to try once more. Is {addr} yours?",
-    "Hey {first}, just floating my last text back up in case it got buried. Is {addr} your property? Thanks! {sender}",
+    "Hey {first}, bumping my last message in case it got lost. Is {addr} yours by chance? Thanks! {sender}",
 ]
 TOUCH2_NONAME = [
     "Hi, {sender} here again. I texted the other day about {addr} and wasn't sure it went through. Is this the right contact for that property?",
@@ -65,6 +65,20 @@ POOLS = [
     (TOUCH4, TOUCH4_NONAME),
 ]
 
+# Retired wordings, kept ONLY so the touch history still recognises texts
+# already sent with them (an unrecognised touch is sent again). Never sent.
+# 2026-10-28 (Jeff): touch 2 "floating" was spam-blocked 3 of 3 on 10/27, and
+# "a local buyer" came out of every wording (blocked 2 of 2 on the heir touch 1;
+# the standard texts without it performed well).
+RETIRED = {
+    1: ["Hey {first}, hope your day is going well. I'm {sender}, a local buyer. Do you know who looks after {addr} now?",
+        "Hello! {sender} here, a local buyer. I'm trying to reach whoever takes care of {addr}. Would you know?"],
+    2: ["Hey {first}, just floating my last text back up in case it got buried. Is {addr} your property? Thanks! {sender}"],
+    3: ["Hi {first}, I'm {sender}, a local buyer here in {city}. If your family ever wanted to sell {addr} as it sits, would you want a number on it?",
+        "Hi, {sender} here. I'm a local buyer in {city}. If {addr} is ever something your family wants to sell as is, would a number be useful?"],
+}
+
+
 # ---------------------------------------------------------------------------
 # HEIR TOUCHES. The owner pools above ask "is {addr} yours?", which is the wrong
 # question for a relative: the person we are texting is NOT the owner of record,
@@ -88,11 +102,11 @@ HEIR_TOUCH1 = [
     "Hi {first}, I'm {sender} and I know this is out of the blue. Does your family still look after the place on {addr}?",
     "Hey {first}, I hope you're doing well! I'm {sender}. I'm trying to reach whoever takes care of {addr} now. Is that you?",
     "Hi {first}! {sender} here. I'm asking around about {addr} and your name came up. Are you connected to that one?",
-    "Hey {first}, hope your day is going well. I'm {sender}, a local buyer. Do you know who looks after {addr} now?",
+    "Hey {first}, hope your day is going well. I'm {sender}. Do you know who looks after {addr} now?",
 ]
 HEIR_TOUCH1_NONAME = [
     "Hi there! My name is {sender}. I'm trying to find who looks after {addr} these days. Am I anywhere close with this number?",
-    "Hello! {sender} here, a local buyer. I'm trying to reach whoever takes care of {addr}. Would you know?",
+    "Hello! {sender} here. I'm trying to reach whoever takes care of {addr}. Would you know?",
 ]
 HEIR_TOUCH2 = [
     "Hi {first}, I sent a note the other day and wasn't sure it went through. Do you know who handles {addr} now? {sender} here.",
@@ -105,12 +119,12 @@ HEIR_TOUCH2_NONAME = [
     "Hello! Trying once more in case my text didn't land. Who would I talk to about {addr}? Thanks! {sender}",
 ]
 HEIR_TOUCH3 = [
-    "Hi {first}, I'm {sender}, a local buyer here in {city}. If your family ever wanted to sell {addr} as it sits, would you want a number on it?",
+    "Hi {first}, {sender} here in {city}. If your family ever wanted to sell {addr} as it sits, would you want a number on it?",
     "Hey {first}! {sender} here. I buy houses around {city} and I'd take {addr} exactly as it is, nothing to fix or clean out. Worth a quick chat?",
     "Hi {first}, {sender} again. If {addr} is ever something the family wants to move on, I can make it simple. Would that be worth talking about?",
 ]
 HEIR_TOUCH3_NONAME = [
-    "Hi, {sender} here. I'm a local buyer in {city}. If {addr} is ever something your family wants to sell as is, would a number be useful?",
+    "Hi, {sender} here in {city}. If {addr} is ever something your family wants to sell as is, would a number be useful?",
     "Hello! I buy houses around {city} as they sit. If {addr} ever comes up, would you want me to take a look? {sender}",
 ]
 HEIR_TOUCH4 = [
@@ -369,13 +383,13 @@ def render_deal(touch: int, seed: str, who: str, city: str, road: str,
 # no link, no zip, one question mark, under 320 characters.
 WHO = [
     "Hi {first}! It's {sender}. Sorry for the random text! I'm with a small local team here in {place} that buys a few houses a year, and I came across {addr}. Would you ever consider an offer on it?",
-    "Hey {first}, {sender} here. I should have led with that! I'm a local buyer around {place} and {addr} is one that caught my eye. Have you ever thought about selling it?",
+    "Hey {first}, {sender} here. I should have led with that! I buy houses around {place} and {addr} is one that caught my eye. Have you ever thought about selling it?",
     "Hi {first}! {sender} here, and fair question. I'm part of a small local team that buys homes here in {place}. I saw {addr} and figured I would ask. Is it something you would ever sell?",
     "Hey {first}, it's {sender}. Sorry, I know that came out of the blue! I buy a few houses around {place} each year and {addr} stood out to me. Would you be open to an offer on it?",
 ]
 WHO_NONAME = [
     "Hi! It's {sender}. Sorry for the random text! I'm with a small local team here in {place} that buys a few houses a year, and I came across {addr}. Would you ever consider an offer on it?",
-    "Hey, {sender} here. I should have led with that! I'm a local buyer around {place}, and {addr} is one that caught my eye. Have you ever thought about selling it?",
+    "Hey, {sender} here. I should have led with that! I buy houses around {place}, and {addr} is one that caught my eye. Have you ever thought about selling it?",
 ]
 
 

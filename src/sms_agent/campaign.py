@@ -129,6 +129,9 @@ def _fingerprints() -> dict[int, list[str]]:
     # Heir copy too (2026-10-26): deep-prospected relatives get it, and a
     # touch the history cannot recognise is a touch 1 sent again forever.
     pools = list(enumerate(touches.POOLS, start=1)) + list(enumerate(touches.HEIR_POOLS, start=1))
+    # Retired wordings: never sent again, but texts already sent with them
+    # must still count as their touch.
+    pools += [(t, (tmpls, [])) for t, tmpls in getattr(touches, "RETIRED", {}).items()]
     for touch, (pool, noname) in pools:
         marks = out.setdefault(touch, [])
         for template in list(pool) + list(noname):

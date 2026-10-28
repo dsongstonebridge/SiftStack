@@ -52,7 +52,7 @@ TOUCH2 = [
     "Hi {first}, I reached out the other day and wasn't sure my text went through. Is {addr} your place? {sender} here.",
     "Hey, sorry to bother you! Did you get my message about {addr}? Just want to make sure I have the right contact. I'm {sender}.",
     "Hi {first}! {sender} again. Sometimes my texts don't go through, so I wanted to try once more. Is {addr} yours?",
-    "Hey {first}, just floating my last text back up in case it got buried. Is {addr} your property? Thanks! {sender}",
+    "Hey {first}, bumping my last message in case it got lost. Is {addr} yours by chance? Thanks! {sender}",
 ]
 TOUCH2_NONAME = [
     "Hi, {sender} here again. I texted the other day about {addr} and wasn't sure it went through. Is this the right contact for that property?",

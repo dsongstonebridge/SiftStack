@@ -98,6 +98,35 @@ SKIP_PHONE_STATUSES = {"DNC", "CORRECT_DNC", "WRONG_DNC", "WRONG", "DEAD"}
 STOP_LEAD_STATUSES = {"not interested", "dead", "dead lead", "wrong number", "do not contact",
                       "dnc", "sold", "under contract", "closed"}
 
+# Jeff, 2026-10-29: Tong (11611 N 109th East Pl) was queued for a touch 1 while
+# his lead status was "Mail Only- DNC or Failed DP". The exact-match set above
+# never matched that custom status, and the build never looked at lead status
+# at all, so only a preset's own exclusions stood between him and a text. Any
+# status that SAYS mail only / DNC / do not contact now blocks, however the
+# account words it.
+STOP_LEAD_WORDS = ("mail only", "do not", "not interested", "dead")
+
+
+def lead_status_name(status) -> str:
+    """A record's lead status as plain text (it arrives as a string or a dict)."""
+    if isinstance(status, dict):
+        status = status.get("title") or status.get("name") or status.get("value") or ""
+    return str(status or "").strip()
+
+
+def lead_status_blocks(status) -> bool:
+    """True when the lead status means: never text this record."""
+    s = lead_status_name(status).lower().replace("_", " ")
+    if not s:
+        return False
+    if s in STOP_LEAD_STATUSES:
+        return True
+    if any(w in s for w in STOP_LEAD_WORDS):
+        return True
+    # "dnc" as its own word ("Mail Only- DNC or Failed DP"), split without regex.
+    words = "".join(c if c.isalnum() else " " for c in s).split()
+    return "dnc" in words
+
 # Only the two tiers Trestle scored as most likely to reach the owner.
 ALLOWED_DIAL_TIERS = {"Dial First", "Dial Second"}
 
@@ -151,11 +180,11 @@ def phone_still_textable(record_uuid: str, phone: str) -> tuple[Optional[bool], 
         return False, f"number now marked {status}"
     # Jeff 2026-10-08: the record's LEAD status too, read from the same fresh copy.
     # A lead moved to not interested / sold / under contract since the build must not get a text.
-    rec = crm.get_record(record_uuid) or {}
-    lead = rec.get("status")
-    lead = (lead.get("title") or lead.get("name") or "") if isinstance(lead, dict) else (lead or "")
-    if str(lead).strip().lower().replace("_", " ") in STOP_LEAD_STATUSES:
-        return False, f"lead status now {lead}"
+    rec = crm.get_record(record_uuid)
+    if rec is None:
+        return None, "could not re-read the record's lead status"
+    if lead_status_blocks(rec.get("status")):
+        return False, f"lead status now {lead_status_name(rec.get('status'))}"
     if config.CORRECT_NUMBER_FIRST:
         verdict = _correct_number_verdict(record_uuid, phone, obj)
         if verdict is not None:
@@ -650,6 +679,13 @@ def from_preset(title: str, limit: int = 0, keep_unresolved: bool = False,
     for rec in cohort:
         phone = rec.get("phone") if isinstance(rec.get("phone"), dict) else {}
         number = store.clean_phone(phone.get("number") or "")
+
+        # Jeff 2026-10-29: a Mail Only / DNC / dead lead status never gets a
+        # text, whatever the preset's own filters say. Dropped outright, never
+        # kept for a deeper look.
+        if lead_status_blocks(rec.get("status")):
+            counts["lead status blocks texting"] = counts.get("lead status blocks texting", 0) + 1
+            continue
 
         # The DNC flag lives ONLY on this search row: the full record comes back
         # with the field absent, not false (verified live 2026-08-28). So this

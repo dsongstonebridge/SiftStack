@@ -1856,8 +1856,22 @@ Ready to Call is out of `SMS_AGENT_CAMPAIGN_SOURCES` until Mon 10/12, when calls
 together; restore it in full (no `|continue`) only on Jeff's yes. Daily rule (Jeff): touch N
 yesterday -> N+1 today; never texted -> touch 1 unless he holds that group.
 
+**STANDING RULE (Jeff, 2026-10-29): the agent runs every weekday from 8 AM, or
+from the first moment the PC is awake/used after 8 AM, unless Jeff explicitly
+says not to (pause = `Disable-ScheduledTask`, nothing else).** Never leave it
+off, never wait to be asked. Windows task "SMS agent weekdays" fires
+`src/sms_agent/windows_task.ps1` at 8:00 and every 15 min until 7 PM
+(Mon-Fri), at logon, on unlock and on wake (Power-Troubleshooter event 1).
+The script is a seconds-long idempotent check: weekday 8-19 and no worker
+started today -> stop any older worker, start one detached via WMI (outside
+the task's job object), note it in `logs/sms_agent_task.log`. Why: on 10/29
+the PC woke at 8:34, yesterday's worker (asleep since 6:50 PM) stopped itself,
+and the old single 8 AM run was used up with no worker started. If a session
+finds no worker on a weekday between 8 and 7, start the task
+(`Start-ScheduledTask "SMS agent weekdays"`) and say so.
+
 **Status (2026-10-07): LIVE.** Windows task "SMS agent weekdays" starts
-`cli.py work --loop` at 8:00 (11h limit; it only sends while the PC is awake,
+`cli.py work --loop` at 8:00 (it only sends while the PC is awake,
 and a sleeping PC also delays reply alerts, nothing is lost). Moving it to the
 cloud (~$5-7/mo on Fly) was declined for now. 10/7: 50 queued, 47 sent,
 3 cancelled by a household reply; replies came from 6 numbers on 5 records

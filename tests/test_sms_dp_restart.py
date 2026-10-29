@@ -135,10 +135,12 @@ check("without the limit the old numbers would be in", "9185550100" in
 
 # ---- 3. Correct numbers
 PHONES[0]["status"] = "CORRECT"                     # an OLD number marked Correct
+RECORD["owner"]["primary_phone"] = "9185550100"     # Correct + primary (Jeff 2026-10-29)
 got, why = seed.apply_correct_number({"uuid": REC, "phone": "9185550100"}, set(), only_numbers=new)
 check("only an old Correct number -> held for review", got is None and why == seed.OLD_CORRECT_REASON, why)
 PHONES[0]["status"] = "UNKNOWN"
 PHONES[3]["status"] = "CORRECT"                     # a NEW number marked Correct
+RECORD["owner"]["primary_phone"] = "9185550103"
 crm.activity_log = lambda uuid: []
 got, why = seed.apply_correct_number({"uuid": REC, "phone": "9185550100"}, set(), only_numbers=new)
 check("a new Correct number wins", got is not None and got["phone"] == "9185550103", why)
@@ -213,6 +215,7 @@ except ValueError:
 
 # ---- 9. allow list: an old Correct number no longer blocks a cleared record
 PHONES[0]["status"] = "CORRECT"
+RECORD["owner"]["primary_phone"] = "9185550100"
 config.DP_ALLOW_RECORDS = {REC}
 got, why = seed.apply_correct_number({"uuid": REC, "phone": "9185550100"}, set(), only_numbers=new)
 check("cleared record goes ahead past an old Correct number", got is not None and why == "", why)

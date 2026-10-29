@@ -189,6 +189,9 @@ def phone_still_textable(record_uuid: str, phone: str) -> tuple[Optional[bool], 
         verdict = _correct_number_verdict(record_uuid, phone, obj)
         if verdict is not None:
             return verdict
+        why = correct_spoken_reason(record_uuid, obj, {})
+        if why:
+            return (None if why.startswith("could not") else False), why
     tier = crm.dial_tier(record_uuid, phone)
     if tier not in ALLOWED_DIAL_TIERS:
         return False, f"dial tier now {tier or 'untagged'}"
@@ -498,8 +501,22 @@ def _sticky_for(record_uuid: str) -> set:
 
 
 def correct_phones(rec: dict) -> list[dict]:
+    """The number(s) that make the record a one-number record: marked Correct
+    AND set as the owner's primary phone.
+
+    Jeff, 2026-10-29: Correct alone is not enough. He marks a number Correct
+    but not primary when he is unsure he can reach them on it, or when it is a
+    family member's/associate's correct number rather than the owner's. Only
+    Correct + Primary means he is confident, so only then do the record's
+    other numbers stop. A Correct-but-not-primary number is texted (or not)
+    by the normal rules, alongside every other textable number.
+    """
     owner = rec.get("owner") if isinstance(rec.get("owner"), dict) else {}
-    phones = [p for p in owner.get("phones") or [] if isinstance(p, dict)]
+    primary = store.clean_phone(owner.get("primary_phone") or "")
+    if not primary:
+        return []
+    phones = [p for p in owner.get("phones") or [] if isinstance(p, dict)
+              and store.clean_phone(p.get("number")) == primary]
     out = [p for p in phones if (p.get("status") or "").upper() == "CORRECT"]
     no_answer = [p for p in phones if (p.get("status") or "").upper() == "NO_ANSWER"]
     if no_answer and rec.get("uuid"):
@@ -538,9 +555,9 @@ def correct_dnc_note(row: dict) -> str:
     """Board note for a record skipped because its Correct number is flagged."""
     return (
         "SMS agent: no automated text sent. The number marked Correct on this "
-        "record is flagged do-not-call in DataSift, so the agent will not text "
-        "it, and it does not text the record's other numbers while one is "
-        "marked Correct. Call it, or decide by hand whether to text it."
+        "record (and set as primary) is flagged do-not-call in DataSift, so the "
+        "agent will not text it, and it does not text the record's other "
+        "numbers while one is marked Correct and primary. Call it, or decide by hand whether to text it."
     )
 
 
@@ -760,6 +777,26 @@ def from_preset(title: str, limit: int = 0, keep_unresolved: bool = False,
 _TIER_RANK = {"Dial First": 0, "Dial Second": 1}
 
 
+def correct_spoken_reason(record_uuid: str, p: dict, events_cache: dict) -> str:
+    """For a number marked CORRECT that does NOT narrow the record (not the
+    primary phone; Jeff 2026-10-29): why it must not get a cold text, or "".
+
+    It is texted by the normal rules like any other number, except when we
+    already spoke with whoever answers it (often a relative or associate),
+    where a "is this your house?" touch would read as if nobody remembered the
+    call. An unreadable call log is a skip, never a pass.
+    """
+    if (p.get("status") or "").upper() != "CORRECT" or not config.CORRECT_NUMBER_FIRST:
+        return ""
+    if record_uuid not in events_cache:
+        events_cache[record_uuid] = crm.activity_log(record_uuid)
+    events = events_cache[record_uuid]
+    if events is None:
+        return "could not read the call log / board for a Correct number"
+    spoke = spoken_on(events, store.clean_phone(p.get("number")))
+    return f"already spoke with them on this Correct number: {spoke}" if spoke else ""
+
+
 def all_textable_rows(row: dict, dnc_numbers: set,
                       only_numbers: Optional[frozenset] = None) -> list[dict]:
     """Tulsa fork (config.TEXT_ALL_BEST): one row per qualifying number on the
@@ -771,6 +808,7 @@ def all_textable_rows(row: dict, dnc_numbers: set,
         return []
     owner = rec.get("owner") if isinstance(rec.get("owner"), dict) else {}
     found = []
+    events_cache: dict = {}
     for p in owner.get("phones") or []:
         if not isinstance(p, dict):
             continue
@@ -782,6 +820,8 @@ def all_textable_rows(row: dict, dnc_numbers: set,
         if number in dnc_numbers and not config.IGNORE_DNC_FLAG:
             continue
         if (p.get("status") or "").upper() in SKIP_PHONE_STATUSES:
+            continue
+        if correct_spoken_reason(row.get("uuid") or "", p, events_cache):
             continue
         tier = ""
         for tag in (p.get("tags") or []):

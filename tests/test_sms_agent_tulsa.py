@@ -330,8 +330,13 @@ crm.activity_log = lambda rec: LOGS.get(rec)
 crm.phone_is_dnc = lambda phone: False
 
 
-def _rec(*phones):
-    return {"owner": {"phones": [{"number": n, "status": s, "type": t, "tags": tags}
+def _rec(*phones, primary=None):
+    # The first Correct number is the owner's primary unless told otherwise:
+    # only Correct + Primary narrows a record to one number (Jeff, 2026-10-29).
+    if primary is None:
+        primary = next((n for n, s, t, tags in phones if s == "CORRECT"), "")
+    return {"owner": {"primary_phone": primary,
+                      "phones": [{"number": n, "status": s, "type": t, "tags": tags}
                                  for n, s, t, tags in phones]}}
 
 
@@ -361,6 +366,20 @@ RECS["r-c4"] = _rec(("9185550166", "CORRECT", "MOBILE", ["Dial First"]))
 got, why = seed.apply_correct_number({"uuid": "r-c4", "phone": "9185550166"}, set())
 check("unreadable call log -> held", got is None and "could not read" in why, why)
 
+# Jeff, 2026-10-29: Correct but NOT primary does not narrow the record.
+RECS["r-c5"] = _rec(("9185550190", "UNKNOWN", "MOBILE", ["Dial First"]),
+                    ("9185550191", "CORRECT", "MOBILE", ["Dial First"]),
+                    primary="9185550190")
+row = {"uuid": "r-c5", "phone": "9185550190"}
+got, why = seed.apply_correct_number(row, set())
+check("Correct but not primary -> row unchanged, other numbers keep texting", got is row, str((got, why)))
+RECS["r-c6"] = _rec(("9185550192", "UNKNOWN", "MOBILE", ["Dial First"]),
+                    ("9185550193", "CORRECT", "MOBILE", ["Dial First"]),
+                    primary="")
+row = {"uuid": "r-c6", "phone": "9185550192"}
+got, why = seed.apply_correct_number(row, set())
+check("Correct with no primary set -> row unchanged", got is row, str((got, why)))
+
 # Send time: phone_still_textable on the same rules.
 crm.find_phone_object = lambda rec, phone, fresh=False: (
     "own", next((p for p in (RECS.get(rec) or {}).get("owner", {}).get("phones", [])
@@ -377,6 +396,23 @@ check("send-time: spoke since queueing -> cancelled", ok is False and "spoke" in
 LOGS.pop("r-c1")
 ok, why = seed.phone_still_textable("r-c1", "9185550162")
 check("send-time: call log unreadable -> held", ok is None, why)
+LOGS["r-c5"] = []
+ok, why = seed.phone_still_textable("r-c5", "9185550190")
+check("send-time: Correct-not-primary elsewhere -> this number still sent", ok is True, why)
+ok, why = seed.phone_still_textable("r-c5", "9185550191")
+check("send-time: Correct-not-primary number itself, not spoken -> sent", ok is True, why)
+LOGS["r-c5"] = [_call("9185550191", "2026-10-20 15:00:00"),
+                _note("talked to his son, call back", "2026-10-20 15:05:00")]
+ok, why = seed.phone_still_textable("r-c5", "9185550191")
+check("send-time: spoke on Correct-not-primary number -> cancelled", ok is False and "spoke" in why, why)
+ok, why = seed.phone_still_textable("r-c5", "9185550190")
+check("send-time: ...but the record's other number still sent", ok is True, why)
+rows_x = seed.all_textable_rows({"uuid": "r-c5", "phone": "9185550190"}, set())
+check("build: spoken Correct-not-primary number left out, other kept",
+      [r["phone"] for r in rows_x] == ["9185550190"], str([r["phone"] for r in rows_x]))
+LOGS.pop("r-c5")
+ok, why = seed.phone_still_textable("r-c5", "9185550191")
+check("send-time: Correct-not-primary, call log unreadable -> held", ok is None, why)
 config.CORRECT_NUMBER_FIRST = False
 
 # ---- a do-not-call flag skips that NUMBER, not the record (2026-10-05)
@@ -638,7 +674,7 @@ check("Correct then Wrong is not Correct", "9185550402" not in sticky)
 check("plain No Answer is not Correct", "9185550403" not in sticky)
 seed.crm.activity_log = lambda u: EV
 seed._sticky_cache.clear()
-rec = {"uuid": "r-sticky", "owner": {"phones": [
+rec = {"uuid": "r-sticky", "owner": {"primary_phone": "9185550401", "phones": [
     {"number": "9185550401", "status": "NO_ANSWER"}, {"number": "9185550403", "status": "NO_ANSWER"}]}}
 check("correct_phones keeps the Correct-then-No-Answer number",
       [p["number"] for p in seed.correct_phones(rec)] == ["9185550401"])

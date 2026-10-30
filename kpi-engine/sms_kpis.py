@@ -231,6 +231,65 @@ def crm_outcomes(reply_times: dict, records: dict, day_from: str, day_to: str) -
             "confirmed": sorted(rec_hash(u) for u in confirmed)}
 
 
+# ---------------------------------------------------------------- contacts
+def contact_role(rec: dict, events: list, phone: str) -> str | None:
+    """'rpc' / 'secondary' / None for a person reached on `phone` (Jeff, 2026-10-30):
+    right-party contact = the number is Correct AND the owner's primary phone; Correct
+    but not primary = secondary contact (relative / secondary decision maker); not
+    Correct = neither. Phone tags don't matter. Read when the KPIs are worked out,
+    i.e. right before the post.
+
+    DataSift lets a "No Answer" call disposition overwrite a Correct status, so a
+    number now NO_ANSWER whose last other status in the record's log was Correct is
+    still Correct (same rule as the SMS agent's sticky Correct)."""
+    import pull_kpis as pk
+    owner = rec.get("owner") if isinstance(rec.get("owner"), dict) else {}
+    phone = _phone(phone)
+    status = ""
+    for p in owner.get("phones") or []:
+        if isinstance(p, dict) and _phone(p.get("number")) == phone:
+            status = str(p.get("status") or "").upper()
+    if status == "NO_ANSWER":
+        ph_ev = [e for e in events or [] if e.get("event_type") == "owner.phone.status.updated"]
+        idx = pk.detect_new_index(ph_ev, "phone")
+        last = ""
+        for e in sorted(ph_ev, key=lambda e: e.get("timestamp", "")):
+            if _phone(((e.get("payload") or {}).get("owner") or {}).get("phone")) == phone:
+                st = str(pk.new_status(e, "phone", idx) or "").upper()
+                if st and st != "NO_ANSWER":
+                    last = st
+        status = last or status
+    if status not in pk.CORRECT_STATES:
+        return None
+    return "rpc" if _phone(owner.get("primary_phone")) == phone else "secondary"
+
+
+def text_contacts(reply_phones: set, records: dict) -> dict:
+    """Hashed record ids reached by a text reply in the period, split rpc / secondary."""
+    import pull_kpis as pk
+    token = pk.get_token()
+    out = {"rpc": set(), "secondary": set()}
+    by_rec = defaultdict(set)
+    for ph in reply_phones:
+        if records.get(ph):
+            by_rec[records[ph]].add(ph)
+    for uuid, phones in by_rec.items():
+        try:
+            rec = pk.req(token, f"/api/internal/property/{uuid}/")
+            if uuid not in _LOG_CACHE:
+                _LOG_CACHE[uuid] = pk.get_logs(token, uuid)
+        except urllib.error.HTTPError as e:
+            if e.code == 404:            # record deleted since
+                continue
+            raise
+        roles = {contact_role(rec, _LOG_CACHE[uuid], ph) for ph in phones}
+        if "rpc" in roles:
+            out["rpc"].add(rec_hash(uuid))
+        elif "secondary" in roles:
+            out["secondary"].add(rec_hash(uuid))
+    return {k: sorted(v) for k, v in out.items()}
+
+
 # ---------------------------------------------------------------- the numbers
 def compute(day_from: str, day_to: str, log_rows: list[dict], agent: dict | None,
             calls: list[dict] | None = None) -> dict:
@@ -417,6 +476,9 @@ def compute(day_from: str, day_to: str, log_rows: list[dict], agent: dict | None
         s["correct_from_texts"] = crm["correct"]
         s["confirmed_records"] = crm["confirmed"]
         s["text_confirmed"] = len(crm["confirmed"])
+        # people who replied in the period, judged Correct + primary right now
+        tc = text_contacts(repliers, agent["records"])
+        s["text_rpc_records"], s["text_secondary_records"] = tc["rpc"], tc["secondary"]
     except SystemExit as e:          # pull_kpis exits on a missing / rejected key
         s["notes"].append(f"DataSift not read ({e}): leads and Correct numbers from texts left out")
     except Exception as e:

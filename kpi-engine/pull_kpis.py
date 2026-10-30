@@ -564,6 +564,7 @@ def pull(token: str, day_from: str, day_to: str, tz, bench: dict) -> dict:
                             # tenant...). Still a real conversation: Jeff, 2026-10-02, after
                             # a 7-minute "Wrong Number" call went uncounted.
                             bump(email, day, "non_owner_talks")
+                            rpc_cands.add((uuid, num))
                         else:
                             bump(email, day, "voicemails")
                             continue
@@ -717,7 +718,7 @@ def pull(token: str, day_from: str, day_to: str, tz, bench: dict) -> dict:
             "marked_wrong": set().union(*wrong_by_rec.values()) if wrong_by_rec else set(),
             "records_detail": details, "live_pickups": live_pickups, "rpc_cands": rpc_cands,
             "correct_marked": correct_marked, "status_contacts": status_contacts,
-            "dial_span": dial_span, "known_records": set(rec_events)}
+            "dial_span": dial_span, "known_records": set(rec_events), "rec_logs": rec_all}
 
 
 # ---- smrtPhone: the call log is the source of truth for talk time ----
@@ -834,14 +835,12 @@ def add_smrtphone(res: dict, day_from: str, day_to: str, bench: dict) -> None:
         noted = kind == "owner" and any((u, c["day"]) in res.get("outcome_days", set()) for u in recs)
         if kind:
             res.setdefault("live_pickups", set()).add((_digits10(c["number"]), c["day"]))
-        if kind == "owner":
-            # the owner on the line (or calling us): one right-party contact per record;
-            # a callback from a number on no record counts by its number. Only PROPERTY ids
-            # the pull saw count: smrtPhone's crm link also carries the owner's own id, which
-            # counted every owner twice (2026-10-30 week test: 59 for 37 pickups).
-            prop = recs & res.get("known_records", set())
-            for u in (prop or {"ph:" + _digits10(c["number"])}):
-                res.setdefault("rpc_cands", set()).add((u, _digits10(c["number"])))
+        # Every live pickup / callback is a contact CANDIDATE: finalize() decides from the
+        # number's status whether it was a right-party (Correct + primary) or secondary
+        # (Correct, not primary) contact. Only PROPERTY ids the pull saw count: smrtPhone's
+        # crm link also carries the owner's own id (once counted every owner twice).
+        for u in recs & res.get("known_records", set()):
+            res.setdefault("rpc_cands", set()).add((u, _digits10(c["number"])))
         scopes = [acct, daily.setdefault(c["day"], blank())]
         user = str(c["user"] or "").strip()
         if user and user != "Unassigned":
@@ -1032,28 +1031,6 @@ def text_stats(day_from: str, day_to: str) -> tuple[dict | None, str]:
     return None, got.get("error") or f"the PC sent no text stats for {day_from} to {day_to}"
 
 
-# Relationship phone tags that mean the number is NOT the owner's own (Jeff, 2026-10-30):
-# a spouse counts as reaching the owner, any other relative does not.
-NON_OWNER_TAGS = {"son", "daughter", "grandchild", "relative"}
-
-
-def _non_owner_numbers(token: str, uuid: str) -> set:
-    """Numbers on this record tagged as a relative other than a spouse."""
-    try:
-        rec = req(token, f"/api/internal/property/{uuid}/")
-    except Exception as e:
-        log(f"could not read phone tags on a record ({e}); counting its pickups as the owner")
-        return set()
-    owner = rec.get("owner") if isinstance(rec.get("owner"), dict) else {}
-    out = set()
-    for ph in owner.get("phones") or []:
-        tags = {(t.get("title") if isinstance(t, dict) else str(t)).strip().lower()
-                for t in (ph.get("tags") or [])}
-        if tags & NON_OWNER_TAGS:
-            out.add(_digits10(ph.get("number")))
-    return out
-
-
 def finalize(res: dict, token: str, texts: dict | None) -> None:
     """Numbers that need BOTH sources (DataSift + smrtPhone, calls + texts)."""
     acct, daily, per = res["account_totals"], res["daily"], res["callers"]
@@ -1063,34 +1040,38 @@ def finalize(res: dict, token: str, texts: dict | None) -> None:
             for sc in (acct, daily.setdefault(day, blank()), per.setdefault(email, blank())):
                 sc["correct_live"] += 1
 
-    # Right-party contacts: records whose OWNER we reached, each once in the window
+    # Contacts (Jeff, 2026-10-30): a person reached by a pickup / callback is a right-party
+    # contact when that number is Correct AND primary, a secondary contact when Correct but
+    # not primary. Status and primary are read now, right before the post.
     by_rec = defaultdict(set)
     for uuid, num in res.get("rpc_cands", set()):
         by_rec[uuid].add(num)
-    by_call = set()
+    call_rpc, call_sec = set(), set()
     for uuid, nums in by_rec.items():
-        if uuid.startswith("ph:"):
-            by_call.add(uuid)
+        try:
+            rec = req(token, f"/api/internal/property/{uuid}/")
+        except Exception as e:
+            log(f"could not read a reached record ({e}); left out of contacts")
             continue
-        if nums - _non_owner_numbers(token, uuid):
-            by_call.add(uuid)
-    call_h = {sms_kpis.rec_hash(u) if not u.startswith("ph:") else u for u in by_call}
-    text_h = set((texts or {}).get("confirmed_records") or [])
+        roles = {sms_kpis.contact_role(rec, res.get("rec_logs", {}).get(uuid, []), n) for n in nums}
+        if "rpc" in roles:
+            call_rpc.add(sms_kpis.rec_hash(uuid))
+        elif "secondary" in roles:
+            call_sec.add(sms_kpis.rec_hash(uuid))
+    t = texts or {}
+    text_rpc = set(t.get("text_rpc_records") or [])
+    text_sec = set(t.get("text_secondary_records") or [])
+    rpc = call_rpc | text_rpc
+    secondary = (call_sec | text_sec) - rpc        # a record with a right-party contact counts there
     dialed_h = {sms_kpis.rec_hash(u) for u in acct["records"]}
     status_h = {sms_kpis.rec_hash(u) for u in res.get("status_contacts", set())}
-    # records worked = dialed, texted, or where the owner was reached / given an outcome
-    # (an owner confirming today by text on an earlier text is still work on that record)
-    worked = (dialed_h | set((texts or {}).get("texted_records") or []) | status_h
-              | {h for h in call_h | text_h if not h.startswith("ph:")})
+    # records worked = dialed, texted, or reached / given an outcome in the window
+    worked = dialed_h | set(t.get("texted_records") or []) | status_h | rpc | secondary
     res["contact"] = {
-        "rpc": len(call_h | text_h), "by_call": len(call_h - text_h), "by_text": len(text_h - call_h),
-        "both": len(call_h & text_h), "worked": len(worked), "texts_known": texts is not None,
-        "no_record": sum(1 for h in call_h if h.startswith("ph:")),
-        # the rates only count contacts on records worked in the window (a callback on a
-        # record nobody dialed or texted is a contact, but not part of this window's rate)
-        "rpc_worked": len((call_h | text_h) & worked), "status_contacts": len(status_h & worked)}
-    res["_ledger_day"] = {"worked": sorted(worked),
-                          "reached": sorted({h for h in call_h | text_h | status_h if not h.startswith("ph:")})}
+        "rpc": len(rpc), "call": len(call_rpc), "text_only": len(text_rpc - call_rpc),
+        "secondary": len(secondary), "worked": len(worked), "texts_known": texts is not None,
+        "status_contacts": len(status_h)}
+    res["_ledger_day"] = {"worked": sorted(worked), "reached": sorted(rpc | status_h)}
 
 
 def update_ledger(path: Path, res: dict) -> dict:
@@ -1160,17 +1141,19 @@ def slack_lines(res: dict, bench: dict, texts: tuple, note: str = "", ledger: di
               f"• Wrong {a['wrong_numbers']} · Dead {a['dead_numbers']} · DNC {a['dnc_numbers']} _(numbers newly marked {when})_"]
     ct = res.get("contact") or {}
     if ct:
-        lines += ["", "*CONTACT*",
-                  f"• Right-party contacts: *{ct['rpc']}* _(owners actually reached, each counted once: the owner "
-                  f"picked up or called us, or confirmed by text; a spouse counts, other relatives don't)_",
-                  f"    by call {ct['by_call']} · by text {ct['by_text']} · both {ct['both']}"
-                  + (f" · {ct['no_record']} of the calls from a number on no record" if ct.get("no_record") else "")
-                  + ("" if ct["texts_known"] else " · _texts not included_"),
-                  f"• Contact rate: *{pct(ct['rpc_worked'], ct['worked'])}* _(records worked where we reached the "
-                  f"owner: {ct['rpc_worked']} of {ct['worked']} records dialed, texted or reached)_",
+        span = "this week" if weekly else "today"
+        lines += ["", f"*CONTACT: {'this week (Mon-Fri)' if weekly else 'today only'}*",
+                  f"• Right-party contacts: *{ct['rpc']}* _(people reached {span} on a number marked Correct AND "
+                  f"primary; primary checked right before this post)_",
+                  f"    Call: *{ct['call']}* _(reached by a pickup or callback; includes anyone who also texted)_",
+                  f"    Text only: *{ct['text_only']}* _(reached by text reply only, no call)_"
+                  + ("" if ct["texts_known"] else "  · _texts not available_"),
+                  f"• Secondary contacts: *{ct['secondary']}* _(people reached {span} on a number marked Correct but "
+                  f"NOT primary: relatives or secondary decision makers; not in the contact rate)_",
+                  f"• Contact rate: *{pct(ct['rpc'], ct['worked'])}* _(records worked {span} where we reached a "
+                  f"right-party contact: {ct['rpc']} of {ct['worked']} records dialed, texted or reached {span})_",
                   f"• Contact check: *{pct(ct['status_contacts'], ct['worked'])}* _(records set to a lead status or "
-                  f"Not Interested ÷ records worked: {ct['status_contacts']} of {ct['worked']}; we only set those "
-                  f"after reaching the owner)_"]
+                  f"Not Interested {span} ÷ records worked {span}: {ct['status_contacts']} of {ct['worked']})_"]
         if ledger and weekly:
             w, r = set(ledger["worked"]), set(ledger["reached"]) & set(ledger["worked"])
             lines.append(f"• Records reached over time: *{pct(len(r), len(w))}* _(of every record dialed or texted "

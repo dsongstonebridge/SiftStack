@@ -2085,7 +2085,8 @@ many wake events that are not someone using the PC.
     (a record reached both ways counts under call). A NO_ANSWER status whose last other
     status was Correct stays Correct (`sms_kpis.contact_role`). Only PROPERTY ids count:
     smrtPhone's crm link also carries the owner's id, which once counted every owner twice.
-  - Contact rate = records with a right-party contact / records worked (dialed, texted, or
+  - Records reached out to (top of the post) = records called or texted. Contact rate = right-party
+    contacts / records reached out to (was: records worked = dialed, texted, or
     reached). Contact check (Jeff's cross-check) = records newly set to a lead status or
     Not Interested / records worked.
   - Text confirmed = within 14 days after a text reply, the number was marked Correct (by

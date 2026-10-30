@@ -1066,11 +1066,15 @@ def finalize(res: dict, token: str, texts: dict | None) -> None:
     dialed_h = {sms_kpis.rec_hash(u) for u in acct["records"]}
     status_h = {sms_kpis.rec_hash(u) for u in res.get("status_contacts", set())}
     # records worked = dialed, texted, or reached / given an outcome in the window
-    worked = dialed_h | set(t.get("texted_records") or []) | status_h | rpc | secondary
+    texted_h = set(t.get("texted_records") or [])
+    worked = dialed_h | texted_h | status_h | rpc | secondary
     res["contact"] = {
         "rpc": len(rpc), "call": len(call_rpc), "text_only": len(text_rpc - call_rpc),
         "secondary": len(secondary), "worked": len(worked), "texts_known": texts is not None,
-        "status_contacts": len(status_h)}
+        "status_contacts": len(status_h),
+        # records we reached out to (Jeff, 2026-10-30: the first line of the post)
+        "outreach": len(dialed_h | texted_h), "called": len(dialed_h),
+        "texted_only": len(texted_h - dialed_h)}
     res["_ledger_day"] = {"worked": sorted(worked), "reached": sorted(rpc | status_h)}
 
 
@@ -1112,8 +1116,12 @@ def slack_lines(res: dict, bench: dict, texts: tuple, note: str = "", ledger: di
     period = res["from"] if not weekly else f"week {res['from']} to {res['to']}"
     # caller-days: goals scale with how many people dialed on how many days
     cdays = sum(len(c["days"]) for c in res["callers"].values()) or 1
-    lines = [f"*📞 Prospecting KPIs*  |  {period}" + (f"  |  _{note}_" if note else ""),
-             "", "*CALLS*",
+    lines = [f"*📞 Prospecting KPIs*  |  {period}" + (f"  |  _{note}_" if note else "")]
+    ct0 = res.get("contact") or {}
+    if ct0:
+        lines.append(f"*Records reached out to: {ct0['outreach']}* _(records we called or texted "
+                     f"{'this week' if weekly else 'today'})_" + ("" if ct0["texts_known"] else "  · _texts not available_"))
+    lines += ["", "*CALLS*",
              f"• Dials: *{dials}* _(outbound calls placed)_",
              f"• Dial hours: *{fmt_hms(a['dial_seconds'])}* _(first call to last call, per caller per day)_",
              f"• Voicemail / no answer: *{a['voicemails']}* _(nobody live: dispositioned no answer, busy or dead, "
@@ -1150,10 +1158,10 @@ def slack_lines(res: dict, bench: dict, texts: tuple, note: str = "", ledger: di
                   + ("" if ct["texts_known"] else "  · _texts not available_"),
                   f"• Secondary contacts: *{ct['secondary']}* _(people reached {span} on a number marked Correct but "
                   f"NOT primary: relatives or secondary decision makers; not in the contact rate)_",
-                  f"• Contact rate: *{pct(ct['rpc'], ct['worked'])}* _(records worked {span} where we reached a "
-                  f"right-party contact: {ct['rpc']} of {ct['worked']} records dialed, texted or reached {span})_",
-                  f"• Contact check: *{pct(ct['status_contacts'], ct['worked'])}* _(records set to a lead status or "
-                  f"Not Interested {span} ÷ records worked {span}: {ct['status_contacts']} of {ct['worked']})_"]
+                  f"• Contact rate: *{pct(ct['rpc'], ct['outreach'])}* _(right-party contacts ÷ records reached "
+                  f"out to {span}: {ct['rpc']} of {ct['outreach']})_",
+                  f"• Contact check: *{pct(ct['status_contacts'], ct['outreach'])}* _(records set to a lead status or "
+                  f"Not Interested {span} ÷ records reached out to {span}: {ct['status_contacts']} of {ct['outreach']})_"]
         if ledger and weekly:
             w, r = set(ledger["worked"]), set(ledger["reached"]) & set(ledger["worked"])
             lines.append(f"• Records reached over time: *{pct(len(r), len(w))}* _(of every record dialed or texted "

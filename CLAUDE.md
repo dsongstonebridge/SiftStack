@@ -2062,8 +2062,39 @@ many wake events that are not someone using the PC.
 - Conversation = reached a person AND (1 min+ OR an owner call with a same-day talk note or
   owner-outcome status: Not interested / a lead). This includes wrong-number calls of 1 min+.
 - Slack lines must add up: Reached = owner + inbound callback + someone else (wrong #);
-  Conversations + brief pickups = Reached; 2 min+ is separate. Leads = any lead status incl.
-  New Lead; Qualified = Cold/Warm/Hot. Follow-up tasks = tasks with "follow" in the title.
+  Conversations + brief pickups = Reached; 2 min+ is separate. Qualified = Cold/Warm/Hot.
+  Follow-up tasks = tasks with "follow" in the title.
+- **Leads (Jeff, 2026-10-30) = exactly Lead, New Lead, No Contact New Lead, Nurture New Lead,
+  Cold, Warm, Hot, Ghosting Lead.** Not Interested is NOT a lead. The post breaks leads down
+  by those statuses.
+- **The 2026-10-30 post layout:** every line carries a bracketed description (Jeff: visually
+  clean, extremely clear). Sections CALLS / NUMBERS / CONTACT / LEADS / BY CALLER / TEXTS.
+  Fridays post it twice: the day, and Monday-Friday (`--week-of`, "Weekly summary"), plus the
+  sheet bot's summary. New numbers and their rules:
+  - Call length bands (under 30s / 30-60s / 1-2 min / 2 min+) count LIVE pickups only, so they
+    add up to Reached. Dial hours = first to last dial per caller per day (smrtPhone).
+  - Missed callbacks = inbound calls nobody answered, one per number, and how many we have not
+    called back since.
+  - Correct, all = numbers newly marked that day/week (a number marked earlier is never counted
+    again); Correct, live pickup = of those, a smrtPhone-counted pickup on that number that day.
+  - Right-party contacts = records where the OWNER picked up / called us, or text confirmed;
+    a number tagged Son/Daughter/Grandchild/Relative is not the owner, a spouse is. Only
+    PROPERTY ids count: smrtPhone's crm link also carries the owner's id, which once counted
+    every owner twice (59 contacts for 37 pickups). Callbacks from numbers on no record count
+    as contacts but not in the rate.
+  - Contact rate = records with a right-party contact / records worked (dialed, texted, or
+    reached). Contact check (Jeff's cross-check) = records newly set to a lead status or
+    Not Interested / records worked.
+  - Text confirmed = within 14 days after a text reply, the number was marked Correct (by
+    hand or by the agent) or the record became a lead / Not Interested. Record ids travel
+    from the PC to GitHub only as sha256 hashes (`sms_kpis.rec_hash`).
+  - Reply rate divides by people whose text was DELIVERED. Reply response time = median from a
+    reply to our first call or hand-typed text (opt-outs and wrong numbers left out). Replies
+    that became a call = they called us, or our call ran 1 min+. Sending-number flags are read
+    from the SMS agent's cached NumberVerifier data in its DB, never fetched by the KPI run.
+  - Records reached over time (Friday post) = a hashed ledger in GitHub's Actions cache
+    (`kpi-engine/reports/ledger.json`), started 2026-10-30. Back-filling it to the first
+    calling day means reading every record touched since: needs Jeff's yes.
 - **Audit line (2026-10-02):** every post lists `smrtPhone calls over 2 min not counted:
   time + reason` (or "none") so a miss surfaces the same night. Also a ⚠️ line when
   smrtPhone outbound calls differ from DataSift dials. If smrtPhone login fails the post

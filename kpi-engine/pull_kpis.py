@@ -40,6 +40,8 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import sms_kpis   # text-message section of the post (same folder)
+
 HERE = Path(__file__).resolve().parent
 API = "https://apiv2.reisift.io"
 HEADERS_BASE = {
@@ -63,10 +65,12 @@ DEFAULT_BENCHMARKS = {
     "leads_per_caller_day": [2, 3],
     "leads_per_contract": [15, 20],
     "appointment_take_rate": 0.25,
-    # Leads = any lead status, New Lead included (same set as the sheet's "New Leads").
+    # Leads (Jeff, 2026-10-30): exactly these eight statuses. Not Interested is NOT a lead.
+    # DataSift writes them as lowercase titles in the log ("ghosting lead"), plus the
+    # system slug "new_lead"; matching is case-insensitive.
     # Qualified = Cold, Warm or Hot only (same as the sheet's "New Leads Qualified").
-    "lead_statuses": ["Cold Lead", "Warm Lead", "Hot Lead", "new_lead", "New Lead",
-                      "No Contact New Lead", "Nurture New Lead", "lead"],
+    "lead_statuses": ["Lead", "New Lead", "new_lead", "No Contact New Lead", "Nurture New Lead",
+                      "Cold Lead", "Warm Lead", "Hot Lead", "Ghosting Lead"],
     "qualified_statuses": ["Cold Lead", "Warm Lead", "Hot Lead"],
     "excluded_callers": [],
 }
@@ -363,6 +367,13 @@ def _human_author(ev) -> bool:
     return bool(a) and a != "system" and (ev.get("source") or "") not in ("smrtphone", "api", "system")
 
 
+def length_band(sec: int) -> str:
+    """Which call-length bucket a LIVE pickup falls in (Jeff, 2026-10-30: voicemails are
+    never put in a bucket, so the four always add up to Reached)."""
+    return ("len_lt30" if sec < 30 else "len_30_60" if sec < 60
+            else "len_60_120" if sec < 120 else "len_120p")
+
+
 def blank():
     return {"dials": 0, "answered": 0, "noanswer": 0, "talk_seconds": 0, "sms_sent": 0,
             "sms_received": 0, "conversations": 0, "meaningful_conversations": 0,
@@ -370,7 +381,11 @@ def blank():
             "inbound_owner_talks": 0, "inbound_calls": 0, "correct_numbers": 0, "wrong_numbers": 0,
             "dead_numbers": 0, "dnc_numbers": 0, "leads": 0, "qualified": 0, "not_interested": 0,
             "follow_ups": 0, "appointments": 0, "records": set(), "days": set(),
-            "first_call": None, "last_call": None}
+            "first_call": None, "last_call": None,
+            # call length of LIVE pickups only (voicemails never reach these)
+            "len_lt30": 0, "len_30_60": 0, "len_60_120": 0, "len_120p": 0,
+            "dial_seconds": 0, "correct_live": 0, "missed_callbacks": 0, "missed_not_returned": 0,
+            "leads_by_status": Counter()}
 
 
 def pull(token: str, day_from: str, day_to: str, tz, bench: dict) -> dict:
@@ -490,6 +505,9 @@ def pull(token: str, day_from: str, day_to: str, tz, bench: dict) -> dict:
     names, phone_final, prop_final, seen = {}, {}, {}, set()
     prop_first = {}   # uuid -> (dt, status before the day's first change)
     task_seen = set()
+    live_pickups = set()      # (number, day): a real person picked up that number that day
+    rpc_cands = set()         # (record uuid, number): the OWNER picked up / called us
+    dial_span = {}            # (caller, day) -> [first dial, last dial]
 
     def bump(email, day, field, amt=1):
         acct[field] += amt
@@ -512,6 +530,8 @@ def pull(token: str, day_from: str, day_to: str, tz, bench: dict) -> dict:
                 call = (ev.get("payload") or {}).get("call") or {}
                 if et == "owner.call.made":
                     bump(email, day, "dials")
+                    sp = dial_span.setdefault((email, day), [dt, dt])
+                    sp[0], sp[1] = min(sp[0], dt), max(sp[1], dt)
                     for scope in (acct, per[email]):
                         scope["records"].add(uuid)
                         scope["days"].add(day)
@@ -538,6 +558,7 @@ def pull(token: str, day_from: str, day_to: str, tz, bench: dict) -> dict:
                         num, vm_day = call_number(call), (uuid, day) in vm_note_days
                         if num in correct_by_rec.get(uuid, set()) and not vm_day:
                             bump(email, day, "answered")
+                            rpc_cands.add((uuid, num))
                         elif num in wrong_by_rec.get(uuid, set()) and not vm_day:
                             # A person answered but it was not the owner (relative, new
                             # tenant...). Still a real conversation: Jeff, 2026-10-02, after
@@ -548,7 +569,11 @@ def pull(token: str, day_from: str, day_to: str, tz, bench: dict) -> dict:
                             continue
                     bump(email, day, "reached")
                     if inbound:
+                        num = call_number(call)
                         bump(email, day, "inbound_owner_talks")
+                        rpc_cands.add((uuid, num))
+                    live_pickups.add((num, day))
+                    bump(email, day, length_band(dur))
                     bump(email, day, "talk_seconds", dur)
                     if dur >= mean_s:
                         bump(email, day, "meaningful_conversations")
@@ -595,25 +620,36 @@ def pull(token: str, day_from: str, day_to: str, tz, bench: dict) -> dict:
                 if any(k in title for k in ("appoint", "appt", "meeting", "consult")):
                     bump(author_of(ev)[0], day, "appointments")
 
+    correct_marked = []       # (number, day, caller) for "Correct, live pickup"
     for phone, (dt, ns, email) in phone_final.items():
         day = dt.date().isoformat()
         if ns in CORRECT_STATES:
             bump(email, day, "correct_numbers")
+            correct_marked.append((_digits10(phone), day, email))
         elif ns in WRONG_STATES:
             bump(email, day, "wrong_numbers")
         elif ns == "DEAD":
             bump(email, day, "dead_numbers")
         elif ns == "DNC":
             bump(email, day, "dnc_numbers")
+    status_contacts = set()   # records newly set to a lead status or Not Interested
     for uuid, (dt, ns, email) in prop_final.items():
         day = dt.date().isoformat()
         started = str((prop_first.get(uuid) or (None, ""))[1] or "").lower()
         if ns.lower() in lead_set and started not in lead_set:   # newly became a lead
             bump(email, day, "leads")
+            for scope in (acct, per[email], daily[day]):
+                scope["leads_by_status"][ns.lower()] += 1
+            status_contacts.add(uuid)
+        if ns.lower() in ("not_interested", "not interested"):
+            status_contacts.add(uuid)
         if ns.lower() in qual_set and started not in qual_set:   # newly Cold/Warm/Hot
             bump(email, day, "qualified")
         if ns == "not_interested":
             bump(email, day, "not_interested")
+
+    for (email, day), (first, last) in dial_span.items():
+        bump(email, day, "dial_seconds", int((last - first).total_seconds()))
 
     # Manual additions: real calls DataSift never saw (e.g. an owner calling from a number
     # that wasn't on any record yet). One row per call in manual_calls.csv:
@@ -679,7 +715,9 @@ def pull(token: str, day_from: str, day_to: str, tz, bench: dict) -> dict:
             "vm_note_days": vm_note_days, "num_recs": dict(num_recs), "outcome_days": outcome_days,
             "marked_correct": set().union(*correct_by_rec.values()) if correct_by_rec else set(),
             "marked_wrong": set().union(*wrong_by_rec.values()) if wrong_by_rec else set(),
-            "records_detail": details}
+            "records_detail": details, "live_pickups": live_pickups, "rpc_cands": rpc_cands,
+            "correct_marked": correct_marked, "status_contacts": status_contacts,
+            "dial_span": dial_span, "known_records": set(rec_events)}
 
 
 # ---- smrtPhone: the call log is the source of truth for talk time ----
@@ -689,7 +727,9 @@ def pull(token: str, day_from: str, day_to: str, tz, bench: dict) -> dict:
 # and "Correct numbers" stays exactly what he marked in DataSift.
 CALL_FIELDS = ("talk_seconds", "conversations", "meaningful_conversations", "inbound_calls",
                "non_owner_talks", "band_brief", "band_vm", "answered", "voicemails",
-               "reached", "inbound_owner_talks")
+               "reached", "inbound_owner_talks", "len_lt30", "len_30_60", "len_60_120",
+               "len_120p", "dial_seconds", "missed_callbacks", "missed_not_returned")
+MISSED_STATUSES = ("missed", "no-answer", "no answer", "busy", "canceled", "cancelled", "failed")
 
 
 def _sp_is_talk(c: dict, marked_correct: set, marked_wrong: set,
@@ -743,7 +783,8 @@ def add_smrtphone(res: dict, day_from: str, day_to: str, bench: dict) -> None:
     res["call_source"] = "DataSift only"
     try:
         import smrtphone_calls as sp
-        calls = [c for c in sp.calls_since(day_from) if day_from <= c["day"] <= day_to]
+        all_calls = sp.calls_since(day_from)          # to NOW: shows whether a missed call was returned
+        calls = [c for c in all_calls if day_from <= c["day"] <= day_to]
     except Exception as ex:                              # session expired, network...
         log(f"smrtPhone not used ({ex}); conversations come from DataSift alone")
         res["call_source"] = f"DataSift only - smrtPhone unavailable ({str(ex)[:80]})"
@@ -755,11 +796,23 @@ def add_smrtphone(res: dict, day_from: str, day_to: str, bench: dict) -> None:
             scope[f] = 0
     conv_s, mean_s, vm_s = (bench["conversation_min_seconds"],
                             bench["meaningful_conversation_min_seconds"], bench["voicemail_max_seconds"])
+    # smrtPhone decides who picked up, so the pickups DataSift alone suggested are replaced
+    # (otherwise "Correct, live pickup" could count a call that Reached does not)
+    res["live_pickups"], res["rpc_cands"] = set(), set()
     out_dials = 0
     missed = []                                          # 2 min+ calls left out of "reached"
+    span = {}                                            # (user, day) -> [first, last] dial
+    missed_in = {}                                       # number -> (day, user, earliest missed time)
     for c in calls:
+        user = str(c["user"] or "").strip()
         if c["direction"] == "outbound":
             out_dials += 1
+            sp_ = span.setdefault((user, c["day"]), [c["when"], c["when"]])
+            sp_[0], sp_[1] = min(sp_[0], c["when"]), max(sp_[1], c["when"])
+        elif (c["duration"] <= 0 or str(c["status"]).lower() in MISSED_STATUSES) and _digits10(c["number"]):
+            n = _digits10(c["number"])
+            if n not in missed_in or c["when"] < missed_in[n][2]:
+                missed_in[n] = (c["day"], user, c["when"])
         kind = _sp_is_talk(c, res.get("marked_correct", set()), res.get("marked_wrong", set()),
                            res.get("vm_note_days", set()), res.get("num_recs", {}))
         if c["duration"] >= mean_s and kind in (None, "vm"):
@@ -779,6 +832,16 @@ def add_smrtphone(res: dict, day_from: str, day_to: str, bench: dict) -> None:
         if m:
             recs.add(m.group(0))
         noted = kind == "owner" and any((u, c["day"]) in res.get("outcome_days", set()) for u in recs)
+        if kind:
+            res.setdefault("live_pickups", set()).add((_digits10(c["number"]), c["day"]))
+        if kind == "owner":
+            # the owner on the line (or calling us): one right-party contact per record;
+            # a callback from a number on no record counts by its number. Only PROPERTY ids
+            # the pull saw count: smrtPhone's crm link also carries the owner's own id, which
+            # counted every owner twice (2026-10-30 week test: 59 for 37 pickups).
+            prop = recs & res.get("known_records", set())
+            for u in (prop or {"ph:" + _digits10(c["number"])}):
+                res.setdefault("rpc_cands", set()).add((u, _digits10(c["number"])))
         scopes = [acct, daily.setdefault(c["day"], blank())]
         user = str(c["user"] or "").strip()
         if user and user != "Unassigned":
@@ -802,12 +865,31 @@ def add_smrtphone(res: dict, day_from: str, day_to: str, bench: dict) -> None:
             sc["talk_seconds"] += d
             if d >= mean_s:
                 sc["meaningful_conversations"] += 1
+            sc[length_band(d)] += 1
             if d >= conv_s or noted:
                 sc["conversations"] += 1
             elif d >= vm_s:
                 sc["band_brief"] += 1
             else:
                 sc["band_vm"] += 1
+    # Dial hours: first dial to last dial, per caller per day (a lunch break counts)
+    for (user, day), (first, last) in span.items():
+        secs = int((last - first).total_seconds())
+        scopes = [acct, daily.setdefault(day, blank())]
+        if user and user != "Unassigned":
+            who = by_name.get(user.lower()) or ("sp:" + user)
+            scopes.append(per.setdefault(who, blank()))
+        for sc in scopes:
+            sc["dial_seconds"] += secs
+    # Missed callbacks: someone called us and nobody picked up (one per number). Returned =
+    # we called that number afterwards, or they called again and got through.
+    for n, (day, user, when) in missed_in.items():
+        returned = any(_digits10(c["number"]) == n and c["when"] > when and
+                       (c["direction"] == "outbound" or c["duration"] > 0)
+                       for c in all_calls)
+        for sc in (acct, daily.setdefault(day, blank())):
+            sc["missed_callbacks"] += 1
+            sc["missed_not_returned"] += not returned
     res["call_source"] = "smrtPhone call log + DataSift"
     res["sp_outbound"] = out_dials
     res["sp_missed"] = missed
@@ -930,24 +1012,181 @@ def write_xlsx(res: dict, bench: dict, path: Path) -> bool:
     return True
 
 
-def post_slack(res: dict, webhook: str, bench: dict, note: str = "") -> None:
+def text_stats(day_from: str, day_to: str) -> tuple[dict | None, str]:
+    """(text KPIs for exactly this window, error). In GitHub they arrive from the PC as the
+    workflow's `texts` input (TEXT_KPIS, base64 JSON: a day, plus Monday..day on Fridays);
+    on the PC itself they are worked out here."""
+    got = sms_kpis.from_env_b64(os.environ.get("TEXT_KPIS", ""))
+    if not got and not os.environ.get("GITHUB_ACTIONS"):
+        weekly = day_from != day_to
+        try:
+            got = sms_kpis.build(day_to, weekly, sms_kpis.DB_DEFAULT)
+        except Exception as e:
+            return None, f"{type(e).__name__}: {e}"
+    if not got:
+        return None, "this run was not started from the PC"
+    for key in ("day", "week"):
+        st = got.get(key) or {}
+        if st and (st.get("from"), st.get("to")) == (day_from, day_to):
+            return st, ""
+    return None, got.get("error") or f"the PC sent no text stats for {day_from} to {day_to}"
+
+
+# Relationship phone tags that mean the number is NOT the owner's own (Jeff, 2026-10-30):
+# a spouse counts as reaching the owner, any other relative does not.
+NON_OWNER_TAGS = {"son", "daughter", "grandchild", "relative"}
+
+
+def _non_owner_numbers(token: str, uuid: str) -> set:
+    """Numbers on this record tagged as a relative other than a spouse."""
+    try:
+        rec = req(token, f"/api/internal/property/{uuid}/")
+    except Exception as e:
+        log(f"could not read phone tags on a record ({e}); counting its pickups as the owner")
+        return set()
+    owner = rec.get("owner") if isinstance(rec.get("owner"), dict) else {}
+    out = set()
+    for ph in owner.get("phones") or []:
+        tags = {(t.get("title") if isinstance(t, dict) else str(t)).strip().lower()
+                for t in (ph.get("tags") or [])}
+        if tags & NON_OWNER_TAGS:
+            out.add(_digits10(ph.get("number")))
+    return out
+
+
+def finalize(res: dict, token: str, texts: dict | None) -> None:
+    """Numbers that need BOTH sources (DataSift + smrtPhone, calls + texts)."""
+    acct, daily, per = res["account_totals"], res["daily"], res["callers"]
+    live = res.get("live_pickups", set())
+    for num, day, email in res.get("correct_marked", []):
+        if (num, day) in live:
+            for sc in (acct, daily.setdefault(day, blank()), per.setdefault(email, blank())):
+                sc["correct_live"] += 1
+
+    # Right-party contacts: records whose OWNER we reached, each once in the window
+    by_rec = defaultdict(set)
+    for uuid, num in res.get("rpc_cands", set()):
+        by_rec[uuid].add(num)
+    by_call = set()
+    for uuid, nums in by_rec.items():
+        if uuid.startswith("ph:"):
+            by_call.add(uuid)
+            continue
+        if nums - _non_owner_numbers(token, uuid):
+            by_call.add(uuid)
+    call_h = {sms_kpis.rec_hash(u) if not u.startswith("ph:") else u for u in by_call}
+    text_h = set((texts or {}).get("confirmed_records") or [])
+    dialed_h = {sms_kpis.rec_hash(u) for u in acct["records"]}
+    status_h = {sms_kpis.rec_hash(u) for u in res.get("status_contacts", set())}
+    # records worked = dialed, texted, or where the owner was reached / given an outcome
+    # (an owner confirming today by text on an earlier text is still work on that record)
+    worked = (dialed_h | set((texts or {}).get("texted_records") or []) | status_h
+              | {h for h in call_h | text_h if not h.startswith("ph:")})
+    res["contact"] = {
+        "rpc": len(call_h | text_h), "by_call": len(call_h - text_h), "by_text": len(text_h - call_h),
+        "both": len(call_h & text_h), "worked": len(worked), "texts_known": texts is not None,
+        "no_record": sum(1 for h in call_h if h.startswith("ph:")),
+        # the rates only count contacts on records worked in the window (a callback on a
+        # record nobody dialed or texted is a contact, but not part of this window's rate)
+        "rpc_worked": len((call_h | text_h) & worked), "status_contacts": len(status_h & worked)}
+    res["_ledger_day"] = {"worked": sorted(worked),
+                          "reached": sorted({h for h in call_h | text_h | status_h if not h.startswith("ph:")})}
+
+
+def update_ledger(path: Path, res: dict) -> dict:
+    """Records reached over time: every record worked (dialed or texted) since the ledger
+    began, and which of them we have ever reached. Hashed ids only (GitHub keeps this file
+    in its cache between runs)."""
+    led = {"since": res["from"], "worked": [], "reached": []}
+    if path.exists():
+        try:
+            led = json.loads(path.read_text(encoding="utf-8"))
+        except ValueError:
+            log("ledger unreadable; starting a new one")
+    day = res.get("_ledger_day") or {}
+    led["since"] = min(led.get("since") or res["from"], res["from"])
+    led["worked"] = sorted(set(led.get("worked", [])) | set(day.get("worked", [])))
+    led["reached"] = sorted(set(led.get("reached", [])) | set(day.get("reached", [])))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(led), encoding="utf-8")
+    return led
+
+
+LEAD_ORDER = [("new lead", "New"), ("new_lead", "New"), ("no contact new lead", "No Contact New"),
+              ("nurture new lead", "Nurture"), ("lead", "Lead"), ("cold lead", "Cold"),
+              ("warm lead", "Warm"), ("hot lead", "Hot"), ("ghosting lead", "Ghosting")]
+
+
+def _goal(n: float, lo: float, hi: float | None = None) -> str:
+    """'goal 5 ✅' / 'goal 2-3 ⚠️': met when n reaches the low end."""
+    rng = f"{lo:g}" if hi is None else f"{lo:g}-{hi:g}"
+    return f"goal {rng} {'✅' if n >= lo else '⚠️'}"
+
+
+def slack_lines(res: dict, bench: dict, texts: tuple, note: str = "", ledger: dict | None = None) -> list[str]:
+    """The post: every number with what it means in brackets (Jeff, 2026-10-30)."""
     a = res["account_totals"]
     dials = a["dials"]
-    period = res["from"] if res["from"] == res["to"] else f"{res['from']} to {res['to']}"
-    dpc = f"{dials / a['correct_numbers']:.1f}" if a["correct_numbers"] else "n/a"
-    lines = [
-        f"*📞 Prospecting KPIs — DataSift (KPI Engine)*  |  {period}" + (f"  |  _{note}_" if note else ""),
-        f"• Dials: *{dials}*  |  Voicemail / no answer: {a['voicemails']}",
-        f"• Reached a person: *{a['reached']}*  =  owner {a['answered']}"
-        f"  +  inbound callback {a['inbound_owner_talks']}  +  someone else (wrong #) {a['non_owner_talks']}",
-        f"• Conversations: *{a['conversations']}* (1 min+, or a talk / outcome on the message board)"
-        f"  |  Brief pickups: {a['reached'] - a['conversations']}  |  2 min+: *{a['meaningful_conversations']}*"
-        f"  |  Talk time {fmt_hms(a['talk_seconds'])}",
-        f"• Correct numbers: *{a['correct_numbers']}* ({pct(a['correct_numbers'], dials)})  |  Dials per correct: {dpc}",
-        f"• Wrong {a['wrong_numbers']}  |  Dead {a['dead_numbers']}  |  DNC {a['dnc_numbers']}",
-        f"• Leads: *{a['leads']}*  |  Qualified (Cold/Warm/Hot): *{a['qualified']}*  |  Not interested: {a['not_interested']}  |  Follow-up tasks: {a['follow_ups']}",
-        f"• Texts: {a['sms_sent']} out / {a['sms_received']} in",
-    ]
+    weekly = res["from"] != res["to"]
+    period = res["from"] if not weekly else f"week {res['from']} to {res['to']}"
+    # caller-days: goals scale with how many people dialed on how many days
+    cdays = sum(len(c["days"]) for c in res["callers"].values()) or 1
+    lines = [f"*📞 Prospecting KPIs*  |  {period}" + (f"  |  _{note}_" if note else ""),
+             "", "*CALLS*",
+             f"• Dials: *{dials}* _(outbound calls placed)_",
+             f"• Dial hours: *{fmt_hms(a['dial_seconds'])}* _(first call to last call, per caller per day)_",
+             f"• Voicemail / no answer: *{a['voicemails']}* _(nobody live: dispositioned no answer, busy or dead, "
+             f"or a same-day \"VM / no answer\" note on the record)_",
+             f"• Reached: *{a['reached']}* _(ANYONE live picked up: owner, relative, wrong number or a callback; "
+             f"the voicemails above are already removed)_",
+             f"    owner {a['answered']} · callback {a['inbound_owner_talks']} · someone else / wrong # {a['non_owner_talks']}",
+             f"    Call length, live pickups only: under 30s {a['len_lt30']} · 30-60s {a['len_30_60']} · "
+             f"1-2 min {a['len_60_120']} · 2 min+ {a['len_120p']}",
+             f"• Conversations: *{a['conversations']}* _(a live person for 1 min+, or a talk note / outcome "
+             f"on the record that day)_  ·  {_goal(a['conversations'], 5 * cdays)}",
+             f"• Talk time: *{fmt_hms(a['talk_seconds'])}* _(total time on live calls)_"]
+    if "sp_outbound" in res:
+        lines.append(f"• Missed callbacks: *{a['missed_callbacks']}* _(people who called us and nobody "
+                     f"answered, one per number)_  ·  {a['missed_not_returned']} not called back yet")
+    dpc = dials / a["correct_numbers"] if a["correct_numbers"] else None
+    when = "this week" if weekly else "today"
+    lines += ["", "*NUMBERS*",
+              f"• Correct, all: *{a['correct_numbers']}* _(numbers newly marked Correct {when}; includes ones "
+              f"confirmed by a voicemail greeting; a number marked earlier is never counted again)_",
+              f"• Correct, live pickup: *{a['correct_live']}* _(of those, a real person picked up that number "
+              f"the same day it was marked)_",
+              f"• Dials per Correct: *{f'{dpc:.1f}' if dpc else 'n/a'}* _(dials ÷ Correct, all; lower is better)_  ·  "
+              f"goal 8-10 {'✅' if dpc and dpc <= 10 else '⚠️'}",
+              f"• Wrong {a['wrong_numbers']} · Dead {a['dead_numbers']} · DNC {a['dnc_numbers']} _(numbers newly marked {when})_"]
+    ct = res.get("contact") or {}
+    if ct:
+        lines += ["", "*CONTACT*",
+                  f"• Right-party contacts: *{ct['rpc']}* _(owners actually reached, each counted once: the owner "
+                  f"picked up or called us, or confirmed by text; a spouse counts, other relatives don't)_",
+                  f"    by call {ct['by_call']} · by text {ct['by_text']} · both {ct['both']}"
+                  + (f" · {ct['no_record']} of the calls from a number on no record" if ct.get("no_record") else "")
+                  + ("" if ct["texts_known"] else " · _texts not included_"),
+                  f"• Contact rate: *{pct(ct['rpc_worked'], ct['worked'])}* _(records worked where we reached the "
+                  f"owner: {ct['rpc_worked']} of {ct['worked']} records dialed, texted or reached)_",
+                  f"• Contact check: *{pct(ct['status_contacts'], ct['worked'])}* _(records set to a lead status or "
+                  f"Not Interested ÷ records worked: {ct['status_contacts']} of {ct['worked']}; we only set those "
+                  f"after reaching the owner)_"]
+        if ledger and weekly:
+            w, r = set(ledger["worked"]), set(ledger["reached"]) & set(ledger["worked"])
+            lines.append(f"• Records reached over time: *{pct(len(r), len(w))}* _(of every record dialed or texted "
+                         f"since {ledger['since']}, how many we have ever reached: {len(r)} of {len(w)})_")
+    lo, hi = bench["leads_per_caller_day"]
+    lbs = a["leads_by_status"]
+    labels = []
+    for _, label in LEAD_ORDER:
+        if label not in labels:
+            labels.append(label)
+    parts = [f"{label} {sum(lbs.get(k, 0) for k, lab in LEAD_ORDER if lab == label)}" for label in labels]
+    lines += ["", "*LEADS*",
+              f"• Leads: *{a['leads']}* _(records newly set to New, No Contact New, Nurture, Lead, Cold, Warm, "
+              f"Hot or Ghosting)_  ·  {_goal(a['leads'], lo * cdays, hi * cdays)}",
+              "    " + " · ".join(parts),
+              f"• Not interested: *{a['not_interested']}* _(not a lead)_  ·  Follow-up tasks: {a['follow_ups']}"]
     sp_out = res.get("sp_outbound")
     if sp_out is not None and dials and abs(sp_out - dials) > max(5, 0.05 * dials):
         lines.append(f"• ⚠️ Check: smrtPhone shows {sp_out} outbound calls vs {dials} dials logged in DataSift")
@@ -957,12 +1196,30 @@ def post_slack(res: dict, webhook: str, bench: dict, note: str = "") -> None:
     callers = [(e, c) for e, c in sorted(res["callers"].items(), key=lambda kv: -kv[1]["dials"])
                if any(c[k] for k in ("dials", "correct_numbers", "leads", "not_interested"))]
     if callers:
-        lines.append("*By caller*")
+        lines += ["", "*BY CALLER*"]
         for email, c in callers:
-            floor = bench["dials_floor_per_caller"] * len(c["days"])
-            lines.append(f"• {res['names'].get(email, email)}: {c['dials']} dials, "
-                         f"{c['conversations']} convos, {c['correct_numbers']} correct, "
-                         f"{c['leads']} leads ({c['qualified']} qualified) — dial floor {'MET' if c['dials'] >= floor and floor else 'BELOW'}")
+            if not c["dials"]:       # marked numbers / set statuses but didn't dial: no dial goals
+                lines.append(f"• {res['names'].get(email, email)}: no dials · {c['correct_numbers']} correct "
+                             f"marked · {c['leads']} leads")
+                continue
+            nd = len(c["days"]) or 1
+            floor = bench["dials_floor_per_caller"] * nd
+            lines.append(f"• {res['names'].get(email, email)}: {c['dials']} dials "
+                         f"({'✅' if c['dials'] >= floor else '⚠️'} floor {floor}) · "
+                         f"{c['conversations']} convos ({'✅' if c['conversations'] >= 5 * nd else '⚠️'} goal {5 * nd}) · "
+                         f"{c['correct_numbers']} correct · {c['leads']} leads · {fmt_hms(c['dial_seconds'])} dialing")
+    # Texts: their own section, separate from the call numbers (Jeff, 2026-10-16)
+    lines += ["", f"*💬 TEXTS*  |  {period}"]
+    lines.extend(sms_kpis.render_lines(texts[0], texts[1]))
+    return lines
+
+
+def post_slack(res: dict, webhook: str, bench: dict, note: str = "", texts: tuple = (None, ""),
+               ledger: dict | None = None) -> None:
+    lines = slack_lines(res, bench, texts, note, ledger)
+    if webhook == "print":           # --slack print: show the post, send nothing
+        print("\n".join(lines))
+        return
     r = urllib.request.Request(webhook, data=json.dumps({"text": "\n".join(lines)}).encode(),
                                headers={"content-type": "application/json"}, method="POST")
     with urllib.request.urlopen(r, timeout=15):
@@ -983,6 +1240,10 @@ def main() -> int:
     ap.add_argument("--show-benchmarks", action="store_true")
     ap.add_argument("--note", default="", help="short note added to the Slack header")
     ap.add_argument("--probe", action="store_true", help="write reports/probe.json with raw event samples")
+    ap.add_argument("--ledger", metavar="PATH",
+                    help="records-reached-over-time ledger to update (and show on a weekly post)")
+    ap.add_argument("--week-of", metavar="DATE",
+                    help="the Monday-to-DATE week (the Friday weekly summary)")
     args = ap.parse_args()
 
     bench = load_benchmarks()
@@ -994,6 +1255,10 @@ def main() -> int:
     if args.days:
         day_from = (today - datetime.timedelta(days=args.days - 1)).isoformat()
         day_to = today.isoformat()
+    elif args.week_of:
+        d = datetime.date.fromisoformat(args.week_of)
+        day_from = (d - datetime.timedelta(days=d.weekday())).isoformat()
+        day_to = d.isoformat()
     elif args.day_from:
         day_from, day_to = args.day_from, args.day_to or today.isoformat()
     else:
@@ -1003,6 +1268,9 @@ def main() -> int:
     token = get_token()
     res = pull(token, day_from, day_to, tz, bench)
     add_smrtphone(res, day_from, day_to, bench)
+    texts = text_stats(day_from, day_to)
+    finalize(res, token, texts[0])
+    ledger = update_ledger(Path(args.ledger), res) if args.ledger else None
     md = render_md(res, bench)
     print("\n" + md)
     out_dir = HERE / "reports"
@@ -1031,7 +1299,7 @@ def main() -> int:
                        or _read_env_value(HERE.parent / "kpi-bot" / ".env", "KPI_SLACK_WEBHOOK_URL"))
             if not webhook:
                 sys.exit("--slack auto: no KPI_SLACK_WEBHOOK_URL found in ../kpi-bot/.env")
-        post_slack(res, webhook, bench, args.note)
+        post_slack(res, webhook, bench, args.note, texts, ledger)
     return 0
 
 

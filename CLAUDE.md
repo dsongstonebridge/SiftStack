@@ -2077,11 +2077,14 @@ many wake events that are not someone using the PC.
     called back since.
   - Correct, all = numbers newly marked that day/week (a number marked earlier is never counted
     again); Correct, live pickup = of those, a smrtPhone-counted pickup on that number that day.
-  - Right-party contacts = records where the OWNER picked up / called us, or text confirmed;
-    a number tagged Son/Daughter/Grandchild/Relative is not the owner, a spouse is. Only
-    PROPERTY ids count: smrtPhone's crm link also carries the owner's id, which once counted
-    every owner twice (59 contacts for 37 pickups). Callbacks from numbers on no record count
-    as contacts but not in the rate.
+  - **Right-party contact (Jeff, 2026-10-30, "it is so simple") = a person reached by a
+    pickup, callback or text reply on a number whose status is Correct AND that is the
+    owner's primary phone, read right before the post. Phone tags do NOT matter.** Correct
+    but not primary = secondary contact (relatives / secondary decision makers), its own
+    line, not in the contact rate. Not Correct = neither. Shown as total / call / text only
+    (a record reached both ways counts under call). A NO_ANSWER status whose last other
+    status was Correct stays Correct (`sms_kpis.contact_role`). Only PROPERTY ids count:
+    smrtPhone's crm link also carries the owner's id, which once counted every owner twice.
   - Contact rate = records with a right-party contact / records worked (dialed, texted, or
     reached). Contact check (Jeff's cross-check) = records newly set to a lead status or
     Not Interested / records worked.

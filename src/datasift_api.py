@@ -929,6 +929,12 @@ def post_property_message_board(property_uuid: str, message: str) -> dict:
                      json_body={"message": message})
 
 
+def update_property_message_board(property_uuid: str, message_uuid: str, message: str) -> dict:
+    """Edit ONE post on a PROPERTY's Message Board, by its exact uuid."""
+    return _request("PATCH", f"{CORE_BASE}/api/internal/property/{property_uuid}/message/{message_uuid}/",
+                     json_body={"message": message})
+
+
 def get_property_message_board(property_uuid: str) -> list[dict]:
     """Every post on a PROPERTY's Message Board, newest first. Read-only."""
     body = _request("GET",
@@ -1550,6 +1556,13 @@ def update_owner_address(owner_uuid: str, address: dict, *,
 def upsert_phones(owner_uuid: str, phones: list[dict]) -> dict:
     return _request("POST", f"{CORE_BASE}/api/internal/owner/{owner_uuid}/upsert-phones/",
                      json_body={"phones": phones})
+
+
+def remove_phones(owner_uuid: str, numbers: list[str]) -> dict:
+    """Remove numbers from an owner. Bare strings, unlike upsert_phones (objects 400 "Not a valid string", verified 2026-11-02); the spec does
+    not document this one, so callers MUST read the record back afterwards."""
+    return _request("POST", f"{CORE_BASE}/api/internal/owner/{owner_uuid}/remove-phones/",
+                     json_body={"phones": list(numbers)})
 
 
 def upsert_emails(owner_uuid: str, emails: list[str] | list[dict]) -> dict:

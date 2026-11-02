@@ -1,23 +1,27 @@
-"""Deep prospect one DataSift record, start to finish, in three commands.
+"""Deep prospect DataSift records, start to finish, in three commands.
 
-    1. start   FREE. Reads the record, runs the obituary check and the owner
-               profile (Assessor, Treasurer, LOCCAT, CRM, web, identity), builds the
-               SmartSkip upload and runs SmartSkip's free count. Stops and
-               prints what the charge would be.
-    2. charge  BILLS SmartSkip (~$0.15 per hit, the saved card). Waits for the
-               job and downloads the results.
-    3. finish  Picks nothing on its own: Claude reads the obituary check and the
-               SmartSkip family, then passes --primary (owner, or top heir/PR)
-               and --basis (why). Writes EVERY SmartSkip number to the phone
-               list, all Trestle scored (Jeff, 2026-10-20), a who-is-who
-               Message Board post naming who to call first, the research PDF
-               to the record's Documents tab, and a board line pointing to it.
+    1. batch   FREE. Every record goes in ONE SmartSkip order: reads each record,
+               runs its obituary check and owner profile (Assessor, Treasurer, LOCCAT, CRM, web,
+               identity), builds one upload, runs SmartSkip's free
+               count. Stops and prints what the charge would be. (`start
+               --only-one` is the same thing when there truly is only one.)
+    2. charge  BILLS the SmartSkip BALANCE, once, for the whole order (~$0.15 per
+               row). NEVER the card (Jeff, 2026-11-02): a short balance stops
+               here and leaves the order unpaid. Waits, downloads, and splits
+               the results back into each record's run folder.
+    3. finish  Picks nothing on its own: Claude reads the boards, filing and obituaries,
+               writes the record's dp_research.json, and passes --primary. Our research
+               trumps SmartSkip: it sets the labels and who gets scored, and finish
+               refuses without it. Only Dial First/Second numbers go on the record
+               (Jeff, 2026-11-02); the rest go in one Message Board post, one line per
+               person, and the research PDF in the Documents tab.
                DRY RUN until --commit.
 
-    python src/deep_prospect_run.py start --street "123 Main St" --city Tulsa
-    python src/deep_prospect_run.py start --street "123 Main St" --city Tulsa \
-        --search-person "Mary Smith"           # probate: search the person who DIED
-    python src/deep_prospect_run.py charge --run output/deep_prospect/123-main-st
+    python src/deep_prospect_run.py batch --list records.json
+        # [{"street": "123 Main St", "city": "Tulsa", "search_person": "Mary Smith",
+        #   "spouse": "", "known": []}, ...]   probate: search the person who DIED
+    python src/deep_prospect_run.py start --only-one --street "123 Main St" --city Tulsa
+    python src/deep_prospect_run.py charge --order output/deep_prospect/_orders/<id>
     python src/deep_prospect_run.py finish --run output/deep_prospect/123-main-st \
         --primary "Susan Smith" --relationship "Susan Smith=Daughter" \
         --owner-status dead --confidence high --status-proof "obituary (Ninde) names Susan as daughter" \
@@ -50,15 +54,22 @@ import config
 import datasift_api as _api
 import deep_prospect_smartskip as dps
 import obituary_check
+import dp_board_split as split
 import owner_profile
 import skip_trace_agent as sta
 import smartskip_parse
 
 logger = logging.getLogger(__name__)
 
-RUNS_DIR = Path(config.OUTPUT_DIR) / "deep_prospect"
+# One folder, whichever checkout runs this: the SMS agent holds a record whose run
+# folder it cannot find (2026-11-02: eleven records landed in the wrong checkout).
+RUNS_DIR = Path(os.getenv("SMS_AGENT_DP_RUNS_DIR") or Path(config.OUTPUT_DIR) / "deep_prospect")
 PDF_MARKER = "DEEP PROSPECTING RESEARCH PDF"
 PRICE_PER_HIT = 0.15
+PRICE_CENTS = 15
+ORDERS_DIR = RUNS_DIR / "_orders"
+#: `start --only-one` is refused this soon after another order: that is one batch.
+ONE_ORDER_WINDOW_SECONDS = 3600
 _ENTITY_WORDS = re.compile(r"(?<![A-Z])(TRUST|TTEE|TRUSTEE|LLC|L L C|INC|CORP|COMPANY|LP|LLP|"
                            r"PLLC|FOUNDATION|ESTATE|MINISTRIES|CHURCH|HOLDINGS|PROPERTIES)(?![A-Z])")
 
@@ -212,7 +223,9 @@ def known_family_from_board(owner_uuid: str, property_uuid: str | None = None) -
 
 # ── 1. start (free) ───────────────────────────────────────────────────
 
-def cmd_start(a) -> int:
+def _prepare(a) -> dict | None:
+    """Everything before the SmartSkip order, for one record: resolve it, refuse a
+    repeat, write its input row, run its obituary check. None = skipped, with why printed."""
     uuid, owner_uuid, rec = dps._resolve(a.street, a.city, a.state)
     owner = rec.get("owner") or {}
     person = a.search_person or person_name(owner)
@@ -221,18 +234,19 @@ def cmd_start(a) -> int:
         # searched whole rather than as its last word.
         person = f"{(owner.get('first_name') or '').strip()}|{(owner.get('last_name') or '').strip()}"
     if not person:
-        print(f"SKIPPED: the owner is a business or trust ({owner.get('company') or 'no person name'}). "
-              "SmartSkip is not free for those. Name a person with --search-person to trace them.")
-        return 3
+        print(f"SKIPPED {a.street}: the owner is a business or trust "
+              f"({owner.get('company') or 'no person name'}). SmartSkip is not free for those. "
+              "Name a person with search_person to trace them.")
+        return None
     at_property = bool(a.search_person) or a.search_at == "property"
     run = RUNS_DIR / slug(a.street)
     why = prior_run_reason(run, rec)
     if why and not a.restart:
-        print(f"REFUSED, nothing created or charged: {why}\n"
-              "Only if you really want a second SmartSkip search (a second charge), add --restart.")
-        return 5
+        print(f"REFUSED {a.street}, nothing created or charged: {why}\n"
+              "Only if you really want a second SmartSkip search (a second charge), set restart.")
+        return None
     if why:
-        logger.warning("--restart: %s Opening a NEW SmartSkip order anyway.", why)
+        logger.warning("restart: %s Opening a NEW SmartSkip order anyway.", why)
         old = run / "state.json"
         if old.exists():
             old.rename(run / f"state.replaced-{int(time.time())}.json")
@@ -240,9 +254,9 @@ def cmd_start(a) -> int:
 
     row = build_input_row(person, rec, at_property=at_property)
     if not row["Mailing Address"]:
-        raise SystemExit("no address to search SmartSkip with")
-    inp = run / "smartskip_input.csv"
-    with open(inp, "w", newline="", encoding="utf-8") as fh:
+        print(f"SKIPPED {a.street}: no address to search SmartSkip with")
+        return None
+    with open(run / "smartskip_input.csv", "w", newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=list(row))
         w.writeheader()
         w.writerow(row)
@@ -261,7 +275,7 @@ def cmd_start(a) -> int:
     known = list(a.known or []) + known_family_from_board(owner_uuid, uuid)
     known = [k for k in dict.fromkeys(known) if not obituary_check.name_in(k, obit_name)]
     if not known and not a.spouse:
-        logger.warning("no known family (no probate heirs on the board, no --spouse/--known): "
+        logger.warning("no known family (no probate heirs on the board, no spouse/known): "
                        "obituary matches cannot be checked against survivors")
     obits = obituary_check.check(obit_name, city=row["Property City"] or a.city, state=a.state,
                                  street=row["Property Address"], spouse=a.spouse or "",
@@ -279,39 +293,162 @@ def cmd_start(a) -> int:
     profile_txt = owner_profile.report(profile)
     (run / "owner_profile.txt").write_text(profile_txt, encoding="utf-8")
     print("\n" + profile_txt.encode("ascii", "replace").decode("ascii"))
-
-    ss = _smartskip()
-    entry = ss.submit(ss.Session(), str(inp), {})
-    state = {"street": a.street, "city": a.city, "state": a.state, "property_uuid": uuid,
-             "owner_uuid": owner_uuid, "searched": person, "searched_at":
-             "property" if at_property else "mailing", "bulkSkipId": entry["bulkSkipId"],
-             "billable_rows": entry.get("entities"), "paid": False, "started": date.today().isoformat()}
-    _save(run, state)
     print("\n" + obit_txt.encode("ascii", "replace").decode("ascii"))
-    n = entry.get("entities") or 0
-    print(f"\nSMARTSKIP: {n} billable row(s), at most ${n * PRICE_PER_HIT:.2f} (charged only on a hit). "
-          f"NOTHING CHARGED YET.\nNext: python src/deep_prospect_run.py charge --run {run.as_posix()}")
+    return {"run": run, "row": row,
+            "state": {"street": a.street, "city": a.city, "state": a.state, "property_uuid": uuid,
+                      "owner_uuid": owner_uuid, "searched": person, "searched_at":
+                      "property" if at_property else "mailing", "paid": False,
+                      "started": date.today().isoformat()}}
+
+
+def _open_order(items: list) -> int:
+    """ONE SmartSkip order for every record in `items`, unpaid (Jeff, 2026-11-02)."""
+    ss = _smartskip()           # before the obituary checks: a missing login fails fast
+    prepared = [p for p in (_prepare(a) for a in items) if p]
+    if not prepared:
+        print("Nothing to order.")
+        return 3
+    order_id = f"{date.today().isoformat()}-{int(time.time())}"
+    order = ORDERS_DIR / order_id
+    order.mkdir(parents=True, exist_ok=True)
+    inp = order / "smartskip_input.csv"
+    with open(inp, "w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=list(prepared[0]["row"]))
+        w.writeheader()
+        w.writerows(p["row"] for p in prepared)
+    entry = ss.submit(ss.Session(), str(inp), {})
+    for p in prepared:
+        _save(p["run"], {**p["state"], "bulkSkipId": entry["bulkSkipId"], "order": order_id,
+                         "billable_rows": 1})
+    n = entry.get("entities") or len(prepared)
+    (order / "order.json").write_text(json.dumps(
+        {"bulkSkipId": entry["bulkSkipId"], "rows": n, "paid": False, "created_ts": time.time(),
+         "runs": [str(p["run"]) for p in prepared]}, indent=2), encoding="utf-8")
+    print(f"\nSMARTSKIP: ONE order, {len(prepared)} record(s), {n} billable row(s), at most "
+          f"${n * PRICE_PER_HIT:.2f} from the balance. NOTHING CHARGED YET.\n"
+          f"Next: python src/deep_prospect_run.py charge --order {order.as_posix()}")
     return 0
 
 
-# ── 2. charge (BILLS SmartSkip) ───────────────────────────────────────
+def _recent_order(now: float | None = None) -> str | None:
+    """An order opened within ONE_ORDER_WINDOW_SECONDS, or None."""
+    now = time.time() if now is None else now
+    if not ORDERS_DIR.exists():
+        return None
+    for f in ORDERS_DIR.glob("*/order.json"):
+        if now - json.loads(f.read_text(encoding="utf-8")).get("created_ts", 0) < ONE_ORDER_WINDOW_SECONDS:
+            return f.parent.name
+    return None
+
+
+def cmd_batch(a) -> int:
+    records = json.loads(Path(a.list).read_text(encoding="utf-8"))
+    return _open_order([argparse.Namespace(
+        street=r["street"], city=r.get("city", ""), state=r.get("state", "OK"),
+        search_person=r.get("search_person"), search_at=r.get("search_at", "mailing"),
+        spouse=r.get("spouse"), known=r.get("known"), restart=bool(r.get("restart")))
+        for r in records])
+
+
+def cmd_start(a) -> int:
+    """One record alone, only when there truly is only one (Jeff, 2026-11-02)."""
+    if not a.only_one:
+        print("REFUSED, nothing created or charged: SmartSkip records go in ONE order. Use "
+              "`batch --list records.json`. If there truly is only one, add --only-one.")
+        return 7
+    recent = _recent_order()
+    if recent:
+        print(f"REFUSED, nothing created or charged: order {recent} was opened in the last hour. "
+              "Several singles in a row is a batch: put them in one `batch --list`.")
+        return 7
+    return _open_order([a])
+
+
+# ── 2. charge (BILLS the SmartSkip balance, never the card) ─────
+
+def pay_from_balance(sess, bid: str, rows: int) -> None:
+    """Pay one order from the SmartSkip balance, the same call the web app makes.
+    The body names no card, and there is no fallback: anything but a clean balance
+    payment stops here with the order left unpaid (Jeff, 2026-11-02)."""
+    code, wallet, _ = sess.call("GET", "/wallet/balance")
+    if code != 200:
+        raise SystemExit(f"could not read the SmartSkip balance ({code}). Nothing was charged.")
+    have, need = int(wallet.get("balance") or 0), rows * PRICE_CENTS
+    if have < need:
+        raise SystemExit(f"SMARTSKIP BALANCE TOO LOW: ${have / 100:.2f} on hand, up to ${need / 100:.2f} "
+                         f"needed for {rows} row(s). Nothing was charged and the card was not touched. "
+                         "Top up the balance, then re-run this charge: the order is still open.")
+    logger.warning("BILLED: SmartSkip %d row(s), up to $%.2f, from the balance ($%.2f on hand)",
+                   rows, need / 100, have / 100)
+    code, data, _ = sess.call("POST", "/bulk-skip/payment-intent",
+                              body={"bulkSkipId": bid, "paymentSource": "wallet"})
+    if code not in (200, 201) or not isinstance(data, dict):
+        raise SystemExit(f"balance payment failed ({code}): {data}. The card was not touched.")
+    if data.get("clientSecret") or not (data.get("walletTransactionId") or
+                                        str(data.get("status") or "").lower() in ("succeeded", "paid", "completed")):
+        raise SystemExit(f"balance payment did not go through: {data}. The card was not touched. "
+                         "Check the order at https://app.smartskip.io/bulk-skip before retrying.")
+    _, after, _ = sess.call("GET", "/wallet/balance")
+    print(f"Paid from the balance. status={data.get('status')} balance now "
+          f"${int((after or {}).get('balance') or 0) / 100:.2f}")
+
+
+def _addr_key(street: str, city: str) -> str:
+    return f"{' '.join((street or '').lower().split())}|{(city or '').strip().lower()}"
+
+
+def split_export(export: Path, runs: list) -> list:
+    """Write each run's share of one order's export to its own smartskip_export.csv,
+    matched on the property address and city every row carries. Returns the runs
+    that got nothing; a row no run claims is an error, never silently lost."""
+    with open(export, newline="", encoding="utf-8-sig") as fh:
+        reader = csv.DictReader(fh)
+        fields = reader.fieldnames
+        rows = list(reader)
+    by_key = {}
+    for r in rows:
+        by_key.setdefault(_addr_key(r.get("Property Address"), r.get("Property City")), []).append(r)
+    empty = []
+    for run in runs:
+        row = next(csv.DictReader(open(run / "smartskip_input.csv", newline="", encoding="utf-8")))
+        mine = by_key.pop(_addr_key(row.get("Property Address"), row.get("Property City")), [])
+        if not mine:
+            empty.append(run)
+            continue
+        with open(run / "smartskip_export.csv", "w", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=fields)
+            w.writeheader()
+            w.writerows(mine)
+    if by_key:
+        raise SystemExit(f"export rows matched no record: {sorted(by_key)}. See {export}")
+    return empty
+
 
 def cmd_charge(a) -> int:
-    run = Path(a.run)
-    state = _load(run)
+    if not a.order and not a.run:
+        raise SystemExit("charge needs --order (or --run for a record's order)")
+    if a.order:
+        order_dir = Path(a.order)
+    else:
+        state = _load(Path(a.run))
+        if not state.get("order"):
+            raise SystemExit("this run predates one-order runs and has no order to charge")
+        order_dir = ORDERS_DIR / state["order"]
+    order = json.loads((order_dir / "order.json").read_text(encoding="utf-8"))
+    runs = [Path(r) for r in order["runs"]]
+    bid = order["bulkSkipId"]
     ss = _smartskip()
     sess = ss.Session()
-    if not state.get("paid"):
-        logger.warning("BILLED: SmartSkip %s row(s), up to $%.2f, on the saved card",
-                       state.get("billable_rows"), (state.get("billable_rows") or 0) * PRICE_PER_HIT)
-        if not ss.pay(sess, state["bulkSkipId"]):
-            raise SystemExit("payment did not go through (see the message above)")
-        state["paid"] = True
-        _save(run, state)
+    if not order.get("paid"):
+        pay_from_balance(sess, bid, order["rows"])
+        order["paid"] = True
+        (order_dir / "order.json").write_text(json.dumps(order, indent=2), encoding="utf-8")
+        for run in runs:
+            _save(run, {**_load(run), "paid": True})
     deadline = time.time() + a.wait
     status = ""
     while time.time() < deadline:
-        items = ss.fetch_status(sess, state["bulkSkipId"])
+        items = ss.fetch_status(sess, bid)
         status = ((items[0].get("status") if items else "") or "").lower()
         if "complet" in status:
             break
@@ -321,116 +458,46 @@ def cmd_charge(a) -> int:
     else:
         print(f"still {status or 'not listed'} after {a.wait}s; re-run charge later (it will not pay twice)")
         return 4
-    export = run / "smartskip_export.csv"
-    ss.download(sess, state["bulkSkipId"], str(export), "vertical")
-    state["export"] = export.name
-    _save(run, state)
-    rec = dps.pick_record(smartskip_parse.parse(str(export)), None)
-    print(f"\nSmartSkip returned {len(rec['subject_phones'])} number(s) for {state['searched']} and "
-          f"{len(rec['relatives'])} relative(s):")
-    for r in rec["relatives"]:
-        print(f"  {r['name']:<28} {r['canon_rel']:<10} age {r.get('age') or '?':<4} "
-              f"{len(r['phones'])} number(s){'  [flagged deceased]' if r.get('deceased') else ''}")
-    known = []
-    oj = run / "obituary_check.json"
-    if oj.exists():
-        known = json.loads(oj.read_text(encoding="utf-8")).get("known") or []
-    findings = owner_profile.identity_findings(rec, home_state=state.get("state") or "OK")
-    state["identity"] = findings
-    _save(run, state)
-    flags = owner_profile.identity_after_smartskip(rec, known, home_state=state.get("state") or "OK")
-    block = "\n== Identity check (after SmartSkip)\n" + "\n".join(f"- {f}" for f in flags) + "\n"
-    pt = run / "owner_profile.txt"
-    if pt.exists() and "Identity check (after SmartSkip)" not in pt.read_text(encoding="utf-8"):
-        pt.write_text(pt.read_text(encoding="utf-8").rstrip() + "\n" + block, encoding="utf-8")
-    elif not pt.exists():
-        pt.write_text(block.lstrip(), encoding="utf-8")
-    print(block)
-    if any(f["level"] == "strong" for f in findings):
-        # Likely two people merged: Jeff decides before anything is scored (2026-10-28).
-        print("STOP: SmartSkip likely merged two people. Ask Jeff before finish, then pass his "
-              "decision as --mixup-call \"...\".")
-    print(f"\nNext: read obituary_check.txt and owner_profile.txt, decide the primary, then\n"
-          f"python src/deep_prospect_run.py finish --run {run.as_posix()} --primary ... --basis \"...\"")
+    export = order_dir / "smartskip_export.csv"
+    ss.download(sess, bid, str(export), "vertical")
+    empty = split_export(export, runs)
+    for run in runs:
+        state = _load(run)
+        if run in empty:
+            print(f"\n{state['street']}: SmartSkip returned nothing for {state['searched']}.")
+            continue
+        state = {**state, "export": "smartskip_export.csv"}
+        rec = dps.pick_record(smartskip_parse.parse(str(run / "smartskip_export.csv")), None)
+        print(f"\n{state['street']}: {len(rec['subject_phones'])} number(s) for {state['searched']} "
+              f"and {len(rec['relatives'])} relative(s):")
+        for r in rec["relatives"]:
+            print(f"  {r['name']:<28} {r['canon_rel']:<10} age {r.get('age') or '?':<4} "
+                  f"{len(r['phones'])} number(s){'  [flagged deceased]' if r.get('deceased') else ''}")
+        known = []
+        oj = run / "obituary_check.json"
+        if oj.exists():
+            known = json.loads(oj.read_text(encoding="utf-8")).get("known") or []
+        findings = owner_profile.identity_findings(rec, home_state=state.get("state") or "OK")
+        state["identity"] = findings
+        _save(run, state)
+        flags = owner_profile.identity_after_smartskip(rec, known, home_state=state.get("state") or "OK")
+        block = "\n== Identity check (after SmartSkip)\n" + "\n".join(f"- {f}" for f in flags) + "\n"
+        pt = run / "owner_profile.txt"
+        if pt.exists() and "Identity check (after SmartSkip)" not in pt.read_text(encoding="utf-8"):
+            pt.write_text(pt.read_text(encoding="utf-8").rstrip() + "\n" + block, encoding="utf-8")
+        elif not pt.exists():
+            pt.write_text(block.lstrip(), encoding="utf-8")
+        print(block)
+        if any(f["level"] == "strong" for f in findings):
+            # Likely two people merged: Jeff decides before anything is scored (2026-10-28).
+            print(f"STOP {state['street']}: SmartSkip likely merged two people. Ask Jeff before "
+                  "finish, then pass his decision as --mixup-call \"...\".")
+    print("\nNext, per record: read obituary_check.txt and owner_profile.txt, write dp_research.json, then\n"
+          "python src/deep_prospect_run.py finish --run <record's run folder> --primary ... --commit")
     return 0
 
 
 # ── 3. finish (DRY RUN until --commit) ────────────────────────────────
-
-def research_pack(state: dict, plan: dict, obits: dict, basis: str, phone_tags: dict,
-                  notes: str = "", decedent: bool = True, owner_dead: bool = False,
-                  status_line: str = "", profile: str = "") -> str:
-    lines = [f"# Deep Prospecting: {state['street']}, {state['city']} {state['state']}", ""]
-    if status_line:
-        lines += [f"**{ln}**" for ln in status_line.splitlines()] + [""]
-    lines += [f"Prepared {date.today().isoformat()}. Searched: **{state['searched']}** "
-             f"(at the {state['searched_at']} address).", "",
-             "## Who to call first", "", basis or "(no basis given)", ""]
-    on_list = plan.get("phone_list_numbers")
-
-    def tag_text(n):
-        if n == "none":
-            return ""
-        if on_list is not None and n not in on_list:
-            return dps.BOARD_ONLY
-        return ", ".join(phone_tags.get(n, [])) or "not scored yet"
-
-    lines += ["| Person | Number | Tags |", "|---|---|---|"]
-    for p in plan["primary"]:
-        for ph in p["phones"]:
-            lines.append(f"| {p['name']} | {ph['number']} | {tag_text(ph['number'])} |")
-    shown = [c for c in obits.get("candidates", [])
-             if not c["verdict"].startswith(obituary_check.RULED_OUT)]
-    confirmed = any(c["verdict"].startswith("CONFIRMED") for c in shown)
-    # A living traced person's raw top finding ("LIKELY THE OWNER'S OBITUARY" on a
-    # namesake) must not sit above "treated as LIVING" (2026-10-23 report read).
-    top = obits.get("summary") if (decedent or confirmed) else "no obituary for the traced person"
-    lines += ["", "## Obituary check", "", f"Top finding: {top}",
-              "Known family checked against survivors: "
-              + (", ".join(obits.get("known") or []) or "none on record"), ""]
-    # A confirmed obituary is the answer; the other name matches are noise to a
-    # caller and were how a stranger's obituary got read as "likely" (10-20).
-    if confirmed:
-        shown = [c for c in shown if c["verdict"].startswith("CONFIRMED")]
-    elif not decedent and owner_dead:
-        lines += ["The traced person is living, but the OWNER is believed deceased: see the "
-                  "research notes. Obituaries that only share the traced person's name are left out.", ""]
-        shown = []
-    elif not decedent:
-        # A living owner's namesakes are strangers' obituaries: leave them out
-        # rather than put "possible death" next to someone we are calling.
-        lines += ["No obituary matching this owner and their known family was found; the "
-                  "owner is treated as LIVING. Obituaries that only share the name are left out.", ""]
-        shown = []
-    elif shown:
-        lines += ["No obituary is confirmed against the known family. The matches below "
-                  "share a name only; treat each as unverified.", ""]
-    for c in shown:
-        lines += [f"- **{c['verdict']}**: {c['title']}", f"  - {c['url']}",
-                  f"  - Died: {c['dod'] or 'not found'}"]
-        if c.get("survived_by"):
-            lines.append("  - Survived by: " + re.sub(r"\s+", " ", c["survived_by"])[:500])
-        if c.get("preceded_by"):
-            lines.append("  - Preceded by: " + re.sub(r"\s+", " ", c["preceded_by"])[:300])
-    lines += ["", "## Family", "",
-              "Scored and on the phone list: " + (", ".join(plan.get("scored_names") or []) or "nobody")
-              + ". Everyone else is listed here only (living owner: owner + spouse; "
-              "deceased owner: close family only).", "",
-              "| Name | Relationship | Number | Tags |", "|---|---|---|---|"]
-    for b in plan["board"]:
-        rel = b["relationship"] + (" (flagged deceased, unverified)" if b["deceased"] else "")
-        for n in b["phones"] or ["none"]:
-            lines.append(f"| {b['name']} | {rel} | {n} | {tag_text(n)} |")
-    lines += ["", "SmartSkip's deceased flags and relationship labels are not reliable; "
-              "the obituary decides."]
-    if notes.strip():
-        lines += ["", "## Research notes", "", notes.strip()]
-    if profile.strip():
-        lines += ["", "## Owner profile (county, CRM, web, identity)", ""]
-        for ln in profile.strip().splitlines()[2:]:
-            lines.append(f"### {ln[3:]}" if ln.startswith("== ") else ln)
-    return "\n".join(lines)
-
 
 def cmd_finish(a) -> int:
     run = Path(a.run)
@@ -447,6 +514,12 @@ def cmd_finish(a) -> int:
         raise SystemExit("--decedent / --owner-deceased need --owner-status dead, verified by an "
                          "obituary confirmed against known family or a filing. Otherwise the owner "
                          "is unverified and nobody is an heir yet.")
+    research = split.load_research(run)
+    if not research and getattr(a, "research", None):
+        research = json.loads(Path(a.research).read_text(encoding="utf-8"))
+    if not research:
+        raise SystemExit(f"no {split.RESEARCH_FILE} in {run}: research trumps SmartSkip, so finish "
+                         "will not run without it. See dp_board_split.load_research for the fields.")
     status_line = dps.owner_status_line(status, getattr(a, "status_proof", ""),
                                         state["searched"], obits=obits,
                                         confidence=getattr(a, "confidence", None) or "")
@@ -466,25 +539,28 @@ def cmd_finish(a) -> int:
     # record is resolved from the run's own address so the two cannot drift.
     rec.update(property_address=state["street"], property_city=state["city"],
                property_state=state["state"])
-    plan = dps.build_plan(rec, a.primary, dps._overrides(a.relationship),
+    overrides = {**dps._overrides(a.relationship), **(research.get("relationships") or {})}
+    plan = dps.build_plan(rec, a.primary or [], overrides,
                           subject_deceased=a.decedent, score_add=getattr(a, "score", None),
-                          score_drop=getattr(a, "no_score", None),
-                          owner_deceased=True if getattr(a, "owner_deceased", False) else None)
+                          score_drop=(getattr(a, "no_score", None) or []) + list(research.get("dead") or [])
+                          + list(research.get("not_family") or []),
+                          owner_deceased=True if getattr(a, "owner_deceased", False) else None,
+                          outside_primary=bool(research.get("call_first_outside")))
+    problems = split.research_problems(research, split.people_from_plan(plan, {}, research), a.primary or [])
+    if problems:
+        raise SystemExit("REFUSED, nothing written:\n  " + "\n  ".join(problems))
     dry = not a.commit
-    res = dps.write_record(rec, plan, dry_run=dry, repost=a.repost, status_line=status_line)
+    res = dps.write_record(rec, plan, research=research, dry_run=dry, repost=a.repost,
+                           status_line=status_line, known_tiers=state.get("tiers"))
 
-    tags: dict[str, list[str]] = {}
-    if not dry:
-        owner = _api.get_owner(state["owner_uuid"]) or {}
-        tags = {sta.norm_phone(p.get("number")): sorted(p.get("tags") or [])
-                for p in owner.get("phones") or []}
     notes_file = getattr(a, "notes", None)
     notes = Path(notes_file).read_text(encoding="utf-8") if notes_file else ""
-    md = research_pack(state, plan, obits, a.basis, tags, notes, decedent=a.decedent,
-                       owner_dead=bool(getattr(a, "owner_deceased", False)),
-                       status_line=status_line,
-                       profile=(run / "owner_profile.txt").read_text(encoding="utf-8")
-                       if (run / "owner_profile.txt").exists() else "")
+    profile_file = run / "owner_profile.txt"
+    after = split.phone_rows(_api.get_property(state["property_uuid"])) if not dry else res["rows_before"]
+    md = split.report_md(state, res["people"], res["rows_before"], research, obits, res["holder"],
+                         split.on_record_now(after) if not dry else set(), notes=notes,
+                         profile=profile_file.read_text(encoding="utf-8") if profile_file.exists() else "",
+                         extra_status=[status_line])
     md_path = run / f"Deep_Prospecting_{slug(state['street'])}.md"
     md_path.write_text(md, encoding="utf-8")
     from deep_prospect_pdf import generate_pdf
@@ -511,7 +587,8 @@ def cmd_finish(a) -> int:
             f"{os.path.basename(pdf)}")
     finally:
         _api.set_dry_run(False)
-    state.update(finished=not dry, primary=a.primary, basis=a.basis, owner_status=status_line)
+    state.update(finished=not dry, primary=a.primary, basis=research.get("basis"), owner_status=status_line,
+                 tiers=res.get("tiers") or state.get("tiers"))
     _save(run, state)
     print(("DRY RUN - nothing written, nothing billed. " if dry else "") + json.dumps(res))
     print(f"PDF: {pdf}" + ("" if dry else f" (uploaded: {doc.get('filename') or doc})"))
@@ -521,7 +598,11 @@ def cmd_finish(a) -> int:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
-    s = sub.add_parser("start", help="FREE: obituary check + SmartSkip count")
+    b = sub.add_parser("batch", help="FREE: ONE SmartSkip order for every record, obituary checks + count")
+    b.add_argument("--list", required=True, help="JSON list of {street, city, state, search_person, "
+                   "search_at, spouse, known, restart}")
+    s = sub.add_parser("start", help="FREE: batch of one, only with --only-one")
+    s.add_argument("--only-one", action="store_true", help="there truly is only one record to deep prospect")
     s.add_argument("--street", required=True)
     s.add_argument("--city", default="")
     s.add_argument("--state", default="OK")
@@ -534,14 +615,18 @@ def main(argv=None) -> int:
                         "the PR are read off the record's board automatically.")
     s.add_argument("--restart", action="store_true",
                    help="open a NEW SmartSkip order even though this property was run before (second charge)")
-    c = sub.add_parser("charge", help="BILLS SmartSkip, waits, downloads")
-    c.add_argument("--run", required=True)
+    c = sub.add_parser("charge", help="BILLS the SmartSkip balance once for the order, never the card")
+    c.add_argument("--order", help="output/deep_prospect/_orders/<id>")
+    c.add_argument("--run", help="a record's run folder: charges that record's order")
     c.add_argument("--wait", type=int, default=1200)
     f = sub.add_parser("finish", help="write phones/board/PDF (dry run until --commit)")
     f.add_argument("--run", required=True)
-    f.add_argument("--primary", action="append", required=True)
+    f.add_argument("--primary", action="append",
+                   help="who to call first, from the SmartSkip results; repeat. May be left out only "
+                        "when dp_research.json has call_first_outside")
+    f.add_argument("--research", help=f"defaults to {split.RESEARCH_FILE} in the run folder")
     f.add_argument("--relationship", action="append")
-    f.add_argument("--basis", default="", help="why these are the primary people")
+    f.add_argument("--basis", default="", help="not used: the basis lives in dp_research.json")
     f.add_argument("--owner-status", required=True, choices=dps.OWNER_STATUSES,
                    help="what OUR research verifies about the owner, printed at the top of every "
                         "post and the PDF. dead needs an obituary confirmed against known family or "
@@ -569,7 +654,7 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     logging.getLogger("ddgs").setLevel(logging.ERROR)
-    return {"start": cmd_start, "charge": cmd_charge, "finish": cmd_finish}[a.cmd](a)
+    return {"batch": cmd_batch, "start": cmd_start, "charge": cmd_charge, "finish": cmd_finish}[a.cmd](a)
 
 
 if __name__ == "__main__":

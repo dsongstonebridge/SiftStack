@@ -44,6 +44,7 @@ import sys
 from datetime import date
 
 import datasift_api as _api
+import dp_board_split as split
 import skip_trace_agent as sta
 import smartskip_parse
 
@@ -128,7 +129,8 @@ def _match(want: str, people: list[dict]) -> list[dict]:
 
 def build_plan(rec: dict, primary: list[str], rel_overrides: dict[str, str] | None = None,
                *, subject_deceased: bool = False, score_add: list[str] | None = None,
-               score_drop: list[str] | None = None, owner_deceased: bool | None = None) -> dict:
+               score_drop: list[str] | None = None, owner_deceased: bool | None = None,
+               outside_primary: bool = False) -> dict:
     """Split one parsed SmartSkip record into phone-list people and board people.
 
     `primary` holds "subject" and/or names of relatives (the top heir / PR).
@@ -150,7 +152,7 @@ def build_plan(rec: dict, primary: list[str], rel_overrides: dict[str, str] | No
     or "subject") correct what SmartSkip's labels cannot know: a co-owner on
     title, or a PR SmartSkip calls a catch-all "Relative".
     """
-    if not primary:
+    if not primary and not outside_primary:
         raise SystemExit("--primary is required: 'subject' and/or the top heir / PR by name")
     rel_overrides = rel_overrides or {}
 
@@ -196,8 +198,11 @@ def build_plan(rec: dict, primary: list[str], rel_overrides: dict[str, str] | No
                 CLOSE_RELS if dead_owner else SPOUSE_RELS)
     for want in score_add or []:
         find(want, "--score")["scored"] = True
+    # Research trumps SmartSkip: a name it rules out need not be in the results at all.
     for want in score_drop or []:
-        find(want, "--no-score")["scored"] = False
+        hits = [subject] if want.strip().lower() == "subject" else _match(want, people)
+        for hit in hits:
+            hit["scored"] = False
 
     holders: dict[str, set[str]] = {}
     for p in people:
@@ -371,7 +376,7 @@ def find_family_post(posts: list[dict]) -> dict | None:
     """Newest post carrying the family marker."""
     for p in posts:
         text = _plain(p.get("message") or "")
-        if FAMILY_MARKER in text or FAMILY_MARKER_V2 in text:
+        if FAMILY_MARKER in text or FAMILY_MARKER_V2 in text or split.POST_MARKER in text:
             return p
     return None
 
@@ -438,11 +443,15 @@ def _already_tiered(rec: dict) -> set[str]:
 
 
 def _write_phones(property_uuid: str, owner_uuid: str, rec: dict, people: list[dict],
-                  *, label: str, dry_run: bool) -> dict:
+                  *, label: str, dry_run: bool, known_tiers: dict | None = None) -> dict:
     """Score + upsert + tag a set of numbers. `people` is
     [{"name", "phones": [{"number", "type", "relationship_tag"}]}].
     Same safety as skip_trace_agent.writeback: caller statuses carried into the
     upsert, tags verified by reading the record back.
+
+    Only a NEW number scored Dial First or Dial Second reaches the record (Jeff,
+    2026-11-02): the rest are listed on the board and in the PDF. `known_tiers` are
+    scores already paid for on an earlier finish of this run, never bought twice.
 
     A number ALREADY on the record (an earlier skip trace, then dialed) is
     never re-upserted: the upsert replaces the phone object, so it could only
@@ -453,7 +462,8 @@ def _write_phones(property_uuid: str, owner_uuid: str, rec: dict, people: list[d
     settled before SmartSkip, and phone tags cannot be removed (2026-10-20)."""
     on_record = {sta.norm_phone(p.get("number"))
                  for p in ((rec.get("owner") or {}).get("phones") or [])} - {None}
-    skip = _already_tiered(rec) | on_record
+    known_tiers = known_tiers or {}
+    skip = _already_tiered(rec) | on_record | set(known_tiers)
     subjects = [{"name": label, "property_address": property_uuid, "people": [
         {"phones": [{"number": ph["number"], "type_raw": ph.get("type") or "",
                      "sources": [SOURCE_SMARTSKIP]}
@@ -467,6 +477,10 @@ def _write_phones(property_uuid: str, owner_uuid: str, rec: dict, people: list[d
         for ph in p["phones"]:
             n = ph["number"]
             s = by_number.get(n, {})
+            # Dry run: nothing is scored, so nothing can be judged yet.
+            if n not in on_record and not dry_run and (
+                    s.get("litigator_risk") or (s.get("tier") or known_tiers.get(n)) not in split.KEEP):
+                continue
             if n not in on_record and n not in {e["number"] for e in phones}:
                 # A number two relatives share is upserted once (2026-10-23).
                 entry = {"number": n}
@@ -476,8 +490,8 @@ def _write_phones(property_uuid: str, owner_uuid: str, rec: dict, people: list[d
             tags = [SOURCE_SMARTSKIP]
             if s.get("litigator_risk"):
                 tags.append(sta.PHONE_TAG_LITIGATOR_RISK)   # REPLACES the tier
-            elif s.get("tier"):
-                tags.append(s["tier"])
+            elif s.get("tier") or known_tiers.get(n):
+                tags.append(s.get("tier") or known_tiers[n])
             if ph.get("relationship_tag") and n not in on_record:
                 tags.append(ph["relationship_tag"])
             number_to_tags.setdefault(n, []).extend(tags)
@@ -491,11 +505,12 @@ def _write_phones(property_uuid: str, owner_uuid: str, rec: dict, people: list[d
              if x.startswith("Dial ") or x == "Drop" or x == sta.PHONE_TAG_LITIGATOR_RISK]
         if n and t:
             existing[n] = sta.PHONE_TAG_LITIGATOR_RISK if sta.PHONE_TAG_LITIGATOR_RISK in t else t[0]
-    tiers = {}
-    for n in number_to_tags:
-        s = by_number.get(n, {})
-        tiers[n] = (sta.PHONE_TAG_LITIGATOR_RISK if s.get("litigator_risk")
-                    else s.get("tier") or existing.get(n, ""))
+    tiers = dict(known_tiers)
+    for number, s in by_number.items():
+        tiers[number] = (sta.PHONE_TAG_LITIGATOR_RISK if s.get("litigator_risk")
+                         else s.get("tier") or tiers.get(number, ""))
+    for number in number_to_tags:
+        tiers[number] = tiers.get(number) or existing.get(number, "")
 
     out = {"numbers": len(number_to_tags), "new_numbers": len(phones),
            "already_on_record": len(on_record & set(number_to_tags)),
@@ -514,9 +529,11 @@ def _write_phones(property_uuid: str, owner_uuid: str, rec: dict, people: list[d
     return out
 
 
-def write_record(rec: dict, plan: dict, *, dry_run: bool = True, repost: bool = False,
-                 status_line: str = "") -> dict:
-    """`write`: every number to the phone list, scored; who-is-who on the board."""
+def write_record(rec: dict, plan: dict, *, research: dict, dry_run: bool = True, repost: bool = False,
+                 status_line: str = "", known_tiers: dict | None = None) -> dict:
+    """`write`: Dial First/Second to the phone list, everything else on the board, with
+    our research over SmartSkip. A number leaves the record only after the post is
+    confirmed on the board, and only on this deep prospected record."""
     _api.set_dry_run(dry_run)
     try:
         uuid, owner_uuid, crm = _resolve(rec["property_address"], rec["property_city"],
@@ -526,11 +543,24 @@ def write_record(rec: dict, plan: dict, *, dry_run: bool = True, repost: bool = 
         people = [p for p in plan["primary"] if p.get("scored", True)] + [
             {"name": b["name"], "phones": b["phone_list"]}
             for b in plan["board"] if b["phone_list"]]
-        res = _write_phones(uuid, owner_uuid, crm, people,
-                            label=plan["subject"], dry_run=dry_run)
+        res = _write_phones(uuid, owner_uuid, crm, people, label=plan["subject"], dry_run=dry_run,
+                            known_tiers=known_tiers)
         tags = [TAG_SMARTSKIP_SKIPPED] + ([sta.TAG_TRESTLE_SCORED] if res["scored"] else [])
         _api.add_tags(uuid, tags)
         res["property_tags"] = tags
+
+        rows = split.phone_rows(_api.get_property(uuid)) if not dry_run else split.phone_rows(crm)
+        remove = split.removable_after_post(rows)
+        kept = split.on_record_now(rows) - set(remove)
+        people_rows = split.people_from_plan(plan, res.get("tiers") or {}, research)
+        holder = split.title_holder(_api.get_message_board(owner_uuid))
+        text = split.build_post({"status_lines": [status_line] if status_line else [],
+                                 "traced": f"Traced: {plan['subject']}. Call first: " + ", ".join(
+                                     x["name"] for x in people_rows if x["section"] == "CALL FIRST") + ".",
+                                 "people": people_rows},
+                                rows, split.plan_numbers(rows), owner_of_record=holder,
+                                statuses=research.get("status") or [], named=research.get("named") or [],
+                                on_record=kept)
 
         # Posts go on the PROPERTY board, where the team works; nothing is posted
         # to an owner record (Jeff, 2026-10-21/23). Both boards are checked so an
@@ -542,10 +572,21 @@ def write_record(rec: dict, plan: dict, *, dry_run: bool = True, repost: bool = 
                            "pass --repost to post anyway", existing.get("created"))
             res["posted"] = False
         else:
-            _api.post_property_message_board(uuid, build_family_post(
-                plan, tiers=res.get("tiers"), status_line=status_line))
+            _api.post_property_message_board(uuid, text)
             res["posted"] = True
-        res.update(property_uuid=uuid)
+        # Numbers that were already on the record and scored below Dial Second.
+        res["removed"] = []
+        if res["posted"] and not dry_run and remove:
+            board = _api.get_property_message_board(uuid)
+            mine = next((p for p in board if split.POST_MARKER in (p.get("message") or "")), None)
+            if not mine or split.missing_from_post(mine.get("message"), remove):
+                res["ok"] = False
+                logger.error("post not confirmed on the board: no number was removed")
+            else:
+                _api.remove_phones(owner_uuid, remove)
+                res["removed"] = remove
+        res.update(property_uuid=uuid, rows_before=rows, holder=holder, post_text=text,
+                   people=people_rows)
         return res
     finally:
         _api.set_dry_run(False)
@@ -655,7 +696,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"PHONE LIST: {n} numbers, all Trestle scored (about ${n * 0.015:.2f}). Call first:",
               "; ".join(f"{p['name']} ({len(p['phones'])})" for p in plan["primary"]))
         print("-" * 60 + "\n" + build_family_post(plan, status_line=line) + "\n" + "-" * 60)
-        res = write_record(rec, plan, dry_run=dry, repost=a.repost, status_line=line)
+        raise SystemExit("REFUSED: use `deep_prospect_run.py finish`, which requires dp_research.json. "
+                         "Research trumps SmartSkip, so nothing writes without it.")
     else:
         only = {s.strip() for s in a.only.split(",")} if a.only else None
         res = promote_record(a.street, a.city, a.state, only=only, dry_run=dry)

@@ -86,5 +86,28 @@ check("a lost tag is caught",
       s.changed_kept(rows[:1], [row("9183317781", "SmartSkip", "Dial First")]) == ["9183317781"])
 check("a lost number is caught", s.changed_kept(rows[:1], []) == ["9183317781"])
 
+check("a record with only low numbers keeps them", s.removable_after_post([row("9180000009", "Dial Fourth")]) == [])
+check("a record with a good number loses its low ones", s.removable_after_post(
+    [row("9180000009", "Dial Fourth"), row("9180000008", "Dial First")]) == ["9180000009"])
+
+
+class FakeAPI:
+    def get_property(self, uuid):
+        return {"owner": {"phones": []}, "tags": ["Courthouse Data"]}
+
+    def get_property_message_board(self, uuid):
+        return [{"message": OLD}]
+
+
+import json, tempfile  # noqa: E402
+regular = Path(tempfile.mkdtemp()) / "x"
+regular.mkdir()
+(regular / "state.json").write_text(json.dumps({"street": "1 A St", "property_uuid": "P", "owner_uuid": "O"}))
+s.api = FakeAPI()
+s.api.get_property = lambda uuid: {"owner": {"phones": [
+    {"number": "9180000009", "tags": ["Dial Fourth"], "status": "UNKNOWN"},
+    {"number": "9180000008", "tags": ["Dial First"], "status": "UNKNOWN"}]}, "tags": ["Courthouse Data"]}
+check("a record that was not deep prospected is refused", s.run(regular, commit=True) == 2)
+
 print(f"\n{len(FAILS)} failed")
 raise SystemExit(1 if FAILS else 0)

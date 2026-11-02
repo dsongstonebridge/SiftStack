@@ -2,12 +2,13 @@
 
 The user's rules (2026-09-23): he does NOT buy a property that is
 
-  1. carrying **less than 15% equity** (PROBATE ONLY since 2026-10-12: the user
+  1. carrying **less than 30% equity** (15% until 2026-11-02; PROBATE ONLY since 2026-10-12: the user
      dropped it for foreclosure because the value-spread stop-and-ask already
      covers it), or
-  2. **sold recently**: within the last 3 years for foreclosure (user,
-     2026-10-09, all foreclosures from then on), 2 years for probate. The
-     foreclosure window was 3 until 2026-09-25, then 2, then back to 3.
+  2. **sold recently** (FORECLOSURE ONLY): within the last 3 years (user,
+     2026-10-09, all foreclosures from then on). The window was 3 until
+     2026-09-25, then 2, then back to 3. Probate has no sale rule (user,
+     2026-11-02): a recent deed on a probate house is usually the inheritance.
 
 Such a record is deleted from the CRM and never skip traced.
 
@@ -89,16 +90,18 @@ from datetime import date, datetime
 
 logger = logging.getLogger(__name__)
 
-MIN_EQUITY_PERCENT = 15.0
-#: Sold within this many years = excluded. Foreclosure 3 (user, 2026-10-09),
-#: probate 2 (unchanged; scoped to foreclosure on purpose).
-RECENT_SALE_YEARS = {"foreclosure": 3, "probate": 2}
+#: Probate only. Under this the record is removed from the CRM and never traced
+#: (user, 2026-11-02: "under 30% on all probate runs"). Missing equity is kept.
+MIN_EQUITY_PERCENT = 30.0
+#: Sold within this many years = excluded. Foreclosure 3 (user, 2026-10-09).
+#: Probate None: the rule does not apply (user, 2026-11-02).
+RECENT_SALE_YEARS = {"foreclosure": 3, "probate": None}
 
 #: Lead status a listed foreclosure gets. The account's own status TITLE.
 MLS_STATUS = "listed"
 
 
-def recent_sale_years(notice_type: str = "foreclosure") -> int:
+def recent_sale_years(notice_type: str = "foreclosure") -> int | None:
     return RECENT_SALE_YEARS.get(notice_type, RECENT_SALE_YEARS["foreclosure"])
 
 #: `mls` values that mean on the market. Only "listed" has been SEEN live
@@ -208,7 +211,7 @@ def check_property(prop: dict, *, today: date | None = None,
             reasons.append(f"equity {eq:.2f}% is under {MIN_EQUITY_PERCENT:.0f}%")
 
     years = recent_sale_years(notice_type)
-    sold = _parse_date(prop.get("last_sold"))
+    sold = _parse_date(prop.get("last_sold")) if years else None
     if sold and sold > _years_before(today, years):
         reasons.append(f"sold {sold.isoformat()}, within the last {years} years")
 
@@ -367,9 +370,9 @@ def apply_post_enrich_gate(rows: list[dict], *, find_property, get_property,
 def describe(notice_type: str = "foreclosure") -> str:
     if notice_type == "probate":
         return (f"Post-enrichment gate (probate): equity at least "
-                f"{MIN_EQUITY_PERCENT:.0f}%, not sold within the last {recent_sale_years('probate')} "
-                f"years, and not a condo, mobile home, 3+ units or non-residential "
-                f"(DataSift structure type). MLS-listed is allowed. Missing data never "
+                f"{MIN_EQUITY_PERCENT:.0f}%, "
+                f"and not a condo, mobile home, 3+ units or non-residential "
+                f"(DataSift structure type). MLS-listed and recent sales are allowed. Missing data never "
                 f"excludes.")
     return (f"Post-enrichment gate: not sold within the last "
             f"{recent_sale_years(notice_type)} years (equity is left to the value-spread "

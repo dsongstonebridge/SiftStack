@@ -17,6 +17,14 @@ merged row (two probates on one house) with only ONE case processed is reported
 as PARTIAL rather than silently created - creating it would double-post the
 processed case's notes and Message Board.
 
+A third outcome, added 2026-11-02 (user: no duplicates): the address is ALREADY
+in the CRM but its Notes do not carry this case (a foreclosure, an older list,
+another probate). Bulk create leaves that record's owner alone, so carrying on
+would post the probate onto someone else's record and pay to trace the PR at
+that owner's mailing address. The row is SKIPPED before anything is written or
+billed, and so is a row whose CRM check could not run: a failed lookup is not a
+miss. There is no override.
+
 Nothing here deletes or moves a file; the caller reports and the human decides.
 
     python src/processed_cases.py check PB-2026-761 PB-2026-778
@@ -117,40 +125,70 @@ def check_rows(rows: list[dict], *, path: Optional[Path] = None) -> tuple[list[d
     return fresh, already
 
 
-def crm_check_rows(rows: list[dict], find_fn: Callable, get_fn: Callable) -> tuple[list[dict], list[dict]]:
-    """Second net, run once property addresses are known: a CRM record at the
-    row's address whose Notes carry one of the row's case numbers. An address
-    that exists WITHOUT the case (say a foreclosure record) is NOT a repeat and
-    is only logged. `find_fn(street, city, state)` and `get_fn(uuid)` are
+def _titles(items) -> str:
+    """Lists and tags read back as dicts or bare strings; show the names."""
+    return ", ".join(str(i.get("title") or i.get("name") or "") if isinstance(i, dict) else str(i)
+                     for i in (items or []))
+
+
+def _existing_summary(record: dict, hit: dict) -> dict:
+    """What a human needs to see to decide about the record already there."""
+    owner = record.get("owner") or {}
+    addr = record.get("address") or hit.get("address") or {}
+    return {
+        "uuid": hit.get("uuid") or record.get("uuid") or "",
+        "street": addr.get("street") or "",
+        "city": addr.get("city") or "",
+        "owner": " ".join(str(owner.get(k) or "") for k in ("first_name", "last_name")).strip()
+                 or str(owner.get("company") or ""),
+        "status": str(record.get("status") or ""),
+        "lists": _titles(record.get("lists")),
+        "tags": _titles(record.get("tags")),
+    }
+
+
+def crm_check_rows(rows: list[dict], find_fn: Callable, get_fn: Callable
+                   ) -> tuple[list[dict], list[dict], list[dict]]:
+    """Second net, run once property addresses are known. Returns
+    (fresh, already, held):
+      already  a CRM record at the address whose Notes carry one of the row's cases
+      held     the address is in the CRM without this case, or the check failed
+      fresh    the address is not in the CRM
+
+    Searches on the address alone, like the foreclosure duplicate check: the
+    stored city can differ from the filing's. A same-street match in another
+    town is therefore skipped too and listed in the run.
+    `find_fn(street, city, state, strict=True)` and `get_fn(uuid)` are
     datasift_api.find_property_by_address / get_property, injected so this is
-    testable offline."""
-    fresh, already = [], []
+    testable offline. A row with no address is left for the buy box."""
+    fresh, already, held = [], [], []
     for row in rows:
         street = str(row.get("Property Street") or "").strip()
+        if not street:
+            fresh.append(row)
+            continue
         cases = extract_cases(str(row.get("Case Number") or ""))
-        if not street or not cases:
-            fresh.append(row)
-            continue
         try:
-            found = find_fn(street, str(row.get("Property City") or ""),
-                            str(row.get("Property State") or "OK"))
-            notes = (get_fn(found["uuid"]) or {}).get("notes") if found else ""
-        except Exception as e:                      # noqa: BLE001 - free lookup, never lose the row
+            found = find_fn(street, "", "", strict=True)
+            record = (get_fn(found["uuid"]) or {}) if found else {}
+        except Exception as e:                      # noqa: BLE001 - fail CLOSED, keep the row
             logger.warning("processed-cases: CRM lookup failed for %r: %s", street, e)
+            row["_existing_record"] = {"error": str(e)}
+            held.append(row)
+            continue
+        if not found:
             fresh.append(row)
             continue
-        done = [c for c in cases if c in extract_cases(notes or "")]
-        if found and done:
+        done = [c for c in cases if c in extract_cases(record.get("notes") or "")]
+        if done:
             row["_already_processed"] = {"cases": cases, "processed": done,
                                           "partial": len(done) < len(cases),
                                           "where": f"CRM record {found['uuid']}"}
             already.append(row)
-        else:
-            if found:
-                logger.info("processed-cases: %r already exists in the CRM but its notes "
-                            "do not carry %s - treating as a different lead", street, cases)
-            fresh.append(row)
-    return fresh, already
+            continue
+        row["_existing_record"] = _existing_summary(record, found)
+        held.append(row)
+    return fresh, already, held
 
 
 def describe(row: dict) -> str:

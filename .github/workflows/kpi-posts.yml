@@ -134,6 +134,16 @@ jobs:
           exit $rc
         continue-on-error: true
 
+      # "Records reached over time" (Jeff, 2026-10-30): every record worked since the ledger
+      # began and which we ever reached, hashed ids only, carried run to run in GitHub's cache.
+      - name: Restore the records-reached ledger
+        if: steps.gate.outputs.daily == 'true' || steps.gate.outputs.weekly == 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: kpi-engine/reports/ledger.json
+          key: kpi-ledger-${{ github.run_id }}
+          restore-keys: kpi-ledger-
+
       - name: Post the daily KPI Engine summary
         if: steps.gate.outputs.daily == 'true'
         working-directory: kpi-engine
@@ -141,10 +151,28 @@ jobs:
           DAY: ${{ github.event.inputs.date }}
         run: |
           if [ -n "$DAY" ]; then
-            python pull_kpis.py --from "$DAY" --to "$DAY" --slack auto
+            python pull_kpis.py --from "$DAY" --to "$DAY" --slack auto --ledger reports/ledger.json
           else
-            python pull_kpis.py --days 1 --slack auto
+            python pull_kpis.py --days 1 --slack auto --ledger reports/ledger.json
           fi
+
+      # Fridays (Jeff, 2026-10-30): the same KPIs for Monday through Friday, as its own post,
+      # alongside the weekly sheet summary below
+      - name: Post the weekly KPI Engine summary (Fridays)
+        if: steps.gate.outputs.weekly == 'true'
+        working-directory: kpi-engine
+        env:
+          DAY: ${{ github.event.inputs.date }}
+        run: |
+          python pull_kpis.py --week-of "${DAY:-$(TZ=America/Chicago date +%F)}" --slack auto \
+            --ledger reports/ledger.json --note "Weekly summary"
+
+      - name: Save the records-reached ledger
+        if: always() && (steps.gate.outputs.daily == 'true' || steps.gate.outputs.weekly == 'true') && hashFiles('kpi-engine/reports/ledger.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: kpi-engine/reports/ledger.json
+          key: kpi-ledger-${{ github.run_id }}
 
       - name: Post the weekly sheet summary (Fridays)
         if: steps.gate.outputs.weekly == 'true'

@@ -217,9 +217,11 @@ def main() -> int:
         for c in sorted((x for x in full if x["scores"]["pipeline"] == p), key=lambda x: x.get("created_utc") or ""):
             s = c["scores"]
             rows.append([c.get("created_local"), c["who"], s.get("total"), s.get("band"), call_tier.get(c["call_id"], ""),
+                         *[(s.get("parts") or {}).get(k) for k in spec.get("parts", {})],
                          *[s["categories"].get(k) for k in spec["weights"]],
                          *[s["criteria"].get(k) for k in crit_ids], c.get("report_file")])
         headers = (["When (Central)", "Caller", "Total", "Band", "Tier (within 5 = tie)"] +
+                   [f"Part: {k.replace('_', ' ')} (/100)" for k in spec.get("parts", {})] +
                    [f"C{k} {spec['categories'][k]} ({w}%)" for k, w in spec["weights"].items()] +
                    [f"{k} {spec['criteria'][k]}" for k in crit_ids] + ["Report"])
         ws = sheet(wb, spec["title"], headers, rows, widths={"When (Central)": 19},
@@ -288,6 +290,14 @@ def main() -> int:
                              f"Team tier: {caller_tier.get((who, p), '-')}. Auto-fails: {a['fails']}.")
                 if p == "closing":
                     lines.append(f"- OK disclosure missed on {a['ok_missed']} call(s).")
+                if spec.get("parts"):
+                    pts = [(c["scores"].get("parts") or {}) for c in full
+                           if c["who"] == who and c["scores"]["pipeline"] == p]
+                    avgs = []
+                    for k in spec["parts"]:
+                        v = [x[k] for x in pts if x.get(k) is not None]
+                        avgs.append(f"{k.replace('_', ' ')} {sum(v) / len(v):.1f}" if v else f"{k.replace('_', ' ')} -")
+                    lines.append("- Part averages (/100): " + "; ".join(avgs))
                 lines.append("- Category averages: " + "; ".join(
                     f"{spec['categories'][k]} {sum(v) / len(v):.2f}/5" for k, v in sorted(a["cats"].items())))
                 crit_avg = sorted(((sum(v) / len(v), k) for k, v in a["crit"].items()))

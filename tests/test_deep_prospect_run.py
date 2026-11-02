@@ -12,6 +12,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import deep_prospect_run as run  # noqa: E402
+import dp_board_split as split  # noqa: E402
 import deep_prospect_smartskip as dps  # noqa: E402
 import skip_trace_agent as sta  # noqa: E402
 
@@ -81,6 +82,11 @@ with open(tmp / "smartskip_export.csv", "w", newline="", encoding="utf-8") as fh
                     "survived_by": "survived by his daughter Susan and son Mark", "preceded_by": ""}]}))
 
 
+(tmp / "dp_research.json").write_text(json.dumps({
+    "status": ["Robert Smith: DEAD, died 08/02/2026 (probate PB-2026-0001)"],
+    "basis": "Robert died Aug 2 2026 per the filing. Susan is the daughter and PR.",
+    "labels": {"Susan Smith": "Daughter, PR (filing)"}}))
+
 OWNER_POSTS = []   # every owner-board post from any fake; must stay empty
 
 
@@ -107,6 +113,9 @@ class FakeAPI:
     def upsert_phones(self, owner_uuid, phones):
         if not self.dry:
             self.phones += [{"number": p["number"], "tags": []} for p in phones]
+
+    def remove_phones(self, owner_uuid, numbers):
+        self.phones = [p for p in self.phones if p["number"] not in numbers]
 
     def apply_phone_tags_verified(self, owner_uuid, mapping):
         if not self.dry:
@@ -144,7 +153,17 @@ class FakeAPI:
 
 fake = FakeAPI()
 run._api = dps._api = fake
-sta.score_phones = lambda subjects, dry_run=True: {}
+
+
+def fake_score(subjects, dry_run=True):
+    for s in subjects:
+        for person in s["people"]:
+            for ph in person["phones"]:
+                ph["tier"] = "Dial Third" if ph["number"] == "9185550301" else "Dial First"
+    return {}
+
+
+sta.score_phones = fake_score
 sta._current_phone_state = lambda uuid: {}
 
 
@@ -163,25 +182,26 @@ check("record resolved from the run's address, not SmartSkip's upper-case copy",
       fake.looked_up == ("100 Fake St", "Tulsa"))
 
 finish(commit=True)
-# Rule since 2026-10-20: every SmartSkip number goes on the phone list.
-check("commit: every SmartSkip number on the phone list",
-      sorted(p["number"] for p in fake.phones) == ["9185550201", "9185550301"])
+# Rule since 2026-11-02: only Dial First/Second reaches the record.
+check("commit: only the Dial First number on the phone list",
+      [p["number"] for p in fake.phones] == ["9185550201"])
 check("commit: her number tagged Daughter",
       "Daughter" in next(p for p in fake.phones if p["number"] == "9185550201")["tags"])
 check("commit: PDF uploaded to Documents", len(fake.uploads) == 1)
-check("commit: board has the family post and the PDF line",
-      any(dps.FAMILY_MARKER_V2 in m for m in fake.board)
-      and any(run.PDF_MARKER in m for m in fake.board))
-check("commit: BOTH board posts open with the verified owner status (2026-10-27)",
-      len(fake.board) == 2 and all(m.startswith("OWNER STATUS: DECEASED (high confidence) - Robert Smith")
-                                   for m in fake.board))
+check("commit: board has the new post and the PDF line",
+      any(split.POST_MARKER in m for m in fake.board) and any(run.PDF_MARKER in m for m in fake.board))
+check("commit: BOTH board posts carry the verified owner status (2026-10-27)",
+      len(fake.board) == 2 and all("OWNER STATUS: DECEASED (high confidence) - Robert Smith" in m for m in fake.board))
+check("commit: the number post opens with the owner of record",
+      next(m for m in fake.board if split.POST_MARKER in m).startswith("OWNER OF RECORD: "))
 check("commit: confirmed death labels the subject Decedent, not Owner",
       any("Decedent (traced subject)" in m for m in fake.board)
       and not any("Owner (traced subject)" in m for m in fake.board))
 md = next(p for p in tmp.iterdir() if p.suffix == ".md").read_text(encoding="utf-8")
 check("research pack names the basis and the obituary", "Susan is the daughter" in md and "example.test/obit" in md)
-check("research pack: owner status sits right under the title",
-      md.split("\n")[2].startswith("**OWNER STATUS: DECEASED (high confidence)"))
+check("research pack: owner of record sits right under the title", md.split("\n")[2].startswith("**OWNER OF RECORD"))
+check("research pack: research label, not SmartSkip's", "Daughter, PR (filing)" in md)
+check("research pack: the low number is board only with its tier", "918-555-0301 (Dial Third)" in md)
 check("research pack lists the deceased owner as a board relative", "Robert Smith" in md and "Mark Smith" in md)
 
 n_board, n_up = len(fake.board), len(fake.uploads)
@@ -222,19 +242,25 @@ check("split_name: plain name -> first and last word",
 check("split_name: First|Last keeps a compound surname",
       run.split_name("Francisco|Perez Rodriguez") == ("Francisco", "Perez Rodriguez"))
 _ST = {"street": "1 A St", "city": "Tulsa", "state": "OK", "searched": "X Y", "searched_at": "mailing"}
-check("research notes reach the PDF text", "## Research notes" in run.research_pack(
-    _ST, {"primary": [], "board": []}, {"summary": "", "candidates": []}, "b", {},
-    "Owner is a nurse.", decedent=False))
-_md = run.research_pack(_ST, {"primary": [], "board": []},
-                        {"summary": "LIKELY THE OWNER'S OBITUARY", "candidates": []}, "b", {}, decedent=False)
-check("living owner: the raw 'LIKELY' top finding never reaches the PDF", "LIKELY" not in _md)
-check("owner deceased, traced person living: PDF says so, not 'treated as LIVING'",
-      "OWNER is believed deceased" in run.research_pack(
-          _ST, {"primary": [], "board": []}, {"summary": "x", "candidates": []}, "b", {},
-          decedent=False, owner_dead=True))
-check("living owner: name-only obituaries are left out of the PDF", "Obit Stranger" not in run.research_pack(
-    _ST, {"primary": [], "board": []}, {"summary": "", "candidates": [
-        {"verdict": "LIKELY", "title": "Obit Stranger", "url": "u", "dod": ""}]}, "b", {}, decedent=False))
+_R = {"status": ["X Y: DEAD"], "basis": "b"}
+_md = split.report_md(_ST, [], [], _R, {"candidates": [
+    {"verdict": "DIFFERENT PERSON (middle name Q)", "title": "Obit Stranger", "url": "u"},
+    {"verdict": "LIKELY THE OWNER'S OBITUARY", "title": "Obit Real &amp; True", "url": "u"}]}, "Y, X", set(),
+    notes="Owner is a nurse.")
+check("research notes reach the PDF text", "## Research notes" in _md and "Owner is a nurse." in _md)
+check("a ruled-out obituary never reaches the PDF", "Obit Stranger" not in _md)
+check("HTML junk never reaches the PDF", "&amp;" not in _md and "Obit Real & True" in _md)
+check("an obituary nobody compared says so", "not confirmed" in _md)
+_read = split.report_md(_ST, [], [], dict(_R, obit_note="Legacy names no survivors."), {}, "Y, X", set())
+check("what reading the obituary showed replaces the generic line",
+      "Legacy names no survivors." in _read and "not confirmed" not in _read)
+check("no obit at all says so", "No obit found." in split.report_md(_ST, [], [], _R, {}, "Y, X", set()))
+_keep = (tmp / "dp_research.json").read_text(encoding="utf-8")
+(tmp / "dp_research.json").unlink()
+check("finish without research is refused", raises(lambda: finish(commit=False)))
+(tmp / "dp_research.json").write_text(json.dumps({"status": ["x"], "basis": "b"}))
+check("finish with a call-first label naming no source is refused", raises(lambda: finish(commit=False)))
+(tmp / "dp_research.json").write_text(_keep)
 
 # ── owner status is research-verified, never SmartSkip (2026-10-27) ──
 # Replay of the 2026-10-27 same-name incident: a name-only "PROBABLE" obituary plus SmartSkip's
@@ -301,15 +327,14 @@ def finish_call(call):
 fake.board.clear()
 finish_call("Jeff: go ahead, numbers checked")
 check("likely mix-up with Jeff's call -> both posts carry the note under the owner status",
-      len(fake.board) == 2 and all(m.split("\n")[1].startswith("POSSIBLE MIX-UP (likely): ")
-                                   and "Jeff's call: Jeff: go ahead" in m.split("\n")[1]
+      len(fake.board) == 2 and all("POSSIBLE MIX-UP (likely): " in m and "Jeff's call: Jeff: go ahead" in m
                                    for m in fake.board))
 run.owner_profile.identity_findings = lambda rec, home_state="OK": [
     {"level": "maybe", "text": "SmartSkip lists a Robert Smith in Boise, ID as a Child."}]
 fake.board.clear()
 finish_call("")
 check("maybe -> no stop, scored as usual, note under the owner status",
-      len(fake.board) == 2 and all("POSSIBLE MIX-UP (maybe): " in m.split("\n")[1] for m in fake.board))
+      len(fake.board) == 2 and all("POSSIBLE MIX-UP (maybe): " in m for m in fake.board))
 run.owner_profile.identity_findings = _real
 
 print(f"\n{failures} failure(s)")

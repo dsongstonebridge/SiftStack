@@ -1596,10 +1596,11 @@ def _treasurer_true_negative_check(row: dict, candidates: list[tuple[str, str]])
     #: tax-payer timeline, pulled for every corroborated hit now, not only
     #: to disambiguate an heir's own property.
     findings: list[tuple[str, str, dict, list[dict]]] = []
+    blocked = []                    # set once the site answers with its captcha
 
     def _search_one(label: str, name: str) -> list[tuple[str, str, dict, list[dict]]]:
         name = str(name or "").strip()
-        if not name:
+        if not name or blocked:
             return []
         parts = [p.strip(".,") for p in name.replace(",", " ").split() if p.strip(".,")]
         while len(parts) > 1 and parts[-1].upper() in _SUFFIXES:
@@ -1610,6 +1611,9 @@ def _treasurer_true_negative_check(row: dict, candidates: list[tuple[str, str]])
 
         try:
             hits = treasurer.search_owner_name(last, first)
+        except treasurer.TreasurerBlocked:
+            blocked.append(name)
+            return []
         except Exception as e:                    # noqa: BLE001 - free lookup; never lose the row
             logging.debug("  treasurer: search error for %s: %s", name, e)
             return []
@@ -1661,6 +1665,17 @@ def _treasurer_true_negative_check(row: dict, candidates: list[tuple[str, str]])
             findings.extend(_search_one(label, name))
 
     if not findings:
+        if blocked:
+            # Say so instead of reading the refusal as "owns nothing". The
+            # Assessor already found nothing, so there is likely no property;
+            # this is a hand check if Jeff thinks it is worth it (2026-10-28).
+            row["Treasurer Check"] = (
+                "Not checked: the Treasurer site requires a captcha. The Assessor found "
+                "nothing, so there is likely no property. Check by hand if worth it: "
+                f"{treasurer.MANUAL_SEARCH_URL}")
+            logging.warning("  treasurer: not checked for %s (captcha); Assessor found nothing, "
+                            "likely no property. Hand check: %s",
+                            row.get("Decedent Name") or blocked[0], treasurer.MANUAL_SEARCH_URL)
         return
 
     row["Treasurer Check"] = "; ".join(
@@ -2000,6 +2015,27 @@ def _report_already_processed(repeats: list[dict]) -> None:
     logging.warning("")
 
 
+def _report_existing_record_holds(held: list[dict]) -> None:
+    """Rows skipped because the address is already in the CRM under something else,
+    or because the check could not run. Same reason to be loud as above."""
+    if not held:
+        return
+    logging.warning("")
+    logging.warning("=== ADDRESS ALREADY IN THE CRM - SKIPPED, NOT CREATED OR TRACED (%d) ===", len(held))
+    for r in held:
+        e = r.get("_existing_record") or {}
+        label = f"{r.get('Case Number') or '?'} {r.get('Decedent Name') or ''}".strip()
+        if e.get("error"):
+            logging.warning("  %s | %s | CRM check FAILED, re-run: %s",
+                            label, r.get("Property Street") or "?", e["error"])
+        else:
+            logging.warning("  %s | %s | existing record %s: owner %s, status %s, lists %s",
+                            label, r.get("Property Street") or "?", e.get("uuid") or "?",
+                            e.get("owner") or "?", e.get("status") or "none",
+                            e.get("lists") or "none")
+    logging.warning("")
+
+
 def _create_records_for_batch(args, csv_path: Path) -> list[dict] | None:
     """`--create` front end: raw property template -> CRM records, ready for
     run_pipeline() to trace and score.
@@ -2327,14 +2363,16 @@ def _create_fresh_rows(args, template_rows: list[dict], notice_type: str) -> dic
         run_timer.stop(_t)
         # Second net, now that addresses are known: a CRM record at the address
         # whose Notes carry the case number (covers cases created before the
-        # ledger existed).
+        # ledger existed), or any other record at that address, which is skipped
+        # before anything is posted to it or billed.
         import processed_cases
         from datasift_api import find_property_by_address, get_property
         _t = run_timer.start("already-processed CRM check")
-        template_rows, repeats = processed_cases.crm_check_rows(
+        template_rows, repeats, existing = processed_cases.crm_check_rows(
             template_rows, find_property_by_address, get_property)
         run_timer.stop(_t)
         _report_already_processed(repeats)
+        _report_existing_record_holds(existing)
         if not template_rows:
             logging.error("Every row was already in the CRM - nothing to create.")
             return None

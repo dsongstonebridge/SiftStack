@@ -1,6 +1,6 @@
-"""rubric_spec.py - the machine-checkable shape of the three Tulsa Homebuyers rubrics.
+"""rubric_spec.py - the machine-checkable shape of the four Tulsa Homebuyers rubrics.
 
-Mirrors rubrics/cold_call.md, lead_management.md and closing.md: criterion ids,
+Mirrors rubrics/cold_call.md, lead_management.md, combined.md and closing.md: criterion ids,
 short names, category weights, where N/A is allowed, and the short-call rules.
 If a rubric file changes its criteria or weights, change this file in the same
 commit or the checker will reject correct reports.
@@ -70,6 +70,48 @@ RUBRICS = {
         "never_na": set(),
         "short": {"opener": ["1.1", "1.2", "1.3", "1.4", "1.5"], "conversion": "4.5"},
     },
+    # A cold call that rolls into lead management on the same call (2026-10-26:
+    # Diego does both jobs until a cold caller is hired). Criteria are the
+    # cold-call and lead-management criteria renumbered, plus the switch.
+    "combined": {
+        "file": "combined.md",
+        "title": "Combined (Cold into LM)",
+        "weights": {"1": 15, "2": 10, "3": 10, "4": 25, "5": 15, "6": 15, "7": 10},
+        "categories": {"1": "Opener and Decision-Maker Confirmation",
+                       "2": "Objection Handling and List Sensitivity", "3": "The Switch",
+                       "4": "Four Pillars Qualification", "5": "Roadblocks and Logistics",
+                       "6": "Rapport, Tonality, Call Control", "7": "Next Action and Handoff"},
+        "criteria": {
+            "1.1": "Decision-maker confirmed first", "1.2": "Soft plans frame with specific property",
+            "1.3": "Awkwardness named", "1.4": "Escalation discipline",
+            "2.1": "How did you get my info", "2.2": "List-type do-not-say discipline",
+            "2.3": "Converting the no", "2.4": "Delay and busy handled small",
+            "2.5": "Address earned, not demanded",
+            "3.1": "Earned the switch", "3.2": "Permission to keep going",
+            "3.3": "Time, agenda and result set",
+            "4.1": "Motivation: the reason behind the trigger", "4.2": "Timeline to agreement, bucketed",
+            "4.3": "Condition: three-bucket grade, tour, capex",
+            "4.4": "Price: pocket number pulled, reflected, never negotiated",
+            "4.5": "Pillar order and flow discipline",
+            "5.1": "Influencers", "5.2": "Logistics and after the sale",
+            "5.3": "Encumbrances, title, and agent exposure", "5.4": "Occupancy and junk",
+            "6.1": "Question, then silence", "6.2": "Mirroring and reflection",
+            "6.3": "Empathy beats and non-judgment", "6.4": "Let them rant, keep control",
+            "6.5": "The no ladder and objection handling",
+            "7.1": "Binary outcome rule", "7.2": "Specific next step with expectations set",
+            "7.3": "Cadence match to pillar evidence",
+            "7.4": "Handoff readiness and warm transfer", "7.5": "Human details drawn out",
+        },
+        # Part A (cold-call criteria) may be N/A like the cold rubric; Part C
+        # only 7.4 like the LM rubric; the switch is always scored.
+        "na_any": False,
+        "na_any_categories": {"1", "2"},
+        "na_allowed": {"7.4"},
+        "non_dm_categories": set(),
+        "never_na": {"3.1", "3.2", "3.3"},
+        "short": None,          # a seller who declines early was never switched
+        "parts": {"opening": ["1", "2"], "switch": ["3"], "lead_management": ["4", "5", "6", "7"]},
+    },
     "closing": {
         "file": "closing.md",
         "title": "Closing",
@@ -117,6 +159,13 @@ def category_of(cid: str) -> str:
     return cid.split(".")[0]
 
 
+def _weighted(cats: dict, weights: dict) -> float | None:
+    live = {c: w for c, w in weights.items() if cats[c] is not None}
+    if not live:
+        return None
+    return round(sum((cats[c] / 5) * w for c, w in live.items()) * 100 / sum(live.values()), 1)
+
+
 def compute(pipeline: str, criteria: dict) -> tuple[dict, float | None]:
     """Category averages (non-N/A) and the weighted total with N/A redistribution."""
     spec = RUBRICS[pipeline]
@@ -124,9 +173,15 @@ def compute(pipeline: str, criteria: dict) -> tuple[dict, float | None]:
     for cat in spec["weights"]:
         vals = [v for k, v in criteria.items() if category_of(k) == cat and v is not None]
         cats[cat] = round(sum(vals) / len(vals), 2) if vals else None
-    live = {c: w for c, w in spec["weights"].items() if cats[c] is not None}
-    if not live:
-        return cats, None
-    wsum = sum(live.values())
-    total = sum((cats[c] / 5) * w for c, w in live.items()) * 100 / wsum
-    return cats, round(total, 1)
+    return cats, _weighted(cats, spec["weights"])
+
+
+def compute_parts(pipeline: str, criteria: dict) -> dict:
+    """Per-part totals (0-100) for a rubric with 'parts'; {} otherwise. Same math
+    as the total, over each part's categories only."""
+    spec = RUBRICS[pipeline]
+    if not spec.get("parts"):
+        return {}
+    cats, _ = compute(pipeline, criteria)
+    return {name: _weighted(cats, {c: spec["weights"][c] for c in cs})
+            for name, cs in spec["parts"].items()}

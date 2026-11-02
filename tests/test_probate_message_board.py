@@ -436,6 +436,39 @@ class TreasurerTrueNegativeTests(unittest.TestCase):
                 row, [("decedent", "Elizabeth Coleman")])
         self.assertNotIn("Treasurer Check", row)
 
+    def test_captcha_block_is_said_out_loud_not_read_as_no_property(self):
+        # Since 2026-10-27 the site answers every search with a captcha. That
+        # used to come back as [] and read as "owns nothing" with no note.
+        import tulsa_treasurer
+        row = {"Decedent Name": "Wilma Quarrender"}
+        calls = []
+
+        def blocked(*a, **k):
+            calls.append(a)
+            raise tulsa_treasurer.TreasurerBlocked("captcha_required")
+
+        with mock.patch("tulsa_treasurer.search_owner_name", side_effect=blocked), \
+             mock.patch("time.sleep"):
+            self.main._treasurer_true_negative_check(
+                row, [("decedent", "Wilma Quarrender"), ("pr", "Dale Quarrender"),
+                      ("heir", "Nora Quarrender")])
+        self.assertTrue(row["Treasurer Check"].startswith("Not checked: the Treasurer site requires a captcha"))
+        self.assertIn("likely no property", row["Treasurer Check"])
+        self.assertIn(tulsa_treasurer.MANUAL_SEARCH_URL, row["Treasurer Check"])
+        self.assertEqual(len(calls), 1)            # stops after the first refusal
+        self.assertNotIn("Property Street", row)   # never invents a property
+
+    def test_search_owner_name_raises_on_the_captcha_instead_of_returning_empty(self):
+        import tulsa_treasurer
+        resp = mock.Mock(status_code=403, text='{"error":"captcha_required","why":"none"}')
+        with mock.patch("requests.Session.post", return_value=resp):
+            with self.assertRaises(tulsa_treasurer.TreasurerBlocked):
+                tulsa_treasurer.search_owner_name("Quarrender", "Wilma")
+        other = mock.Mock(status_code=500, text="oops")
+        other.raise_for_status.side_effect = Exception("500")
+        with mock.patch("requests.Session.post", return_value=other):
+            self.assertEqual(tulsa_treasurer.search_owner_name("Quarrender", "Wilma"), [])
+
     def test_corroborated_decedent_hit_is_recorded(self):
         row = {"Decedent Name": "Johnnie Fulton Sr.", "PR Address": "1807 N Main"}
         hits = [{"tax_data_id": "1", "parcel_id": "40800-02-13-05520",

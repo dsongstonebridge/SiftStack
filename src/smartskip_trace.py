@@ -1,5 +1,6 @@
 # Copied unchanged from the deep-prospecting-v5 skill (scripts/smartskip_trace.py).
-# Kept verbatim so it stays diffable against upstream. Used by deep_prospect_run.py.
+# Verbatim except pay(), which refuses (Jeff, 2026-11-02: never bill the card).
+# Used by deep_prospect_run.py.
 #!/usr/bin/env python3
 """Step 0: Run a SmartSkip bulk skip trace through the app.smartskip.io API.
 
@@ -237,6 +238,13 @@ def submit(sess, csv_path, overrides):
 
 
 def pay(sess, bid, pm_id=None):
+    # Jeff, 2026-11-02: SmartSkip never bills the card. deep_prospect_run.py pays
+    # the SmartSkip balance (paymentSource "wallet") in one combined order.
+    raise SystemExit("REFUSED: card payments are switched off. Nothing was charged. "
+                     "Use: python src/deep_prospect_run.py batch, then charge --order")
+
+
+def _card_pay_disabled(sess, bid, pm_id=None):
     if not pm_id:
         code, pms, _ = sess.call("GET", "/payment/payment-method")
         if code != 200 or not pms:

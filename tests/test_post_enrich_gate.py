@@ -40,10 +40,10 @@ class CheckProperty(unittest.TestCase):
         # Foreclosure: only the 3-year sale window (equity dropped 2026-10-12,
         # the value-spread list covers it). Fry and Alexander now pass.
         self.assertEqual(fails, {"Quick", "Vivas", "Watkins"})
-        # Probate still checks equity and keeps the 2-year window.
-        probate = {k for k, p in LIVE.items()
-                   if check_property(p, today=TODAY, notice_type="probate")}
-        self.assertEqual(probate, {"Quick", "Vivas", "Fry", "Alexander"})
+        # Probate checks equity and has no sale window (2026-11-02).
+        for k, p in LIVE.items():
+            for reason in check_property(p, today=TODAY, notice_type="probate"):
+                self.assertNotIn("sold", reason, k)
 
     def test_equity_is_not_a_foreclosure_rule(self):
         low = prop("x", "-11.60", None)
@@ -65,18 +65,16 @@ class CheckProperty(unittest.TestCase):
                                         today=TODAY), [])
 
     def test_boundaries(self):
-        self.assertEqual(check_property(prop("x", "15.00"), today=TODAY,
+        self.assertEqual(check_property(prop("x", "30.00"), today=TODAY,
                                         notice_type="probate"), [])
-        self.assertTrue(check_property(prop("x", "14.99"), today=TODAY,
+        self.assertTrue(check_property(prop("x", "29.99"), today=TODAY,
                                        notice_type="probate"))
         # foreclosure: exactly 3 years ago is outside the window; one day later is inside
         self.assertEqual(check_property(prop("x", "50", "2023-09-25"), today=TODAY), [])
         self.assertTrue(check_property(prop("x", "50", "2023-09-26"), today=TODAY))
-        # probate: still 2 years
-        self.assertEqual(check_property(prop("x", "50", "2024-09-25"), today=TODAY,
+        # probate: a sale last month is not a reason (2026-11-02)
+        self.assertEqual(check_property(prop("x", "50", "2026-08-25"), today=TODAY,
                                         notice_type="probate"), [])
-        self.assertTrue(check_property(prop("x", "50", "2024-09-26"), today=TODAY,
-                                       notice_type="probate"))
 
 
 def typed(st, units=None, use="Residential", **kw):
@@ -241,6 +239,35 @@ class MlsStatusFailure(unittest.TestCase):
             today=TODAY, post_board=lambda o, m: None, set_status=boom)
         self.assertTrue(kept[0]["_mls_listed"])
         self.assertIn("400", kept[0]["_mls_error"])
+
+
+class ProbateEquityFloorTests(unittest.TestCase):
+    """Under 30%: removed from the CRM. Unknown: kept. Foreclosure: no equity rule."""
+
+    def _run(self, equity, notice_type="probate"):
+        deleted = []
+        kept, excluded = apply_post_enrich_gate(
+            [{"Property Street": "1 Main St", "Property City": "Tulsa"}],
+            find_property=lambda *a: {"uuid": "u"},
+            get_property=lambda u: prop("u", equity=equity),
+            delete_property=deleted.append, notice_type=notice_type)
+        return kept, excluded, deleted
+
+    def test_under_thirty_is_removed(self):
+        kept, excluded, deleted = self._run("29.99")
+        self.assertEqual((kept, deleted, excluded[0]["_gate_action"]), ([], ["u"], "deleted"))
+
+    def test_thirty_stays(self):
+        kept, _, deleted = self._run("30")
+        self.assertEqual((len(kept), deleted), (1, []))
+
+    def test_missing_equity_stays(self):
+        kept, _, deleted = self._run(None)
+        self.assertEqual((len(kept), deleted), (1, []))
+
+    def test_foreclosure_has_no_equity_rule(self):
+        kept, _, deleted = self._run("20", notice_type="foreclosure")
+        self.assertEqual((len(kept), deleted), (1, []))
 
 
 if __name__ == "__main__":

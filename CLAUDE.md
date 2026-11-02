@@ -18,6 +18,27 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 8. **REI Skill Library:** 21 Claude Co-Work skill files (`.skill`/`.plugin` ZIPs) for distribution to DataSift community via [learn.datasift.ai/claude-skills-rei](https://learn.datasift.ai/claude-skills-rei). Skills teach Claude specific REI workflows when uploaded to Co-Work sessions or Projects.
 
+## Working with Jeff (read first; his frustrations, 2026-10-27/28)
+
+Jeff has had to correct how I work several times in a row. These are standing rules:
+
+- **Talk like a human.** Plain words, short sentences. Say what happens to his records,
+  texts and money, not which function changes. No code names, jargon or internal labels
+  unless he asks. If he says it doesn't make sense, rewrite it more simply; don't repeat it.
+- **Don't push him for answers.** Lay out the plan, then stop and wait. Don't fire a menu
+  of questions right after a long explanation. When a question is really needed, ask one
+  clear question.
+- **Build only what he asked for.** Don't invent rules, flags, overrides or extra
+  machinery. If an idea is mine and not Jeff's or Ty's (e.g. Ty's deep-prospecting v5
+  method), say so plainly and leave it out unless he says yes. On 2026-10-28 I proposed
+  blocking out-of-state numbers and heirs, plus "tie/untie" override flags. Jeff:
+  unnecessary, bulky, and it risked dropping real heirs. None of that came from him.
+- **Don't overcorrect after a mistake.** A reprimand means fix the actual problem, not lock
+  down the whole pipeline. After the wrong John Webster (2026-10-27: a same-name stranger in
+  Idaho named as the heir), what he wanted was deeper research when the wrong person is
+  possible, and a stop to ask him only when it is really unclear.
+- **Repeat back before building** anything big, or whenever he asks. Then wait for his yes.
+
 ## Commands
 
 ```bash
@@ -929,6 +950,57 @@ Pulls real call recordings from the SmrtPhone web session, transcribes them with
 - **Grading:** Claude (in-session or via Workflow fan-out) scores each `worth_grading` transcript against the skill's `references/rubric.md`, writes per-call reports + per-caller scorecards to `output/call_coaching/reports/{pipeline}/`. Voicemails and wrong numbers are never scored.
 - **Rubric sources:** DataSift Call Playbook (Cold Caller / Lead Manager / Closer scripts + trainings), LEAD-M_1.MD, playbook research corpus + elite-call transcripts.
 
+### Tulsa call coaching: `call-coaching/` (built 2026-09, PAUSED)
+
+**This fork's coach is `call-coaching/`, not `src/call_coaching/`** (that is Ty's
+version, described above, and works differently: 60s cutoff, no spend gate).
+Runbook: `call-coaching/README.md`; grader rules: `call-coaching/GRADING.md`;
+Tulsa rubrics: `call-coaching/rubrics/`. Paused 2026-09-28 until a caller is
+hired. OpenRouter key added to `call-coaching/.env` 2026-10-23.
+
+**NOTHING IS TRANSCRIBED UNLESS THE USER NAMES THE CALLS; EVERY TRANSCRIBED CALL IS
+SCORED** (Diego, 2026-10-26, enforced in code). Transcription is the billed step
+and the only gate he opens:
+- `transcribe.py --commit` REFUSES without `--call-id A,B`; there is no "all
+  calls" option, and an unknown id stops the run before anything is sent.
+  Without `--commit` it only prints the cost estimate.
+- Scoring is free (Claude in-session), so it needs no approval: `grade.py`
+  `queue`/`check` score every call that has a transcript (`is_transcribed()`),
+  however it got there, and reject a report for any call that has none. Grade
+  them right after transcribing without asking again.
+- Voicemails, wrong numbers and dead air are sorted `not_gradeable` and go to
+  the Connection Log, never scored. Diego: "we'll probably never score a voicemail".
+- Do not run the coach from a branch older than commit 789a158 (e.g.
+  `sms-agent-diego` as of 2026-10-26): its copy has no spend gate.
+- Tests: `py -3 call-coaching/tests/test_say_so.py` (11 checks, stubbed paid
+  step), `tests/test_combined.py` (24) and `tests/test_grading.py` (14).
+
+**COMBINED CALLS (2026-10-26).** Roles for now: Diego is cold caller AND lead
+manager, Jeff is the closer, no cold caller hired yet. Diego usually rolls a
+cold call straight into lead management while he has the seller (booking a
+callback with himself would be strange). Neither single rubric grades that
+fairly: cold call 5.4 scores 0 for "no booking attempt" and lead management
+1.1 scores 0 for "no prior conversation". So a fourth type, `combined`
+(`rubrics/combined.md`), grades it in three parts: Part A opening on cold-call
+criteria (cold cats 1 and 3, 25%), Part B the switch (new 3.1-3.3: earned it,
+asked permission, set time/agenda/result; never N/A, 10%), Part C on
+lead-management criteria (LM cats 2-5, 65%; tonality judged over the whole
+call). JSON carries `parts` (opening / switch / lead_management, each /100),
+checked by `rubric_spec.compute_parts`. Reused criteria point to the source
+rubrics BY NUMBER and a test fails if their names drift. No short version.
+- **The user's type always wins:** `--call-id CA1:combined` (also `cold`,
+  `lm`, `closing`). Without one, the sorting step decides and suggests the
+  switch line; the transcript header records who set it. Diego chose telling
+  us the type as the safer route, since spotting the exact switch is the
+  hard part for the model.
+- Once a cold caller is hired and the roles split, calls go back to plain
+  cold_call / lead_management with no rubric change needed.
+
+Cost (live OpenRouter prices 2026-10-23, Gemini 2.5 Flash): audio $1/M tokens
+(1,920 tokens per minute = $0.00192/min) plus output $2.50/M, about
+$0.0025/min all in. Gemini's default "thinking" adds an unknown amount on top;
+turning it off was discussed, not built.
+
 ## Two-Way SMS Agent (build 1.0.38, 2026-08)
 
 `src/sms_agent/` sends outreach, reads replies in real time, classifies them, writes the result back to DataSift (phone status, opt-outs, lead status), and hands positive responses to a prospector in Slack. Full runbook: `src/sms_agent/README.md`.
@@ -1236,7 +1308,8 @@ https://oktaxrolls.com/search/Tulsa
 python src/deep_prospect_run.py start  --street "123 Main St" --city Tulsa \
     --search-person "Mary Smith" --search-at property --spouse "John Smith" \
     --known "Susan Smith"                                    # FREE
-python src/deep_prospect_run.py charge --run output/deep_prospect/123-main-st   # BILLS SmartSkip
+python src/deep_prospect_run.py batch --list records.json   # FREE: ONE order for all records (use this)
+python src/deep_prospect_run.py charge --order output/deep_prospect/_orders/<id>   # BILLS the BALANCE once
 python src/deep_prospect_run.py finish --run output/deep_prospect/123-main-st --decedent \
     --primary "Susan Smith" --relationship "Susan Smith=Daughter" --basis "why"  # dry run
 python src/deep_prospect_run.py finish ... --commit          # BILLS Trestle, writes
@@ -1247,8 +1320,8 @@ no-unapproved-spend rule; the code itself only gates on `--commit`):
 1. `charge`: SmartSkip, ~$0.15 per hit. **The WALLET does work (found 2026-10-23 in
    the app's BulkSkipView bundle):** `POST /bulk-skip/payment-intent
    {"bulkSkipId": ..., "paymentSource": "wallet"}` returns `{status,
-   walletTransactionId}`; `GET /wallet/balance` reports CENTS. Try the wallet first,
-   the saved card only if it refuses (and only up to what Jeff approved).
+   walletTransactionId}`; `GET /wallet/balance` reports CENTS. The card is never
+   used (Jeff, 2026-11-02); see "SmartSkip: one order" below.
    **Several records = ONE SmartSkip order, never one order each** (Jeff, 2026-10-23):
    run `start` per record (free), combine the one-row inputs into one CSV, submit and
    pay once, then split the vertical export back into each run's
@@ -1850,6 +1923,93 @@ clean rows proceed to creation in the same run, and only the flagged rows are he
 in the review sheet) for a later manual pass. Mirrors how `apply_buy_box()` already splits
 kept/rejected rows rather than failing the whole batch on one exclusion.
 
+**THE TREASURER HAS REQUIRED A CAPTCHA SINCE 2026-10-27** (Cloudflare Turnstile; every search
+answers HTTP 403 `captcha_required`). `search_owner_name()` used to swallow that and return
+`[]`, so this fallback quietly found nothing and wrote no note. It now raises
+`TreasurerBlocked`. The check stops after the first refusal and writes `Treasurer Check:
+Not checked: the Treasurer site requires a captcha. The Assessor found nothing, so there is
+likely no property. Check by hand if worth it: https://oktaxrolls.com/search/Tulsa`. Jeff
+(2026-10-28): no paid solve. If the Assessor has nothing, there is likely no property anyway,
+and he checks by hand when he thinks it's worth it. The check is passed once per browser
+session (the site's `human.js`), so a paid solve would cost about $0.0015 per run, not per
+search, if he ever changes his mind.
+
+### Address already in the CRM (2026-11-02)
+
+`processed_cases.crm_check_rows()` runs in `--create` once addresses are known,
+before the buy box and before anything is written or billed. **A probate whose
+address is already in the CRM is never written**, whether the record carries this
+case (already processed) or anything else (a foreclosure, an older list, another
+probate). A row whose check could not run is skipped too; re-run it. Skipped rows
+are listed in the run's log under `ADDRESS ALREADY IN THE CRM`; clean rows carry
+on. Search is by address alone, so a same-street match in another town is skipped
+too. There is deliberately no override (user, 2026-11-02): do not add one, and do
+not offer `Not A Duplicate`, which is a foreclosure-only column.
+
+### Probate has no recent-sale rule; equity numbers (2026-11-02)
+
+The post-enrichment gate's sale window is foreclosure only: on probate a recent
+$0 deed is usually the inheritance itself. Under 30% equity is removed from the CRM
+and never traced, on every probate run, and a record with no equity number is kept
+and traced. A SiftMap disagreement is fine unless it shows a totally different
+owner, which gets flagged for a human.
+
+### Deep prospecting: our research trumps SmartSkip (Jeff, 2026-11-02)
+
+`deep_prospect_run.py finish` refuses without `dp_research.json` in the run folder
+(fields in `dp_board_split.load_research`). Research sets the labels, the real
+relationships, who is dead or not family (never scored), and who SmartSkip missed. A
+call-first label must name its source (filing, obit, county, deed, conversation). Read
+the Message Boards and the obituaries FIRST; a probate's filing and signing chain
+usually settle who holds title and who is alive, so do not ask Jeff what they already say.
+
+- **Phone list:** a new number reaches the record only at Dial First or Second. On a
+  DEEP PROSPECTED record, an older number below Second also comes off, whatever skip
+  trace found it. A record NOT deep prospected never loses a number: `dp_board_split.py`
+  refuses without the `SmartSkip Skipped` tag. Never removed: a number a caller marked
+  (any status but UNKNOWN), or the last numbers on a record (the list is never emptied).
+  A number comes off only after the post is confirmed on the board.
+- **Post and PDF share one layout:** owner of record, alive or dead, who to call, then one
+  line per person with numbers separated by semicolons. Earlier scores are kept in
+  `state.json` (`tiers`), so re-running finish never pays Trestle twice.
+- **Wording trap:** `sms_agent/death_check.py` bans every first name on a line containing
+  "obituary", "funeral" or "decedent". Write "obit" on any line naming a living person,
+  and keep the living out of a sentence that says someone died.
+- **Run folders:** `SMS_AGENT_DP_RUNS_DIR` sets the one folder for every checkout. The SMS
+  agent holds a record whose run folder it cannot find.
+- **Repair:** `python src/dp_board_split.py --run-dir <folder> [--commit]` brings a record
+  written under the old rules up to these, using its `dp_research.json`.
+
+### SmartSkip: one order, paid from the balance, never the card (2026-11-02)
+
+Jeff's hard rule. `batch` puts every record in ONE order; `start` is refused without
+`--only-one`, and refused within an hour of another order, so a run of singles cannot
+happen. `charge` pays once with `POST /bulk-skip/payment-intent {bulkSkipId,
+paymentSource: "wallet"}`, read out of the web app's own bundle, and no card is named.
+A short balance, or anything but a clean balance payment, stops with the order still
+open: there is no card fallback. `smartskip_trace.pay()` refuses in `src/`. `/wallet/balance`
+is in CENTS. The results are split back to each record's run folder by property address.
+
+### Server rewrites and throttling on lookups (2026-11-02)
+
+The server can also drop a LEADING directional and re-space a name: sent
+`100 S MAPLE ST W`, stored `100 Maple St`. Four of 43 rows on one batch read as
+"never created" and got no notes, board or trace. `_is_server_rewrite()` now matches
+these in both `find_property_by_address()` (tier 4) and the `wait_for_properties()`
+scan: a direction may be dropped but never changed, and the match must be unique.
+`search_by_address()` now waits out a 429. It used to raise, which the lookup read as
+"no record", so 11 rows skipped the duplicate check and 8 skipped the equity gate.
+
+### Inherited houses and trusts (2026-11-02)
+
+**A house that came from the decedent stays a lead even if an heir or surviving
+joint tenant now holds title** (TOD, survivorship, trust deed to a named person).
+Read the deed history: Durbin's search went to zero because title had moved to
+Regina Miller. **A home the family owned on its own, with no deed from the decedent,
+is not a lead.** A "personal property only" petition can still mean a house passed
+outside probate, so check heirs' addresses and deed history before calling it done.
+A named trust is not an automatic exclusion unless the filing says personal only.
+
 ### Known gaps
 
 1. ~~`--create` is not safe to re-run~~ **Fixed 2026-10-05** — see "Running
@@ -2003,8 +2163,43 @@ many wake events that are not someone using the PC.
 - Conversation = reached a person AND (1 min+ OR an owner call with a same-day talk note or
   owner-outcome status: Not interested / a lead). This includes wrong-number calls of 1 min+.
 - Slack lines must add up: Reached = owner + inbound callback + someone else (wrong #);
-  Conversations + brief pickups = Reached; 2 min+ is separate. Leads = any lead status incl.
-  New Lead; Qualified = Cold/Warm/Hot. Follow-up tasks = tasks with "follow" in the title.
+  Conversations + brief pickups = Reached; 2 min+ is separate. Qualified = Cold/Warm/Hot.
+  Follow-up tasks = tasks with "follow" in the title.
+- **Leads (Jeff, 2026-10-30) = exactly Lead, New Lead, No Contact New Lead, Nurture New Lead,
+  Cold, Warm, Hot, Ghosting Lead.** Not Interested is NOT a lead. The post breaks leads down
+  by those statuses.
+- **The 2026-10-30 post layout:** every line carries a bracketed description (Jeff: visually
+  clean, extremely clear). Sections CALLS / NUMBERS / CONTACT / LEADS / BY CALLER / TEXTS.
+  Fridays post it twice: the day, and Monday-Friday (`--week-of`, "Weekly summary"), plus the
+  sheet bot's summary. New numbers and their rules:
+  - Call length bands (under 30s / 30-60s / 1-2 min / 2 min+) count LIVE pickups only, so they
+    add up to Reached. Dial hours = first to last dial per caller per day (smrtPhone).
+  - Missed callbacks = inbound calls nobody answered, one per number, and how many we have not
+    called back since.
+  - Correct, all = numbers newly marked that day/week (a number marked earlier is never counted
+    again); Correct, live pickup = of those, a smrtPhone-counted pickup on that number that day.
+  - **Right-party contact (Jeff, 2026-10-30, "it is so simple") = a person reached by a
+    pickup, callback or text reply on a number whose status is Correct AND that is the
+    owner's primary phone, read right before the post. Phone tags do NOT matter.** Correct
+    but not primary = secondary contact (relatives / secondary decision makers), its own
+    line, not in the contact rate. Not Correct = neither. Shown as total / call / text only
+    (a record reached both ways counts under call). A NO_ANSWER status whose last other
+    status was Correct stays Correct (`sms_kpis.contact_role`). Only PROPERTY ids count:
+    smrtPhone's crm link also carries the owner's id, which once counted every owner twice.
+  - Records reached out to (top of the post) = records called or texted. Contact rate = right-party
+    contacts / records reached out to (was: records worked = dialed, texted, or
+    reached). Contact check (Jeff's cross-check) = records newly set to a lead status or
+    Not Interested / records worked.
+  - Text confirmed = within 14 days after a text reply, the number was marked Correct (by
+    hand or by the agent) or the record became a lead / Not Interested. Record ids travel
+    from the PC to GitHub only as sha256 hashes (`sms_kpis.rec_hash`).
+  - Reply rate divides by people whose text was DELIVERED. Reply response time = median from a
+    reply to our first call or hand-typed text (opt-outs and wrong numbers left out). Replies
+    that became a call = they called us, or our call ran 1 min+. Sending-number flags are read
+    from the SMS agent's cached NumberVerifier data in its DB, never fetched by the KPI run.
+  - Records reached over time (Friday post) = a hashed ledger in GitHub's Actions cache
+    (`kpi-engine/reports/ledger.json`), started 2026-10-30. Back-filling it to the first
+    calling day means reading every record touched since: needs Jeff's yes.
 - **Audit line (2026-10-02):** every post lists `smrtPhone calls over 2 min not counted:
   time + reason` (or "none") so a miss surfaces the same night. Also a ⚠️ line when
   smrtPhone outbound calls differ from DataSift dials. If smrtPhone login fails the post

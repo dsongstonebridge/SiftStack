@@ -406,6 +406,18 @@ def fill_texts(sh, days, dry):
             ws.update(range_name="A1", values=[sms_kpis.SHEET_COLUMNS])
             ws.freeze(rows=1)
             k.log("Texts: tab created")
+        # columns added later (2026-10-30) go on the end of the existing header
+        header = ws.row_values(1)
+        new = [c for c in sms_kpis.SHEET_COLUMNS if c not in header]
+        if new:
+            if dry:
+                k.log(f"Texts: would add columns {new}")
+            else:
+                if ws.col_count < len(header) + len(new):
+                    ws.add_cols(len(header) + len(new) - ws.col_count)
+                import gspread
+                ws.update(range_name=gspread.utils.rowcol_to_a1(1, len(header) + 1), values=[new])
+                k.log(f"Texts: added columns {new}")
         upsert(ws, rows, ["Date"], dry)
     except Exception as ex:
         k.log(f"Texts skipped: {type(ex).__name__}: {ex}")

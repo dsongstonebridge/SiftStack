@@ -1921,6 +1921,24 @@ on. Search is by address alone, so a same-street match in another town is skippe
 too. There is deliberately no override (user, 2026-11-02): do not add one, and do
 not offer `Not A Duplicate`, which is a foreclosure-only column.
 
+### Probate has no recent-sale rule; equity numbers (2026-11-02)
+
+The post-enrichment gate's sale window is foreclosure only: on probate a recent
+$0 deed is usually the inheritance itself. Under 15% equity is deleted, 15% to 30%
+stays in the CRM with no trace spend, and a record with no equity number is kept
+and traced. A SiftMap disagreement is fine unless it shows a totally different
+owner, which gets flagged for a human.
+
+### Inherited houses and trusts (2026-11-02)
+
+**A house that came from the decedent stays a lead even if an heir or surviving
+joint tenant now holds title** (TOD, survivorship, trust deed to a named person).
+Read the deed history: Durbin's search went to zero because title had moved to
+Regina Miller. **A home the family owned on its own, with no deed from the decedent,
+is not a lead.** A "personal property only" petition can still mean a house passed
+outside probate, so check heirs' addresses and deed history before calling it done.
+A named trust is not an automatic exclusion unless the filing says personal only.
+
 ### Known gaps
 
 1. ~~`--create` is not safe to re-run~~ **Fixed 2026-10-05** — see "Running

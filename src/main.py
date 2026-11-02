@@ -2015,6 +2015,27 @@ def _report_already_processed(repeats: list[dict]) -> None:
     logging.warning("")
 
 
+def _report_existing_record_holds(held: list[dict]) -> None:
+    """Rows skipped because the address is already in the CRM under something else,
+    or because the check could not run. Same reason to be loud as above."""
+    if not held:
+        return
+    logging.warning("")
+    logging.warning("=== ADDRESS ALREADY IN THE CRM - SKIPPED, NOT CREATED OR TRACED (%d) ===", len(held))
+    for r in held:
+        e = r.get("_existing_record") or {}
+        label = f"{r.get('Case Number') or '?'} {r.get('Decedent Name') or ''}".strip()
+        if e.get("error"):
+            logging.warning("  %s | %s | CRM check FAILED, re-run: %s",
+                            label, r.get("Property Street") or "?", e["error"])
+        else:
+            logging.warning("  %s | %s | existing record %s: owner %s, status %s, lists %s",
+                            label, r.get("Property Street") or "?", e.get("uuid") or "?",
+                            e.get("owner") or "?", e.get("status") or "none",
+                            e.get("lists") or "none")
+    logging.warning("")
+
+
 def _create_records_for_batch(args, csv_path: Path) -> list[dict] | None:
     """`--create` front end: raw property template -> CRM records, ready for
     run_pipeline() to trace and score.
@@ -2342,14 +2363,16 @@ def _create_fresh_rows(args, template_rows: list[dict], notice_type: str) -> dic
         run_timer.stop(_t)
         # Second net, now that addresses are known: a CRM record at the address
         # whose Notes carry the case number (covers cases created before the
-        # ledger existed).
+        # ledger existed), or any other record at that address, which is skipped
+        # before anything is posted to it or billed.
         import processed_cases
         from datasift_api import find_property_by_address, get_property
         _t = run_timer.start("already-processed CRM check")
-        template_rows, repeats = processed_cases.crm_check_rows(
+        template_rows, repeats, existing = processed_cases.crm_check_rows(
             template_rows, find_property_by_address, get_property)
         run_timer.stop(_t)
         _report_already_processed(repeats)
+        _report_existing_record_holds(existing)
         if not template_rows:
             logging.error("Every row was already in the CRM - nothing to create.")
             return None

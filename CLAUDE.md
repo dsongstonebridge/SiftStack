@@ -1909,6 +1909,18 @@ and he checks by hand when he thinks it's worth it. The check is passed once per
 session (the site's `human.js`), so a paid solve would cost about $0.0015 per run, not per
 search, if he ever changes his mind.
 
+### Address already in the CRM (2026-11-02)
+
+`processed_cases.crm_check_rows()` runs in `--create` once addresses are known,
+before the buy box and before anything is written or billed. **A probate whose
+address is already in the CRM is never written**, whether the record carries this
+case (already processed) or anything else (a foreclosure, an older list, another
+probate). A row whose check could not run is skipped too; re-run it. Skipped rows
+are listed in the run's log under `ADDRESS ALREADY IN THE CRM`; clean rows carry
+on. Search is by address alone, so a same-street match in another town is skipped
+too. There is deliberately no override (user, 2026-11-02): do not add one, and do
+not offer `Not A Duplicate`, which is a foreclosure-only column.
+
 ### Known gaps
 
 1. ~~`--create` is not safe to re-run~~ **Fixed 2026-10-05** — see "Running

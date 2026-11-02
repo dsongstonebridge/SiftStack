@@ -106,35 +106,73 @@ class CheckRowsTests(_Ledgered):
 class CrmCheckTests(unittest.TestCase):
     ROW = {"Case Number": "PB-2026-0761", "Property Street": "1916 S 140th East Ave",
            "Property City": "Tulsa", "Property State": "OK"}
+    RECORD = {"owner": {"first_name": "Pat", "last_name": "Old"}, "status": "cold_lead",
+              "lists": [{"title": "Foreclosure"}], "tags": ["FTM"],
+              "address": {"street": "1916 S 140th East Ave", "city": "Tulsa"}}
 
-    def _run(self, found, notes, row=None, find_raises=False):
-        def find(street, city, state):
+    def _run(self, found, notes, row=None, find_raises=False, get_raises=False):
+        self.calls = []
+
+        def find(street, city, state, strict=False):
+            self.calls.append((street, city, state, strict))
             if find_raises:
                 raise RuntimeError("down")
             return found
-        return pc.crm_check_rows([dict(row or self.ROW)], find, lambda u: {"notes": notes})
+
+        def get(uuid):
+            if get_raises:
+                raise RuntimeError("down")
+            return {**self.RECORD, "notes": notes}
+        return pc.crm_check_rows([dict(row or self.ROW)], find, get)
+
+    def _counts(self, out):
+        return tuple(len(x) for x in out)
 
     def test_record_whose_notes_carry_the_case_is_a_repeat(self):
-        fresh, already = self._run({"uuid": "u9"}, "PROBATE FILING\n  Case Number: PB-2026-0761\n")
-        self.assertEqual((len(fresh), len(already)), (0, 1))
-        self.assertIn("u9", already[0]["_already_processed"]["where"])
+        out = self._run({"uuid": "u9"}, "PROBATE FILING\n  Case Number: PB-2026-0761\n")
+        self.assertEqual(self._counts(out), (0, 1, 0))
+        self.assertIn("u9", out[1][0]["_already_processed"]["where"])
 
-    def test_same_address_but_a_different_case_is_a_different_lead(self):
-        fresh, already = self._run({"uuid": "u9"}, "FORECLOSURE PETITION\n  Case Number: CJ-2026-100\n")
-        self.assertEqual((len(fresh), len(already)), (1, 0))
+    def test_same_address_but_a_different_case_is_held(self):
+        out = self._run({"uuid": "u9"}, "FORECLOSURE PETITION\n  Case Number: CJ-2026-100\n")
+        self.assertEqual(self._counts(out), (0, 0, 1))
+        e = out[2][0]["_existing_record"]
+        self.assertEqual((e["uuid"], e["owner"], e["status"], e["lists"], e["tags"]),
+                         ("u9", "Pat Old", "cold_lead", "Foreclosure", "FTM"))
+
+    def test_another_probate_case_at_the_address_is_held(self):
+        out = self._run({"uuid": "u9"}, "Case Number: PB-2026-100")
+        self.assertEqual(self._counts(out), (0, 0, 1))
+
+    def test_not_a_duplicate_column_does_not_release_anything(self):
+        out = self._run({"uuid": "u9"}, "", row={**self.ROW, "Not A Duplicate": "Yes"})
+        self.assertEqual(self._counts(out), (0, 0, 1))
+
+    def test_row_with_no_case_number_at_a_known_address_is_held(self):
+        out = self._run({"uuid": "u9"}, "", row={"Property Street": "1916 S 140th East Ave"})
+        self.assertEqual(self._counts(out), (0, 0, 1))
 
     def test_address_not_in_the_crm_is_fresh(self):
-        fresh, already = self._run(None, "")
-        self.assertEqual((len(fresh), len(already)), (1, 0))
+        self.assertEqual(self._counts(self._run(None, "")), (1, 0, 0))
 
-    def test_lookup_failure_never_loses_the_row(self):
-        fresh, already = self._run(None, "", find_raises=True)
-        self.assertEqual((len(fresh), len(already)), (1, 0))
+    def test_search_is_strict_and_ignores_the_city(self):
+        self._run(None, "")
+        self.assertEqual(self.calls, [("1916 S 140th East Ave", "", "", True)])
 
-    def test_row_without_an_address_is_left_for_the_ledger(self):
-        fresh, already = self._run({"uuid": "u9"}, "Case Number: PB-2026-761",
-                                   row={"Case Number": "PB-2026-761"})
-        self.assertEqual((len(fresh), len(already)), (1, 0))
+    def test_failed_search_holds_the_row(self):
+        out = self._run(None, "", find_raises=True)
+        self.assertEqual(self._counts(out), (0, 0, 1))
+        self.assertIn("down", out[2][0]["_existing_record"]["error"])
+
+    def test_failed_record_read_holds_the_row(self):
+        out = self._run({"uuid": "u9"}, "", get_raises=True)
+        self.assertEqual(self._counts(out), (0, 0, 1))
+
+    def test_row_without_an_address_is_left_for_the_buy_box(self):
+        out = self._run({"uuid": "u9"}, "Case Number: PB-2026-761",
+                        row={"Case Number": "PB-2026-761"})
+        self.assertEqual(self._counts(out), (1, 0, 0))
+        self.assertEqual(self.calls, [])
 
 
 class PipelineWiringTests(_Ledgered):
@@ -159,6 +197,33 @@ class PipelineWiringTests(_Ledgered):
              mock.patch.object(main, "_read_property_template", return_value=rows), \
              mock.patch.object(main, "_enrich_probate_rows",
                                side_effect=AssertionError("looked up an already-processed case")):
+            out = main._create_records_for_batch(Args(), Path("batch.xlsx"))
+        self.assertIsNone(out)
+
+
+class ExistingRecordWiringTests(_Ledgered):
+    """A held row must stop before the buy box and creation."""
+
+    def test_every_row_held_creates_nothing(self):
+        import main
+        import created_rows
+
+        class Args:
+            notice_type = "probate"
+            county = "Tulsa"
+            trial_tag = None
+            list_name = None
+
+        rows = [{"Property Street": "1 Main St", "Last Name": "A", "Case Number": "PB-2026-901"}]
+        with mock.patch.object(pc, "LEDGER_PATH", self.path), \
+             mock.patch.object(created_rows, "LEDGER_PATH",
+                               Path(self._tmp.name) / "created.json"), \
+             mock.patch.object(main, "_read_property_template", return_value=rows), \
+             mock.patch.object(main, "_enrich_probate_rows", side_effect=lambda rs: rs), \
+             mock.patch("datasift_api.find_property_by_address", return_value={"uuid": "u1"}), \
+             mock.patch("datasift_api.get_property", return_value={"notes": "Case Number: CJ-2026-1"}), \
+             mock.patch("buy_box.apply_buy_box",
+                        side_effect=AssertionError("a held row reached the buy box")):
             out = main._create_records_for_batch(Args(), Path("batch.xlsx"))
         self.assertIsNone(out)
 

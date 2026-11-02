@@ -1924,10 +1924,20 @@ not offer `Not A Duplicate`, which is a foreclosure-only column.
 ### Probate has no recent-sale rule; equity numbers (2026-11-02)
 
 The post-enrichment gate's sale window is foreclosure only: on probate a recent
-$0 deed is usually the inheritance itself. Under 15% equity is deleted, 15% to 30%
-stays in the CRM with no trace spend, and a record with no equity number is kept
+$0 deed is usually the inheritance itself. Under 30% equity is removed from the CRM
+and never traced, on every probate run, and a record with no equity number is kept
 and traced. A SiftMap disagreement is fine unless it shows a totally different
 owner, which gets flagged for a human.
+
+### Server rewrites and throttling on lookups (2026-11-02)
+
+The server can also drop a LEADING directional and re-space a name: sent
+`100 S MAPLE ST W`, stored `100 Maple St`. Four of 43 rows on one batch read as
+"never created" and got no notes, board or trace. `_is_server_rewrite()` now matches
+these in both `find_property_by_address()` (tier 4) and the `wait_for_properties()`
+scan: a direction may be dropped but never changed, and the match must be unique.
+`search_by_address()` now waits out a 429. It used to raise, which the lookup read as
+"no record", so 11 rows skipped the duplicate check and 8 skipped the equity gate.
 
 ### Inherited houses and trusts (2026-11-02)
 

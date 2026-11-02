@@ -318,9 +318,17 @@ def search_by_address(address_prefix: str, *, limit: int = 10, offset: int = 0,
             "query": {"must": must}}
     headers = _headers(has_body=True, auth="api_key")
     headers["x-http-method-override"] = "GET"
-    _pace()
-    resp = requests.post(f"{CORE_BASE}/api/internal/property/",
-                         headers=headers, json=body, timeout=45)
+    # A 429 here used to raise straight away, and find_property_by_address turned
+    # that into "no record": on 2026-11-02 it skipped 11 rows' duplicate check and
+    # let 8 records through the equity gate unchecked. Wait it out like _request does.
+    for attempt in range(1, 7):
+        _pace()
+        resp = requests.post(f"{CORE_BASE}/api/internal/property/",
+                             headers=headers, json=body, timeout=45)
+        if resp.status_code != 429 or attempt == 6:
+            break
+        hint = re.search(r"available in (\d+) second", resp.text)
+        time.sleep((int(hint.group(1)) if hint else 2 ** attempt) + 1)
     if not resp.ok:
         raise DataSiftAPIError(
             f"search_by_address({address_prefix!r}) -> {resp.status_code}: {resp.text[:300]}")
@@ -345,6 +353,7 @@ _STREET_ABBR = {
     "PLACE": "PL", "LANE": "LN", "COURT": "CT", "BOULEVARD": "BLVD",
     "CIRCLE": "CIR", "TERRACE": "TER", "PARKWAY": "PKWY", "TRAIL": "TRL",
     "HIGHWAY": "HWY", "SUITE": "STE", "APARTMENT": "APT",
+    "AV": "AVE", "BV": "BLVD",           # the Assessor's spellings
 }
 
 
@@ -419,6 +428,36 @@ def _strip_dir(normalized: str) -> str:
     if len(toks) > 2 and toks[-1] in _DIRECTIONALS:
         toks = toks[:-1]
     return " ".join(toks)
+
+
+def _street_parts(normalized: str) -> tuple[str, str | None, str | None, str]:
+    """(house number, leading directional, trailing directional, street name with
+    its type and its spaces removed), from a _norm_street() string."""
+    toks = normalized.split()
+    house, rest = (toks[0], toks[1:]) if toks else ("", [])
+    lead = rest.pop(0) if len(rest) > 1 and rest[0] in _DIRECTIONALS else None
+    trail = rest.pop() if len(rest) > 1 and rest[-1] in _DIRECTIONALS else None
+    if len(rest) > 1 and rest[-1] in _STREET_SUFFIXES:
+        rest.pop()
+    # _norm_street shortened "South" to "S", which "SOUTHPARK" never was.
+    full = {"N": "NORTH", "S": "SOUTH", "E": "EAST", "W": "WEST"}
+    return house, lead, trail, "".join(full.get(t, t) for t in rest)
+
+
+def _is_server_rewrite(sent: str, stored: str) -> bool:
+    """Could `stored` be what the server made of `sent`? Both _norm_street() strings.
+
+    The server geocodes on write and can drop EITHER directional and re-space the
+    name: sent "100 S MAPLE ST W", stored "100 Maple St"; sent "200 W OAKPARK BV S",
+    stored "200 W Oak Park Blvd". A direction may be DROPPED but never CHANGED, since
+    "E 56th St N" and "E 56th St S" are different streets. Callers also require the
+    match to be unique. Four of 43 probate rows hit this on 2026-11-02: each record
+    existed, read as "never created", and got no notes, no board and no trace.
+    """
+    s_house, s_lead, s_trail, s_name = _street_parts(sent)
+    t_house, t_lead, t_trail, t_name = _street_parts(stored)
+    return (bool(s_name) and s_house == t_house and s_name == t_name
+            and t_lead in (None, s_lead) and t_trail in (None, s_trail))
 
 
 def _bare_street(normalized: str) -> str:
@@ -525,6 +564,22 @@ def find_property_by_address(street: str, city: str = "", state: str = "", *,
                 "trailing directional is ignored (%s) — refusing to guess",
                 street, len(cands),
                 [(r.get("address") or {}).get("street") for r in cands[:4]])
+            continue
+
+        # Tier 4 - the server dropped a LEADING directional too, or re-spaced the
+        # name. Same unique-candidate rule; see _is_server_rewrite().
+        cands = [r for r in results
+                 if _is_server_rewrite(want, _norm_street((r.get("address") or {}).get("street")))
+                 and city_ok(r.get("address") or {})]
+        if len(cands) == 1:
+            logger.info("find_property_by_address: matched %r to stored %r (server "
+                        "rewrote it; only candidate)", street,
+                        (cands[0].get("address") or {}).get("street"))
+            return cands[0]
+        if len(cands) > 1:
+            logger.warning("find_property_by_address: %r matches %d rewritten records "
+                           "(%s) - refusing to guess", street, len(cands),
+                           [(r.get("address") or {}).get("street") for r in cands[:4]])
     return None
 
 
@@ -668,6 +723,33 @@ def bulk_create_properties(records: list[dict], *,
 
 
 def _scan_page_matches(items: list[dict], remaining: set[str]) -> list[tuple[str, dict]]:
+    """_scan_exact_and_directional, then any server rewrite (_is_server_rewrite)
+    that is unique on both sides. Without this pass a rewritten address sits out
+    the whole 300s timeout before the fallback lookup finds it."""
+    hits = _scan_exact_and_directional(items, remaining)
+    done = {k for k, _ in hits}
+    used = {id(r) for _, r in hits}
+    pairs: list[tuple[str, dict]] = []
+    for rec in items:
+        if id(rec) in used:
+            continue
+        addr = rec.get("address") or {}
+        stored = _norm_street(addr.get("street"))
+        city = (addr.get("city") or "").strip().lower()
+        for k in remaining - done:
+            street, _, want_city = k.partition("|")
+            if want_city == city and _is_server_rewrite(street, stored):
+                pairs.append((k, rec))
+    for k, rec in pairs:
+        if (sum(1 for a, _ in pairs if a == k) == 1
+                and sum(1 for _, r in pairs if r is rec) == 1):
+            logger.info("wait_for_properties: matched %r to stored %r (server rewrote it; "
+                        "unique on both sides)", k, (rec.get("address") or {}).get("street"))
+            hits.append((k, rec))
+    return hits
+
+
+def _scan_exact_and_directional(items: list[dict], remaining: set[str]) -> list[tuple[str, dict]]:
     """Match one page of the -created listing against the addresses still awaited.
 
     Returns (awaited_key, record) pairs in page order: exact address_key()

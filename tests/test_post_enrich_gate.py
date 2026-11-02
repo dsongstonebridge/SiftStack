@@ -65,9 +65,9 @@ class CheckProperty(unittest.TestCase):
                                         today=TODAY), [])
 
     def test_boundaries(self):
-        self.assertEqual(check_property(prop("x", "15.00"), today=TODAY,
+        self.assertEqual(check_property(prop("x", "30.00"), today=TODAY,
                                         notice_type="probate"), [])
-        self.assertTrue(check_property(prop("x", "14.99"), today=TODAY,
+        self.assertTrue(check_property(prop("x", "29.99"), today=TODAY,
                                        notice_type="probate"))
         # foreclosure: exactly 3 years ago is outside the window; one day later is inside
         self.assertEqual(check_property(prop("x", "50", "2023-09-25"), today=TODAY), [])
@@ -241,8 +241,8 @@ class MlsStatusFailure(unittest.TestCase):
         self.assertIn("400", kept[0]["_mls_error"])
 
 
-class ProbateTraceEquityTests(unittest.TestCase):
-    """Under 30%: kept, no spend. Under 15%: still deleted. Unknown: fails open."""
+class ProbateEquityFloorTests(unittest.TestCase):
+    """Under 30%: removed from the CRM. Unknown: kept. Foreclosure: no equity rule."""
 
     def _run(self, equity, notice_type="probate"):
         deleted = []
@@ -253,25 +253,21 @@ class ProbateTraceEquityTests(unittest.TestCase):
             delete_property=deleted.append, notice_type=notice_type)
         return kept, excluded, deleted
 
-    def test_under_thirty_is_kept_and_marked(self):
+    def test_under_thirty_is_removed(self):
         kept, excluded, deleted = self._run("29.99")
-        self.assertEqual((kept[0]["_low_equity"], excluded, deleted), (29.99, [], []))
+        self.assertEqual((kept, deleted, excluded[0]["_gate_action"]), ([], ["u"], "deleted"))
 
-    def test_thirty_is_not_marked(self):
-        kept, _, _ = self._run("30")
-        self.assertNotIn("_low_equity", kept[0])
+    def test_thirty_stays(self):
+        kept, _, deleted = self._run("30")
+        self.assertEqual((len(kept), deleted), (1, []))
 
-    def test_under_fifteen_is_still_deleted(self):
-        kept, excluded, deleted = self._run("13")
-        self.assertEqual((kept, deleted), ([], ["u"]))
+    def test_missing_equity_stays(self):
+        kept, _, deleted = self._run(None)
+        self.assertEqual((len(kept), deleted), (1, []))
 
-    def test_missing_equity_fails_open(self):
-        kept, _, _ = self._run(None)
-        self.assertNotIn("_low_equity", kept[0])
-
-    def test_foreclosure_is_never_marked(self):
-        kept, _, _ = self._run("20", notice_type="foreclosure")
-        self.assertNotIn("_low_equity", kept[0])
+    def test_foreclosure_has_no_equity_rule(self):
+        kept, _, deleted = self._run("20", notice_type="foreclosure")
+        self.assertEqual((len(kept), deleted), (1, []))
 
 
 if __name__ == "__main__":

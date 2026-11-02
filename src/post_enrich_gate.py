@@ -2,7 +2,7 @@
 
 The user's rules (2026-09-23): he does NOT buy a property that is
 
-  1. carrying **less than 15% equity** (PROBATE ONLY since 2026-10-12: the user
+  1. carrying **less than 30% equity** (15% until 2026-11-02; PROBATE ONLY since 2026-10-12: the user
      dropped it for foreclosure because the value-spread stop-and-ask already
      covers it), or
   2. **sold recently** (FORECLOSURE ONLY): within the last 3 years (user,
@@ -11,13 +11,6 @@ The user's rules (2026-09-23): he does NOT buy a property that is
      2026-11-02): a recent deed on a probate house is usually the inheritance.
 
 Such a record is deleted from the CRM and never skip traced.
-
-PROBATE UNDER 30% EQUITY: KEPT, NEVER TRACED (user, 2026-11-02)
----------------------------------------------------------------
-"I dont want you spending on anyone whose siftmap equity is under 30%." At 15%
-or more and under 30%, the record stays in the CRM and carries `_low_equity`;
-the caller keeps it out of the trace. Under 15% is still deleted, as above.
-Missing equity fails open, like every other rule here. Foreclosure unchanged.
 
 MLS-LISTED: KEPT, STATUS "listed", NEVER TRACED (user, 2026-10-09)
 ------------------------------------------------------------------
@@ -97,9 +90,9 @@ from datetime import date, datetime
 
 logger = logging.getLogger(__name__)
 
-MIN_EQUITY_PERCENT = 15.0
-#: Probate only: under this, no trace spend, record kept (user, 2026-11-02).
-MIN_TRACE_EQUITY_PERCENT = 30.0
+#: Probate only. Under this the record is removed from the CRM and never traced
+#: (user, 2026-11-02: "under 30% on all probate runs"). Missing equity is kept.
+MIN_EQUITY_PERCENT = 30.0
 #: Sold within this many years = excluded. Foreclosure 3 (user, 2026-10-09).
 #: Probate None: the rule does not apply (user, 2026-11-02).
 RECENT_SALE_YEARS = {"foreclosure": 3, "probate": None}
@@ -225,15 +218,6 @@ def check_property(prop: dict, *, today: date | None = None,
     return reasons
 
 
-def low_equity_for_trace(prop: dict) -> float | None:
-    """The equity % when it is known and under the no-spend line, else None."""
-    try:
-        eq = float(prop.get("equity_percent"))
-    except (TypeError, ValueError):
-        return None
-    return eq if eq < MIN_TRACE_EQUITY_PERCENT else None
-
-
 def mls_listed(prop: dict) -> bool:
     """DataSift shows the property on the market. An unrecognised value is
     logged and treated as not listed."""
@@ -350,12 +334,6 @@ def apply_post_enrich_gate(rows: list[dict], *, find_property, get_property,
             kept.append(r)
             if notice_type == "probate" and vacant_land_flag(prop):
                 _note_vacant_land(prop, street, post_board)
-            if notice_type == "probate":
-                low = low_equity_for_trace(prop)
-                if low is not None:
-                    r["_low_equity"] = low
-                    logger.warning("post-enrich gate: %s - equity %.2f%% is under %.0f%%: kept, "
-                                   "not traced", street, low, MIN_TRACE_EQUITY_PERCENT)
             if notice_type != "probate" and mls_listed(prop):
                 r["_mls_listed"] = True
                 r["_mls_error"] = _flag_mls(prop, street, set_status, post_board, today)
@@ -392,7 +370,7 @@ def apply_post_enrich_gate(rows: list[dict], *, find_property, get_property,
 def describe(notice_type: str = "foreclosure") -> str:
     if notice_type == "probate":
         return (f"Post-enrichment gate (probate): equity at least "
-                f"{MIN_EQUITY_PERCENT:.0f}% to stay and {MIN_TRACE_EQUITY_PERCENT:.0f}% to be traced, "
+                f"{MIN_EQUITY_PERCENT:.0f}%, "
                 f"and not a condo, mobile home, 3+ units or non-residential "
                 f"(DataSift structure type). MLS-listed and recent sales are allowed. Missing data never "
                 f"excludes.")

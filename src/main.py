@@ -2238,7 +2238,7 @@ def _report_already_created(done: list[tuple[dict, dict]]) -> None:
     logging.info("=== ALREADY CREATED BY AN EARLIER --create (%d) - not created again, "
                  "notes and board not re-posted ===", len(done))
     what = {"trace": "goes straight to the trace",
-            "no_trace": "Owner Alive = No or probate equity under 30%, never traced",
+            "no_trace": "Owner Alive = No, never traced",
             "excluded": "removed by the post-enrichment gate, never traced",
             "listed": "MLS-listed, status listed, never traced",
             "review": "value spread under review - see the numbered list",
@@ -2558,8 +2558,7 @@ def _create_fresh_rows(args, template_rows: list[dict], notice_type: str) -> dic
         "owner_review": owner_review,
         "excluded": [r for r in created if id(r) not in kept_ids and id(r) not in owner_ids],
         "no_trace": [r for r in created
-                     if id(r) in kept_ids
-                     and (id(r) in {id(d) for d in deceased} or r.get("_low_equity") is not None)],
+                     if id(r) in kept_ids and id(r) in {id(d) for d in deceased}],
         "listed": [r for r in created if id(r) in listed_ids],
         "review": [r for r in created if id(r) in kept_ids and r.get("_spread_review")],
     }

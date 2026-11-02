@@ -1284,7 +1284,8 @@ family by relationship, what is excluded, and why any record scores nothing. The
 python src/deep_prospect_run.py start  --street "123 Main St" --city Tulsa \
     --search-person "Mary Smith" --search-at property --spouse "John Smith" \
     --known "Susan Smith"                                    # FREE
-python src/deep_prospect_run.py charge --run output/deep_prospect/123-main-st   # BILLS SmartSkip
+python src/deep_prospect_run.py batch --list records.json   # FREE: ONE order for all records (use this)
+python src/deep_prospect_run.py charge --order output/deep_prospect/_orders/<id>   # BILLS the BALANCE once
 python src/deep_prospect_run.py finish --run output/deep_prospect/123-main-st --decedent \
     --primary "Susan Smith" --relationship "Susan Smith=Daughter" --basis "why"  # dry run
 python src/deep_prospect_run.py finish ... --commit          # BILLS Trestle, writes
@@ -1928,6 +1929,16 @@ $0 deed is usually the inheritance itself. Under 30% equity is removed from the 
 and never traced, on every probate run, and a record with no equity number is kept
 and traced. A SiftMap disagreement is fine unless it shows a totally different
 owner, which gets flagged for a human.
+
+### SmartSkip: one order, paid from the balance, never the card (2026-11-02)
+
+Jeff's hard rule. `batch` puts every record in ONE order; `start` is refused without
+`--only-one`, and refused within an hour of another order, so a run of singles cannot
+happen. `charge` pays once with `POST /bulk-skip/payment-intent {bulkSkipId,
+paymentSource: "wallet"}`, read out of the web app's own bundle, and no card is named.
+A short balance, or anything but a clean balance payment, stops with the order still
+open: there is no card fallback. `smartskip_trace.pay()` refuses in `src/`. `/wallet/balance`
+is in CENTS. The results are split back to each record's run folder by property address.
 
 ### Server rewrites and throttling on lookups (2026-11-02)
 

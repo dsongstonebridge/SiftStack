@@ -1126,6 +1126,26 @@ def _text_to_blocks(text, max_chars=2900):
     return blocks
 
 
+def texts_kpis():
+    """This week's text-message KPIs (Jeff, 2026-10-16). Not on the sheet: the PC
+    works them out and sends them in with the run (TEXT_KPIS, see kpi-engine/sms_kpis.py)."""
+    import sys
+    sys.path.insert(0, os.path.join(SCRIPT_DIR, "..", "kpi-engine"))
+    import sms_kpis
+
+    got = sms_kpis.from_env_b64(os.environ.get("TEXT_KPIS", ""))
+    week = got.get("week")
+    today, week_start = get_today_and_week()
+    error = got.get("error", "")
+    if not got:
+        error = "this run was not started from the PC"
+    elif week and (week.get("from"), week.get("to")) != (week_start.isoformat(), today.isoformat()):
+        week, error = None, f"the PC sent text stats for {week.get('from')} to {week.get('to')}, not this week"
+    elif not week and not error:
+        error = "the PC sent no weekly text stats"
+    return "\n".join(sms_kpis.render_lines(week, error))
+
+
 def build_slack_message(sheet):
     """Build the full Slack message from all tabs."""
     n = _now()
@@ -1150,6 +1170,10 @@ def build_slack_message(sheet):
 
     # SmrtDialer
     blocks += _text_to_blocks(f"*📞 SMRTDIALER*\n{smrtdialer_kpis(sheet)}")
+    blocks.append({"type": "divider"})
+
+    # Texts this week (from the PC; not on the sheet)
+    blocks += _text_to_blocks(f"*💬 TEXTS (this week)*\n{texts_kpis()}")
     blocks.append({"type": "divider"})
 
     # First to Market (will be split into multiple blocks)

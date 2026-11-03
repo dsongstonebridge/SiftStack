@@ -1711,6 +1711,18 @@ many wake events that are not someone using the PC.
   and bot locally (`run_engine.bat`, `run_kpi_bot.bat`). They are disabled; turning them on
   while the GitHub path runs posts everything twice. Never delete them.
 
+**After-hours activity + the next-morning check (Jeff, 2026-11-03).** Activity counts on the day it
+happened, never rolled into the next day. Calls and replies after the post used to reach no daily
+post at all (Nov 2 posted 100 dials / 11 correct / 0 replies; the full day was 124 / 18 / 5). Every
+post now saves its numbers to `reports/kpi_snapshot_<from>_<to>.json`. `kpi-engine/kpi_recheck.py`,
+run by the same Windows task, re-pulls each posted day from 6 AM the next day (first time the PC is
+open): same numbers = nothing; different = a fresh post headed "Updated KPI's for <day>" with a
+one-line list of what changed, then the sheet is refilled from that day. Fridays recheck the weekly
+summary too, but not the sheet bot's big post. Checked once per day; a failed smrtPhone or text read
+retries every 15 minutes rather than reporting a false change. Numbers that move just because time
+passed (not called back yet, reply response time, replies that became a call) are not compared.
+Test: `python tests/test_kpi_recheck.py`. Dry run: `py -3 kpi_recheck.py --dry-run`.
+
 **Counting rules (Jeff's, all in `pull_kpis.py`; fill_sheet uses the same ones):**
 - Two sources. smrtPhone call log = every call, duration, disposition -> conversations,
   talk time, inbound. DataSift = dials, Jeff's phone markings, message board notes,

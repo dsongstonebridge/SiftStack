@@ -1058,24 +1058,53 @@ def finalize(res: dict, token: str, texts: dict | None) -> None:
             call_rpc.add(sms_kpis.rec_hash(uuid))
         elif "secondary" in roles:
             call_sec.add(sms_kpis.rec_hash(uuid))
+    # Contact rate (Jeff, 2026-11-03). Bottom: records reached out to in this window, whatever
+    # happened before it. Top: those with a number marked Correct in this window that is either
+    # the primary, or on a record set to a lead status or Not Interested in this window.
+    logs = res.get("rec_logs", {})
+    p_idx = detect_new_index([e for evs in logs.values() for e in evs
+                              if e.get("event_type") == "owner.phone.status.updated"], "phone")
+    mark_rpc, mark_any = set(), set()
+    for uuid, evs in logs.items():
+        marked = {sms_kpis._phone(((e.get("payload") or {}).get("owner") or {}).get("phone")) for e in evs
+                  if e.get("event_type") == "owner.phone.status.updated"
+                  and res["from"] <= str(e.get("timestamp") or "")[:10] <= res["to"]
+                  and str(new_status(e, "phone", p_idx) or "").upper() in CORRECT_STATES}
+        if not marked - {""}:
+            continue
+        try:
+            rec = req(token, f"/api/internal/property/{uuid}/")
+        except Exception as e:
+            log(f"could not read a marked record ({e}); left out of contacts")
+            continue
+        owner = rec.get("owner") if isinstance(rec.get("owner"), dict) else {}
+        primary = sms_kpis._phone(owner.get("primary_phone"))
+        roles = {sms_kpis.contact_role(rec, evs, n) for n in marked - {""}}
+        if primary in marked - {""} and sms_kpis.contact_role(rec, evs, primary) == "rpc":
+            mark_rpc.add(sms_kpis.rec_hash(uuid))
+        if roles & {"rpc", "secondary"}:   # still Correct now, primary or not
+            mark_any.add(sms_kpis.rec_hash(uuid))
     t = texts or {}
     text_rpc = set(t.get("text_rpc_records") or [])
     text_sec = set(t.get("text_secondary_records") or [])
-    rpc = call_rpc | text_rpc
-    secondary = (call_sec | text_sec) - rpc        # a record with a right-party contact counts there
     dialed_h = {sms_kpis.rec_hash(u) for u in acct["records"]}
     status_h = {sms_kpis.rec_hash(u) for u in res.get("status_contacts", set())}
+    reached = call_rpc | text_rpc | mark_rpc | status_h
+    secondary = (call_sec | text_sec) - reached
     # records worked = dialed, texted, or reached / given an outcome in the window
     texted_h = set(t.get("texted_records") or [])
-    worked = dialed_h | texted_h | status_h | rpc | secondary
+    worked = dialed_h | texted_h | status_h | reached | secondary
+    outreach_h = dialed_h | texted_h
+    by_status = (mark_any & status_h) - mark_rpc
     res["contact"] = {
-        "rpc": len(rpc), "call": len(call_rpc), "text_only": len(text_rpc - call_rpc),
-        "secondary": len(secondary), "worked": len(worked), "texts_known": texts is not None,
-        "status_contacts": len(status_h),
+        "rpc": len((mark_rpc | by_status) & outreach_h), "marked": len(mark_rpc & outreach_h),
+        "by_status": len(by_status & outreach_h),
+        "secondary": len(secondary), "worked": len(worked),
+        "texts_known": texts is not None,
         # records we reached out to (Jeff, 2026-10-30: the first line of the post)
-        "outreach": len(dialed_h | texted_h), "called": len(dialed_h),
+        "outreach": len(outreach_h), "called": len(dialed_h),
         "texted_only": len(texted_h - dialed_h)}
-    res["_ledger_day"] = {"worked": sorted(worked), "reached": sorted(rpc | status_h)}
+    res["_ledger_day"] = {"worked": sorted(worked), "reached": sorted(reached)}
 
 
 def update_ledger(path: Path, res: dict) -> dict:
@@ -1151,17 +1180,13 @@ def slack_lines(res: dict, bench: dict, texts: tuple, note: str = "", ledger: di
     if ct:
         span = "this week" if weekly else "today"
         lines += ["", f"*CONTACT: {'this week (Mon-Fri)' if weekly else 'today only'}*",
-                  f"• Right-party contacts: *{ct['rpc']}* _(people reached {span} on a number marked Correct AND "
-                  f"primary; primary checked right before this post)_",
-                  f"    Call: *{ct['call']}* _(reached by a pickup or callback; includes anyone who also texted)_",
-                  f"    Text only: *{ct['text_only']}* _(reached by text reply only, no call)_"
-                  + ("" if ct["texts_known"] else "  · _texts not available_"),
+                  f"• Right-party contacts: *{ct['rpc']}* _(records reached out to {span} with the primary number marked "
+                  f"Correct {span}: {ct['marked']}; or a number marked Correct {span} and the record set to a lead "
+                  f"status or Not Interested {span}: {ct['by_status']})_" + ("" if ct["texts_known"] else "  · _texts not available_"),
                   f"• Secondary contacts: *{ct['secondary']}* _(people reached {span} on a number marked Correct but "
                   f"NOT primary: relatives or secondary decision makers; not in the contact rate)_",
                   f"• Contact rate: *{pct(ct['rpc'], ct['outreach'])}* _(right-party contacts ÷ records reached "
-                  f"out to {span}: {ct['rpc']} of {ct['outreach']})_",
-                  f"• Contact check: *{pct(ct['status_contacts'], ct['outreach'])}* _(records set to a lead status or "
-                  f"Not Interested {span} ÷ records reached out to {span}: {ct['status_contacts']} of {ct['outreach']})_"]
+                  f"out to {span}: {ct['rpc']} of {ct['outreach']})_"]
         if ledger and weekly:
             w, r = set(ledger["worked"]), set(ledger["reached"]) & set(ledger["worked"])
             lines.append(f"• Records reached over time: *{pct(len(r), len(w))}* _(of every record dialed or texted "
@@ -1205,9 +1230,58 @@ def slack_lines(res: dict, bench: dict, texts: tuple, note: str = "", ledger: di
     return lines
 
 
+def post_numbers(res: dict, texts: dict | None) -> dict:
+    """The numbers on the post, by name, for the next-morning check (kpi_recheck.py). Numbers that
+    move just because time passed are left out on purpose: "not called back yet", reply response
+    time, replies that became a call, sending-number flags."""
+    a = res["account_totals"]
+    ct = res.get("contact") or {}
+    out = {
+        "Records reached out to": ct.get("outreach"),
+        "Dials": a["dials"], "Dial hours": fmt_hms(a["dial_seconds"]), "Voicemail / no answer": a["voicemails"],
+        "Reached": a["reached"], "Reached owner": a["answered"], "Reached callback": a["inbound_owner_talks"],
+        "Reached someone else": a["non_owner_talks"], "Conversations": a["conversations"],
+        "Calls under 30s": a["len_lt30"], "Calls 30-60s": a["len_30_60"],
+        "Calls 1-2 min": a["len_60_120"], "Calls 2 min+": a["len_120p"],
+        "Talk time": fmt_hms(a["talk_seconds"]), "Missed callbacks": a.get("missed_callbacks"),
+        "Correct, all": a["correct_numbers"], "Correct, live pickup": a["correct_live"],
+        "Wrong": a["wrong_numbers"], "Dead": a["dead_numbers"], "DNC": a["dnc_numbers"],
+        "Right-party contacts": ct.get("rpc"), "Secondary contacts": ct.get("secondary"),
+        "Leads": a["leads"], "Not interested": a["not_interested"], "Follow-up tasks": a["follow_ups"],
+    }
+    for email, c in res["callers"].items():
+        who = res["names"].get(email, email)
+        out.update({f"{who} dials": c["dials"], f"{who} conversations": c["conversations"],
+                    f"{who} correct": c["correct_numbers"], f"{who} leads": c["leads"]})
+    if texts:
+        o = texts.get("outcomes") or {}
+        out.update({"Texts sent": texts.get("sent"), "Texts delivered": texts.get("delivered"),
+                    "Texts undelivered": texts.get("undelivered"), "Text replies": texts.get("replies"),
+                    "People who replied": texts.get("repliers"), "Text confirmed": texts.get("text_confirmed"),
+                    "Replies interested": o.get("interested"), "Replies not interested": o.get("not_interested"),
+                    "Replies wrong #": o.get("wrong_number"), "Replies unclear": o.get("unclear"),
+                    "Opt-outs": o.get("opt_out")})
+    return out
+
+
+SNAPSHOT_GLOB = "kpi_snapshot_*.json"
+
+
+def save_snapshot(res: dict, texts: dict | None, folder: Path | None = None, note: str = "") -> Path:
+    """Remember what the post said, so kpi_recheck.py can tell tomorrow whether it changed."""
+    folder = folder or HERE / "reports"
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f"kpi_snapshot_{res['from']}_{res['to']}.json"
+    path.write_text(json.dumps({
+        "from": res["from"], "to": res["to"], "note": note,
+        "taken_at": datetime.datetime.now(ZoneInfo("America/Chicago")).isoformat(timespec="seconds"),
+        "numbers": post_numbers(res, texts), "checked": False}, indent=1), encoding="utf-8")
+    return path
+
+
 def post_slack(res: dict, webhook: str, bench: dict, note: str = "", texts: tuple = (None, ""),
-               ledger: dict | None = None) -> None:
-    lines = slack_lines(res, bench, texts, note, ledger)
+               ledger: dict | None = None, header: list[str] | None = None) -> None:
+    lines = (header or []) + slack_lines(res, bench, texts, note, ledger)
     if webhook == "print":           # --slack print: show the post, send nothing
         print("\n".join(lines))
         return
@@ -1235,6 +1309,8 @@ def main() -> int:
                     help="records-reached-over-time ledger to update (and show on a weekly post)")
     ap.add_argument("--week-of", metavar="DATE",
                     help="the Monday-to-DATE week (the Friday weekly summary)")
+    ap.add_argument("--snapshot-only", action="store_true",
+                    help="only remember today's numbers for kpi_recheck.py (when GitHub made the post)")
     args = ap.parse_args()
 
     bench = load_benchmarks()
@@ -1261,6 +1337,9 @@ def main() -> int:
     add_smrtphone(res, day_from, day_to, bench)
     texts = text_stats(day_from, day_to)
     finalize(res, token, texts[0])
+    if args.snapshot_only:
+        log(f"remembered the numbers in {save_snapshot(res, texts[0], note=args.note).name}")
+        return 0
     ledger = update_ledger(Path(args.ledger), res) if args.ledger else None
     md = render_md(res, bench)
     print("\n" + md)
@@ -1291,6 +1370,8 @@ def main() -> int:
             if not webhook:
                 sys.exit("--slack auto: no KPI_SLACK_WEBHOOK_URL found in ../kpi-bot/.env")
         post_slack(res, webhook, bench, args.note, texts, ledger)
+        if webhook != "print":
+            save_snapshot(res, texts[0], note=args.note)
     return 0
 
 

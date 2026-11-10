@@ -24,7 +24,7 @@ lead-management part stays comparable with scheduled follow-ups.
 
 A call is combined when it is a FIRST touch with the owner (no sign of an
 earlier conversation) AND, on the same call, the caller goes past the cold
-call's job into lead-manager qualification: digging into all four pillars,
+call's job into lead-manager qualification: digging into all of UMBC,
 roadblocks, condition in detail, a next step toward an offer.
 
 The user can set the type when naming a call for transcription
@@ -77,7 +77,7 @@ qualification (65%).
 | 2.5 Address earned, not demanded | cold_call.md 3.5 |
 
 Not used from the cold-call rubric, on purpose: Category 2 (Four Pillars
-Discovery), because Part C grades the pillars in full depth; Category 4
+Discovery), because Part C grades UMBC in full depth; Category 4
 (Tonality), because Category 6 grades tone over the whole call; Category 5
 (Close and Next Step), because the switch replaces the booked callback.
 
@@ -93,19 +93,22 @@ Discovery), because Part C grades the pillars in full depth; Category 4
 
 ### Part C: Lead Management (lead-management criteria, judged after the switch)
 
-**Category 4: Four Pillars Qualification (25%)**, from `lead_management.md` Category 2
+**Category 4: UMBC Qualification (25%)**, from `lead_management.md` Category 2
 
 | Criterion | Source |
 |---|---|
 | 4.1 Motivation: the reason behind the trigger | lead_management.md 2.1 |
-| 4.2 Timeline to agreement, bucketed | lead_management.md 2.2 |
-| 4.3 Condition: three-bucket grade, tour, capex | lead_management.md 2.3 |
-| 4.4 Price: pocket number pulled, reflected, never negotiated | lead_management.md 2.4 |
-| 4.5 Pillar order and flow discipline | lead_management.md 2.5 |
+| 4.2 Urgency: timeline, bucketed | lead_management.md 2.2 |
+| 4.3 Condition: grade or updates, tour, capex | lead_management.md 2.3 |
+| 4.4 Ballpark Price: seller's number pulled, reflected, never negotiated | lead_management.md 2.4 |
+| 4.5 UMBC order and flow discipline | lead_management.md 2.5 |
 
-Pillars the seller already answered before the switch count here: absorbing
+UMBC (Urgency, Motivation, Ballpark Price, Condition) replaced the 4 pillars on
+2026-11-10; see change 4 at the top of `lead_management.md`.
+
+UMBC items the seller already answered before the switch count here: absorbing
 them without re-asking earns credit (the same rule lead_management.md 2.5
-applies to volunteered pillars).
+applies to volunteered UMBC items).
 
 **Category 5: Roadblocks and Logistics (15%)**, from `lead_management.md` Category 3
 
@@ -132,7 +135,7 @@ applies to volunteered pillars).
 |---|---|
 | 7.1 Binary outcome rule | lead_management.md 5.1 |
 | 7.2 Specific next step with expectations set | lead_management.md 5.2 |
-| 7.3 Cadence match to pillar evidence | lead_management.md 5.3 |
+| 7.3 Cadence match to UMBC evidence | lead_management.md 5.3 |
 | 7.4 Handoff readiness and warm transfer | lead_management.md 5.4 |
 | 7.5 Human details drawn out | lead_management.md 5.5 |
 
@@ -167,13 +170,13 @@ and the list is never named. When the seller shows real openness, the caller
 asks for the time rather than taking it ("Do you have about 10 minutes right
 now?"), then sets how long, what it covers, what it decides, and that a no is
 fine. From there it is a full lead-manager qualification: motivation peeled
-past the first answer, timeline bucketed, condition graded and toured, the
-pocket number pulled and reflected without negotiating, every roadblock named,
+past the first answer, urgency bucketed, condition opened and toured, the
+ballpark price pulled and reflected without negotiating, every roadblock named,
 with nothing the seller already said asked twice. The seller talks more than
 the caller the whole way through. It ends with the binary outcome honored: a
 booked offer call with Jeff carrying the complete handoff package, or a
 specific follow-up with time, agenda and result, at a cadence that matches
-what the pillars proved.
+what UMBC proved.
 
 ## Coaching Output Format
 
@@ -193,7 +196,7 @@ SCORES
 | 1. Opener and Decision-Maker Confirmation      | 15%    |             |          |
 | 2. Objection Handling and List Sensitivity     | 10%    |             |          |
 | 3. The Switch                                  | 10%    |             |          |
-| 4. Four Pillars Qualification                  | 25%    |             |          |
+| 4. UMBC Qualification                          | 25%    |             |          |
 | 5. Roadblocks and Logistics                    | 15%    |             |          |
 | 6. Rapport, Tonality, Call Control             | 15%    |             |          |
 | 7. Next Action and Handoff                     | 10%    |             |          |
@@ -219,10 +222,10 @@ CRITERION SCORES (required: one row per criterion, in order, every row ends in E
 | 3.2 Permission to keep going | | |
 | 3.3 Time, agenda and result set | | |
 | 4.1 Motivation: the reason behind the trigger | | |
-| 4.2 Timeline to agreement, bucketed | | |
-| 4.3 Condition: three-bucket grade, tour, capex | | |
-| 4.4 Price: pocket number pulled, reflected, never negotiated | | |
-| 4.5 Pillar order and flow discipline | | |
+| 4.2 Urgency: timeline, bucketed | | |
+| 4.3 Condition: grade or updates, tour, capex | | |
+| 4.4 Ballpark Price: seller's number pulled, reflected, never negotiated | | |
+| 4.5 UMBC order and flow discipline | | |
 | 5.1 Influencers | | |
 | 5.2 Logistics and after the sale | | |
 | 5.3 Encumbrances, title, and agent exposure | | |
@@ -234,15 +237,15 @@ CRITERION SCORES (required: one row per criterion, in order, every row ends in E
 | 6.5 The no ladder and objection handling | | |
 | 7.1 Binary outcome rule | | |
 | 7.2 Specific next step with expectations set | | |
-| 7.3 Cadence match to pillar evidence | | |
+| 7.3 Cadence match to UMBC evidence | | |
 | 7.4 Handoff readiness and warm transfer | | |
 | 7.5 Human details drawn out | | |
 N/A criteria and weight redistribution: [list, or "none"]
 
-PILLAR STATUS (from this call)
-Motivation: [captured value or MISSING]   Timeline: [bucket or MISSING]
-Condition: [bucket or MISSING]            Price: [pocket number or MISSING]
-Temperature the pillar evidence supports: [Hot | Warm | Cold]
+UMBC STATUS (from this call)
+Urgency: [bucket or MISSING]   Motivation: [captured value or MISSING]
+Ballpark Price: [seller's number or MISSING]   Condition: [bucket or MISSING]
+Temperature the UMBC evidence supports: [Hot | Warm | Cold]
 Next action booked: [date/time or NONE]
 
 TOP 3 STRENGTHS (verbatim quotes from the transcript)

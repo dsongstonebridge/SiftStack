@@ -132,7 +132,7 @@ def transcript_quotes(report_body: str) -> list[str]:
     for line in report_body.splitlines():
         head = line.strip().upper()
         if head.startswith(("TOP 3 STRENGTHS", "TOP 3 IMPROVEMENT", "WHAT HAPPENED", "ONE FIX",
-                            "CRITERION SCORES", "OPENER", "PILLAR")):
+                            "CRITERION SCORES", "OPENER", "PILLAR", "UMBC")):
             section = head
         elif head.startswith(("ONE DRILL", "SCORES", "CONVERSION ATTEMPT", "```")):
             section = "skip"

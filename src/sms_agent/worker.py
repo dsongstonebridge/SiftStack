@@ -151,6 +151,23 @@ def drain_outbox(limit: int = 25) -> dict:
                 skipped += 1
                 continue
 
+        # Tier 2 SMS Prospecting (touches 5-10): the record must still carry the
+        # round status, nobody replied, nobody talked to them. Checked here
+        # because the batch is built in the morning and sent through the day.
+        from . import round2
+        if round2.touch_of(row.get("intent")) >= 5:
+            rec_uuid = (conv.get("record_uuid")
+                        or (store.lookup_phone(phone) or {}).get("record_uuid") or "")
+            ok, why = round2.still_ok(rec_uuid, phone)
+            if ok is None:
+                log.info("holding round outbox %s: %s", row["id"], why)
+                held += 1
+                continue
+            if not ok:
+                store.mark_outbox(row["id"], "cancelled", f"round check: {why}")
+                skipped += 1
+                continue
+
         if not sender_pool.within_quiet_hours(phone):
             nb = sender_pool.next_send_window(phone).isoformat(timespec="seconds")
             with store.tx() as c:

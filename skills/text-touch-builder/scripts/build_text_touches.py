@@ -83,6 +83,197 @@ TOUCH4_NONAME = [
 POOLS = [(TOUCH1, TOUCH1_NONAME), (TOUCH2, TOUCH2_NONAME),
          (TOUCH3, TOUCH3_NONAME), (TOUCH4, TOUCH4_NONAME)]
 
+# ---------------------------------------------------------------------------
+# OPTIONAL: Tier 2 SMS prospecting (touches 5-10). For records still not
+# reached after the call attempts: six more texts over two weeks (e.g. Mon,
+# Wed, Fri). Touch 4 must not promise "last text from me" if you run these,
+# so the *_V2 touch 4 lines below replace the promising ones. KNOWN = a number
+# you confirmed from the voicemail greeting (no "is this yours?"), UNKNOWN =
+# not confirmed yet, HEIR = a relative's number (never mention a death).
+# Each entry is (named variants, no-name variants). Not written to the Text
+# Touch 1-4 fields; they are audited here so a bad line is caught early.
+TOUCH4_V2 = [
+    "Hi {first}, I've sent a few texts about {addr} and haven't heard back. Did you decide to keep it instead? Either way, wishing you the best! {sender}",
+    "Hey {first}, it's {sender} again. If selling {addr} is ever on your mind, I'd love to be your first call. Is that something you'd think about?",
+    "Hi {first}, {sender} here. Just leaving my number in case {addr} ever becomes something you'd like to talk about. Would that be alright?",
+    "Hey {first}, {sender} here one more time. If I have the wrong number, I'm so sorry! If not, I'd still love to connect about {addr} whenever works for you.",
+]
+TOUCH4_V2_NONAME = [
+    "Hi, {sender} here again about {addr}. If there's a better contact for that property, I'd be grateful for a point in the right direction. Thanks!",
+    "Hey there, {sender} again! If {addr} is ever something you'd consider selling, I'd love to be your first call. All the best!",
+]
+HEIR_TOUCH4_V2 = [
+    "Hi {first}, {sender} here. If {addr} ever comes up down the road, I'm around. Take care!",
+    'Hey {first}, {sender} again about {addr}. If anything changes, just text me back. Thanks for your time!',
+    "Hi {first}, {sender} here once more. If I've got the wrong person for {addr}, no worries at all. Wishing you well!",
+]
+HEIR_TOUCH4_V2_NONAME = [
+    "Hi, {sender} here again about {addr}. If there's a better person to ask, I'd be grateful for a pointer. Thank you!",
+    "Hello, {sender} again! If {addr} is ever something your family would sell, I'd love to be the first call. All the best!",
+]
+ROUND_UNKNOWN = [
+    (  # touch 5
+        [
+            "Hi {first}, it's {sender}. I texted a couple weeks back about {addr} and never caught you. Is that one still yours?",
+            'Hey {first}! {sender} here. Hope the last couple weeks have treated you well. Do you still own {addr}?',
+            'Hi {first}, {sender} again. I know I texted a while ago about {addr}. Did I ever have the right person for it?',
+        ], [
+            "Hi, it's {sender}. I texted a couple weeks back about {addr} and never heard either way. Is this still the right contact for it?",
+            "Hello! {sender} here. Still hoping to find whoever owns {addr} in {city}. Any chance that's you?",
+        ]),
+    (  # touch 6
+        [
+            "Hi {first}, {sender} here. If {addr} is yours, I'd buy it just as it sits, no repairs and no cleaning out. Would that ever interest you?",
+            "Hey {first}! It's {sender}. Just so you know, I buy houses as is, so nothing about {addr} would need fixing. Is selling something you'd think about?",
+            "Hi {first}, {sender} again. No pressure, but if {addr} ever needed work you didn't want to do, I'd take it as is. Worth talking about?",
+        ], [
+            "Hi, {sender} here. If you own {addr}, I'd buy it just as it sits, no repairs needed. Would that be worth a conversation?",
+            "Hello, it's {sender}. I buy houses in {city} as is. If {addr} is yours, would you ever think about selling?",
+        ]),
+    (  # touch 7
+        [
+            "Hi {first}, it's {sender}. Maybe now just isn't the right time for {addr}, and that's totally fine. Would later this year be better?",
+            "Hey {first}, {sender} here. I'm in no rush on {addr}. Is it something you might look at down the road?",
+            "Hi {first}! {sender} again. If {addr} is a maybe someday, I'm happy to wait. Would it help if I checked back in a few months?",
+        ], [
+            "Hi, {sender} here. If now isn't the time for {addr}, that's okay. Would checking back in a few months be alright?",
+            "Hello! It's {sender}. No rush at all on {addr}. Is it something the owner might consider later on?",
+        ]),
+    (  # touch 8
+        [
+            "Hi {first}, {sender} here. If {addr} isn't yours, do you happen to know who I should talk to about it?",
+            "Hey {first}, it's {sender}. I might have the wrong person for {addr}. If so, is there someone else I should ask?",
+            'Hi {first}! {sender} again. Is someone else the best person to talk to about {addr}?',
+        ], [
+            'Hi, {sender} here. If I have the wrong number for {addr}, do you know who the owner might be?',
+            "Hello, it's {sender}. Am I texting the right person about {addr}, or is there someone better to ask?",
+        ]),
+    (  # touch 9
+        [
+            "Hi {first}, it's {sender}. Quick one about {addr}: would you ever sell it for the right offer?",
+            'Hey {first}, {sender} here. Even a quick no on {addr} helps me out. Would you ever consider selling it?',
+            'Hi {first}! {sender} again. Is {addr} a hard no, or a maybe someday?',
+        ], [
+            'Hi, {sender} here. Even a quick no helps me out. Would the owner of {addr} ever consider selling?',
+            "Hello! It's {sender}. Is {addr} a hard no, or a maybe someday?",
+        ]),
+    (  # touch 10
+        [
+            "Hi {first}, {sender} here. I'll keep {addr} in mind in case anything changes. Would you text me if selling ever comes up?",
+            "Hey {first}, it's {sender}. Thanks for bearing with my texts about {addr}. If you ever want an offer, would you let me know?",
+            'Hi {first}! {sender} again. Wishing you the best with {addr}. Could you keep my number in case you ever think about selling?',
+        ], [
+            "Hi, {sender} here. I'll keep {addr} in mind in case anything changes. If the owner ever wants to sell, would you pass my number along?",
+            "Hello, it's {sender}. Thanks for bearing with me about {addr}. If selling ever comes up, could you keep my number?",
+        ]),
+]
+ROUND_KNOWN = [
+    (  # touch 5
+        [
+            "Hi {first}, it's {sender}. I tried you a few times about {addr} and kept missing you. Is this a better week to talk?",
+            'Hey {first}! {sender} here. Sorry we keep missing each other. Are you still open to hearing an offer on {addr}?',
+            'Hi {first}, {sender} again. Hope things are good. Would you still be open to an offer on {addr}?',
+        ], [
+            "Hi, it's {sender}. I tried a few times about {addr} and kept missing you. Would you be open to hearing an offer?",
+            "Hello! {sender} here. Sorry we keep missing each other. Is {addr} still something you'd sell?",
+        ]),
+    (  # touch 6
+        [
+            "Hi {first}, {sender} here. I'd buy {addr} just as it sits, no repairs and no cleaning out. Would that make things easier?",
+            "Hey {first}, it's {sender}. I can close on {addr} on whatever timeline works for you. Is that something you'd want to hear more about?",
+            "Hi {first}! {sender} again. With me there's no fixing up {addr} and no showings. Would that help?",
+        ], [
+            "Hi, {sender} here. I'd buy {addr} as it sits, no repairs and no showings. Would that make things easier?",
+            "Hello, it's {sender}. I can close on {addr} on your timeline. Is that worth a quick talk?",
+        ]),
+    (  # touch 7
+        [
+            "Hi {first}, it's {sender}. If now isn't the time for {addr}, no worries. Would a few months from now be better?",
+            'Hey {first}, {sender} here. No rush on my end about {addr}. Is there a better time of day to catch you?',
+            'Hi {first}! {sender} again. If texting is easier than talking, that works for me. Are you still thinking about {addr}?',
+        ], [
+            'Hi, {sender} here. No rush about {addr}. Is there a better time of day to catch you?',
+            "Hello! It's {sender}. If texting is easier than talking, that works for me. Are you still thinking about {addr}?",
+        ]),
+    (  # touch 8
+        [
+            'Hi {first}, {sender} here. Do you have a number in mind for {addr}? Even a ballpark helps me.',
+            "Hey {first}, it's {sender}. What would it take for selling {addr} to make sense for you?",
+            'Hi {first}! {sender} again. If I made you an offer on {addr}, what would you want it to cover?',
+        ], [
+            'Hi, {sender} here. Do you have a number in mind for {addr}? A ballpark is fine.',
+            "Hello, it's {sender}. What would make selling {addr} worth it for you?",
+        ]),
+    (  # touch 9
+        [
+            "Hi {first}, it's {sender}. Even a quick no on {addr} helps me out. Is selling off the table for now?",
+            'Hey {first}, {sender} here. Is {addr} a hard no, or a maybe someday?',
+            "Hi {first}! {sender} again. Totally fine if you'd rather keep {addr}. Is that where you've landed?",
+        ], [
+            'Hi, {sender} here. Even a quick no helps. Is selling {addr} off the table for now?',
+            "Hello! It's {sender}. Is {addr} a hard no, or a maybe someday?",
+        ]),
+    (  # touch 10
+        [
+            "Hi {first}, {sender} here. I'll keep {addr} in mind in case anything changes. Would you text me if selling ever comes up?",
+            "Hey {first}, it's {sender}. Thanks for bearing with my texts about {addr}. If you ever want an offer, would you let me know?",
+            'Hi {first}! {sender} again. Wishing you the best with {addr}. Could you keep my number in case you ever think about selling?',
+        ], [
+            "Hi, {sender} here. I'll keep {addr} in mind in case anything changes. Would you text me if selling ever comes up?",
+            "Hello, it's {sender}. Thanks for bearing with me about {addr}. If selling ever comes up, could you keep my number?",
+        ]),
+]
+ROUND_HEIR = [
+    (  # touch 5
+        [
+            "Hi {first}, it's {sender}. I texted a while back about {addr}. Do you know who looks after it these days?",
+            'Hey {first}! {sender} here. Still trying to find who takes care of {addr}. Would you know?',
+        ], [
+            "Hi, it's {sender}. I texted a while back about {addr}. Do you know who looks after it now?",
+            "Hello! {sender} here. Still trying to find who takes care of {addr}. Any chance you'd know?",
+        ]),
+    (  # touch 6
+        [
+            "Hi {first}, {sender} here. If your family ever wanted to sell {addr}, I'd take it just as it sits. Would that be useful to know?",
+            "Hey {first}, it's {sender}. Nothing at {addr} would need fixing or cleaning out if it ever sold to me. Worth passing along?",
+        ], [
+            "Hi, {sender} here. If {addr} ever sold, I'd take it as it sits, nothing to fix. Could you pass that along?",
+            "Hello, it's {sender}. I buy houses in {city} as is. Would whoever handles {addr} want to know that?",
+        ]),
+    (  # touch 7
+        [
+            "Hi {first}, it's {sender}. No rush at all on {addr}. Would it be alright if I checked back in a few months?",
+            "Hey {first}, {sender} here. If now isn't a good time to think about {addr}, I understand. Would later on be better?",
+        ], [
+            'Hi, {sender} here. No rush on {addr}. Would it be okay to check back in a few months?',
+            "Hello! It's {sender}. If now isn't a good time to think about {addr}, that's fine. Would later be better?",
+        ]),
+    (  # touch 8
+        [
+            'Hi {first}, {sender} here. Is there someone else I should be talking to about {addr}?',
+            "Hey {first}, it's {sender}. If I've got the wrong person for {addr}, could you point me to the right one?",
+        ], [
+            'Hi, {sender} here. Is there someone better to talk to about {addr}?',
+            "Hello, it's {sender}. If I have the wrong person for {addr}, would you know the right one?",
+        ]),
+    (  # touch 9
+        [
+            "Hi {first}, it's {sender}. Even a quick no about {addr} helps me out. Is selling off the table?",
+            'Hey {first}, {sender} here. Is {addr} something your family plans to keep?',
+        ], [
+            'Hi, {sender} here. Even a quick no helps. Is {addr} being kept for now?',
+            "Hello! It's {sender}. Is {addr} something that might be sold someday, or is it staying put?",
+        ]),
+    (  # touch 10
+        [
+            "Hi {first}, {sender} here. I'll keep {addr} in mind in case anything changes. Would you pass my number along if it ever comes up?",
+            "Hey {first}, it's {sender}. Thanks for bearing with my texts about {addr}. Could you keep my number in case it ever comes up?",
+        ], [
+            "Hi, {sender} here. I'll keep {addr} in mind in case anything changes. Could you pass my number along if it ever comes up?",
+            "Hello, it's {sender}. Thanks for bearing with me about {addr}. Would you keep my number in case it ever comes up?",
+        ]),
+]
+
 # common DataSift export header spellings, first match wins (case-insensitive)
 COLUMN_GUESSES = {
     "street": ["property street", "street address", "property address", "street", "address"],
@@ -182,10 +373,19 @@ def audit_pools() -> list[str]:
     for name, pool in (("TOUCH1", TOUCH1), ("TOUCH1_NONAME", TOUCH1_NONAME),
                        ("TOUCH2", TOUCH2), ("TOUCH2_NONAME", TOUCH2_NONAME),
                        ("TOUCH3", TOUCH3), ("TOUCH3_NONAME", TOUCH3_NONAME),
-                       ("TOUCH4", TOUCH4), ("TOUCH4_NONAME", TOUCH4_NONAME)):
+                       ("TOUCH4", TOUCH4), ("TOUCH4_NONAME", TOUCH4_NONAME),
+                       ("TOUCH4_V2", TOUCH4_V2), ("TOUCH4_V2_NONAME", TOUCH4_V2_NONAME),
+                       ("HEIR_TOUCH4_V2", HEIR_TOUCH4_V2),
+                       ("HEIR_TOUCH4_V2_NONAME", HEIR_TOUCH4_V2_NONAME)):
         for i, variant in enumerate(pool):
             for why in human_voice_problems(variant):
                 problems.append(f"{name}[{i}]: {why} -> {variant[:70]}")
+    for name, rounds in (("ROUND_UNKNOWN", ROUND_UNKNOWN), ("ROUND_KNOWN", ROUND_KNOWN),
+                         ("ROUND_HEIR", ROUND_HEIR)):
+        for touch, (named, noname) in enumerate(rounds, start=5):
+            for i, variant in enumerate(list(named) + list(noname)):
+                for why in human_voice_problems(variant):
+                    problems.append(f"{name} touch {touch}[{i}]: {why} -> {variant[:70]}")
     return problems
 
 

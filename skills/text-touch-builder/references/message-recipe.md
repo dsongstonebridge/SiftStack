@@ -111,6 +111,27 @@ No-name versions:
 - Hi, {sender} here one last time about {addr}. If there's a better contact for that property, I'd be grateful for a point in the right direction. Thanks!
 - Hey there, last text from me! If {addr} is ever something you'd consider selling, I'd love to be your first call. All the best! {sender}
 
+## Optional: Tier 2 SMS prospecting (touches 5-10)
+
+For records still not reached after the call attempts: six more texts over two
+weeks (for example Mon, Wed, Fri), then stop. Three rules carry over from the
+first four touches and one is new:
+
+- **Touch 4 must not promise it is the last text** if you run this round.
+  "Last one from me, I promise!" followed by six more texts is the fastest way
+  to get reported. Use the `TOUCH4_V2` lines in `scripts/build_text_touches.py`
+  in place of the promising ones, and never start the round on a number whose
+  touch 4 already made that promise.
+- **Pick the pool by what you know.** KNOWN for a number you confirmed from the
+  voicemail greeting (no "is this yours?"), UNKNOWN for a number not confirmed
+  yet, HEIR for a relative's number (never mention a death).
+- **One job per touch still holds:** check back in, as is, timing, right
+  person, easy no, wrap up. The wrap-up does not promise to stop either.
+- Only text records you have not talked to and who never replied.
+
+The pools live in `scripts/build_text_touches.py` (`ROUND_UNKNOWN`,
+`ROUND_KNOWN`, `ROUND_HEIR`) and are audited by `--check-pools` with the rest.
+
 ## Seasonal and day-of-week upgrades
 
 If you regenerate fields weekly, swap openers for timely ones (these outperform evergreen copy):

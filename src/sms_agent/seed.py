@@ -1058,6 +1058,12 @@ def build(rows: Iterable[dict], touch: int, sender_fallback: str = "",
             rel_name = relation_addressee(cand.record_uuid, phone)
             if rel_name is not None:
                 cand.first = touches.clean_first(rel_name) if rel_name else ""
+        # Tier 2 SMS Prospecting (round2.py, Jeff 2026-11-13): "known" copy for
+        # a Correct number (no "is this yours?"), heir copy for an old number on
+        # a record whose owner died. A relative's DP number keeps heir copy.
+        forced = row.get("_variant")
+        if forced == "heir" or (forced == "known" and variant == "owner"):
+            variant = forced
 
         # Jeff, 2026-10-26: NEVER put a dead person's name in a text. Name
         # only when we are confident that person is alive; otherwise no name.
@@ -1285,7 +1291,9 @@ def reschedule_held() -> dict:
     # attempts down, so touch 4s land first, then 3s, 2s and 1s, and each group
     # has its texts before he reaches it. Ties keep queue order (campaign
     # source order). A row with no touch number goes last.
-    rows.sort(key=lambda r: (-_touch_of(r.get("intent")), r["id"]))
+    # Tier 2 round texts (touches 5-10) go AFTER every touch 1-4: those
+    # records are not being called, so they do not need the early slots.
+    rows.sort(key=lambda r: (_touch_of(r.get("intent")) >= 5, -_touch_of(r.get("intent")), r["id"]))
 
     now = datetime.now(timezone.utc)
     cursor = now

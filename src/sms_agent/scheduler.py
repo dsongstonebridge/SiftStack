@@ -95,6 +95,23 @@ def _warn_number_caps() -> None:
     )
 
 
+def _post_round(rplan, per_touch: dict, held_for_review: bool) -> None:
+    """The daily Tier 2 review: what was staged, who has the status but was
+    held (and why), who looks eligible without the status, who finished."""
+    from . import round2
+
+    if rplan.skipped or rplan.error:
+        return
+    round2.claim_finished(rplan)
+    total = sum(per_touch.values())
+    escalate.alert(
+        f"SMS Tier 2 round: {total} text(s) staged"
+        + (" and HELD for review" if held_for_review and total else ""),
+        round2.review_text(rplan, per_touch, held_for_review),
+        kind="campaign",
+    )
+
+
 def run(force: bool = False, dry_run: bool = False) -> dict:
     """Build and release one day's batch. Safe to call every worker pass."""
     if not config.CAMPAIGN_ENABLED and not force:
@@ -113,6 +130,23 @@ def run(force: bool = False, dry_run: bool = False) -> dict:
     # candidates the cap then throws away.
     plan = campaign.build(limit=cap)
     ready = plan.candidates[:cap]
+
+    # Tier 2 SMS Prospecting (Jeff, 2026-11-13): touches 5-10 for records the
+    # team gave the round status. OFF until SMS_AGENT_ROUND_ON=1. A failure
+    # here never takes the touches 1-4 run down with it.
+    rplan = None
+    if config.ROUND_ON:
+        from . import round2
+        try:
+            rplan = round2.build(today=_now_local().date(),
+                                 already={c.phone for c in ready})
+        except Exception as exc:  # noqa: BLE001
+            log.exception("round2 build failed")
+            escalate.alert("SMS Tier 2 round: build failed, nothing staged",
+                           str(exc)[:300], kind="campaign")
+        if rplan and rplan.error:
+            escalate.alert("SMS Tier 2 round: not run", rplan.error, kind="campaign")
+    round_ready = rplan.candidates if rplan else []
 
     # NEVER silently short a day (Jeff, 2026-10-26). When the cap stops the
     # build, say how much was left so a person can decide (raise the cap,
@@ -145,7 +179,9 @@ def run(force: bool = False, dry_run: bool = False) -> dict:
     if plan.board_notes and not dry_run:
         log.info("skip board notes: %s", seed.post_skip_notes(plan.board_notes))
 
-    if not ready:
+    if rplan and not dry_run and not ready and not round_ready:
+        _post_round(rplan, {}, False)
+    if not ready and not round_ready:
         # Say so out loud. A quiet morning and a broken cohort query look
         # identical from the outside, and only one of them is fine.
         escalate.alert(
@@ -162,6 +198,7 @@ def run(force: bool = False, dry_run: bool = False) -> dict:
             "would_queue": len(ready),
             "per_stage": plan.per_stage,
             "holds": plan.holds,
+            "round_would_queue": len(round_ready),
         }
 
     # Queued per touch (that is the seed API), then re-laid as ONE timeline.
@@ -172,10 +209,30 @@ def run(force: bool = False, dry_run: bool = False) -> dict:
         batch = [c for c in ready if getattr(c, "touch", None) == touch]
         if batch:
             queued += seed.queue(batch, touch).get("queued", 0)
+    round_per_touch: dict = {}
+    for touch in range(5, 11):
+        batch = [c for c in round_ready if getattr(c, "touch", None) == touch]
+        if batch:
+            n = seed.queue(batch, touch).get("queued", 0)
+            queued += n
+            if n:
+                round_per_touch[touch] = n
     laid = seed.reschedule_held()
     released = 0
     for touch in (1, 2, 3, 4):
         released += seed.release(touch)
+    if rplan:
+        # The first round days stay HELD until Jeff has read the review.
+        held_for_review = False
+        if round_per_touch:
+            from . import round2
+            days = round2.note_staged_day(_now_local().date())
+            if round2.release_allowed(days):
+                for touch in round_per_touch:
+                    released += seed.release(touch)
+            else:
+                held_for_review = True
+        _post_round(rplan, round_per_touch, held_for_review)
     _warn_number_caps()
     result = {"queued": queued}
 

@@ -496,6 +496,31 @@ def cmd_campaign(args) -> int:
     return 0
 
 
+def cmd_round(args) -> int:
+    """Preview the Tier 2 SMS Prospecting round. Reads the CRM, stages nothing."""
+    from datetime import date as _date
+
+    from . import round2
+
+    logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
+    store.init()
+    day = _date.fromisoformat(args.date) if args.date else None
+    plan = round2.build(today=day, suggest=not args.no_suggest)
+    if plan.skipped or plan.error:
+        print(plan.skipped or plan.error)
+        return 0 if plan.skipped else 1
+    per_touch: dict = {}
+    for c in plan.candidates:
+        per_touch[c.touch] = per_touch.get(c.touch, 0) + 1
+    print(round2.review_text(plan, per_touch, held_for_review=False))
+    if args.show:
+        print("\nsamples:")
+        for c in plan.candidates[: args.show]:
+            print(f"  t{c.touch}  {c.phone}  {c.message}")
+    print("\npreview only, nothing staged.")
+    return 0
+
+
 def cmd_reschedule(args) -> int:
     """Re-time the whole staged batch as one properly spaced sequence."""
     store.init()
@@ -739,6 +764,13 @@ def main() -> int:
     p.add_argument("--queue", action="store_true", help="stage as HELD outbox rows")
     p.set_defaults(fn=cmd_campaign)
 
+    p = sub.add_parser("round", help="preview the Tier 2 SMS Prospecting round; stages nothing")
+    p.add_argument("--date", help="pretend today is YYYY-MM-DD (round days are Mon/Wed/Fri)")
+    p.add_argument("--show", type=int, default=10)
+    p.add_argument("--no-suggest", action="store_true",
+                   help="skip the 'looks eligible, no status' list (fewer CRM reads)")
+    p.set_defaults(fn=cmd_round)
+
     sub.add_parser("reschedule", help="re-time the staged batch as one sequence").set_defaults(fn=cmd_reschedule)
 
     p = sub.add_parser("cancel-held", help="drop every staged-but-unsent message")
@@ -771,7 +803,8 @@ def main() -> int:
     p.set_defaults(fn=cmd_seed)
 
     p = sub.add_parser("release", help="release held seed touches into the send queue")
-    p.add_argument("--touch", type=int, required=True, choices=[1, 2, 3, 4])
+    p.add_argument("--touch", type=int, required=True, choices=list(range(1, 11)),
+                   help="1-4, or 5-10 for the Tier 2 SMS Prospecting round")
     p.add_argument("--limit", type=int, default=0)
     p.set_defaults(fn=cmd_release)
 

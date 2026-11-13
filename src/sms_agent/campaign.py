@@ -132,6 +132,12 @@ def _fingerprints() -> dict[int, list[str]]:
     # Retired wordings: never sent again, but texts already sent with them
     # must still count as their touch.
     pools += [(t, (tmpls, [])) for t, tmpls in getattr(touches, "RETIRED", {}).items()]
+    # Touch 4 without the "last text" promise (Tier 2 SMS Prospecting). Still
+    # touch 4, so a number that got it moves on to the round, not to touch 4
+    # again. Tier 2 round texts (5-10) are NOT fingerprinted: they are counted
+    # by the touch number stored with each send (round2.history).
+    pools += [(4, (touches.TOUCH4_V2, touches.TOUCH4_V2_NONAME)),
+              (4, (touches.HEIR_TOUCH4_V2, touches.HEIR_TOUCH4_V2_NONAME))]
     for touch, (pool, noname) in pools:
         marks = out.setdefault(touch, [])
         for template in list(pool) + list(noname):

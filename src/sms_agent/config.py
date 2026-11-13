@@ -234,6 +234,28 @@ DP_ALLOW_RECORDS = {x.strip() for x in _env("SMS_AGENT_DP_ALLOW_RECORDS", "").sp
 DP_ALLOW_NUMBERS = {"".join(ch for ch in x if ch.isdigit())[-10:]
                     for x in _env("SMS_AGENT_DP_ALLOW_NUMBERS", "").split(",") if x.strip()}
 
+# Tulsa fork (Jeff, 2026-11-13): Tier 2 SMS Prospecting. Records still not
+# contacted after their 5 call attempts (and after the deep prospect week, when
+# there was one) get 6 more texts on Mon/Wed/Fri, touches 5-10. The team opts a
+# record in by setting ROUND_STATUS; the code double-checks it (round2.py).
+# OFF until Jeff turns it on.
+ROUND_ON = _env("SMS_AGENT_ROUND_ON", "0") in ("1", "true", "True")
+ROUND_STATUS = _env("SMS_AGENT_ROUND_STATUS", "Tier 2 SMS Prospecting")
+# The preset that lists the records carrying ROUND_STATUS.
+ROUND_PRESET = _env("SMS_AGENT_ROUND_PRESET", "")
+ROUND_DAYS = _env("SMS_AGENT_ROUND_DAYS", "mon,wed,fri")
+ROUND_TEXTS = int(_env("SMS_AGENT_ROUND_TEXTS", "6"))
+ROUND_MIN_GAP_DAYS = int(_env("SMS_AGENT_ROUND_MIN_GAP_DAYS", "2"))
+# Only a number whose touch 4 went out ON OR AFTER this date can get the round.
+# The numbers that finished touch 4 before the round was built (133 on
+# 2026-11-13, most told "last text from me") stay out (Jeff, 2026-11-12/13).
+ROUND_TOUCH4_AFTER = _env("SMS_AGENT_ROUND_TOUCH4_AFTER", "2026-11-14")
+# The first N round days are staged HELD; Jeff reads the review and releases.
+ROUND_HELD_DAYS = int(_env("SMS_AGENT_ROUND_HELD_DAYS", "2"))
+# Touch 4 wording that does not promise "last text" (drafts in touches.py).
+# OFF until Jeff approves the wording; touch 4 is live.
+TOUCH4_V2 = _env("SMS_AGENT_TOUCH4_V2", "0") in ("1", "true", "True")
+
 # Tulsa fork (Jeff, 2026-10-06): each day, every NEW record starts on one
 # number, the cleanest by NumberVerifier flags, so callers can dial from the
 # number the owner already saw. Records already texted stay on their number.

@@ -181,3 +181,17 @@ jobs:
           KPI_AS_OF: ${{ github.event.inputs.date }}   # a caught-up Friday still reports Friday's week
         run: python kpi_slack_bot.py
 
+
+      # Jeff, 2026-11-16: free Slack drops posts after 90 days. Each post's exact text is
+      # attached to the run; trigger_kpi_post.ps1 on the PC downloads it into the
+      # Stonebridge OneDrive (kpi-engine/archive_kpi_posts.ps1).
+      - name: Attach the posted text (archived to Stonebridge by the PC)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kpi-posts-${{ github.run_id }}
+          path: |
+            kpi-engine/reports/posts/
+            kpi-bot/posts/
+          if-no-files-found: ignore
+          retention-days: 90

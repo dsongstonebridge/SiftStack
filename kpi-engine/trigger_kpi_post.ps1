@@ -56,6 +56,8 @@ function Run-Recheck {
     Push-Location $here
     try { cmd /c "py -3 kpi_recheck.py >> `"$recheckLog`" 2>&1" } catch { Log "next-morning check failed: $_" }
     Pop-Location
+    # Jeff, 2026-11-16: keep every post outside Slack (free Slack drops them after 90 days)
+    try { & (Join-Path $here "archive_kpi_posts.ps1") } catch { Log "post archive failed: $_" }
     $ErrorActionPreference = "Stop"
 }
 

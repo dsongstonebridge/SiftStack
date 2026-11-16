@@ -1303,6 +1303,31 @@ def post_slack(res: dict, webhook: str, bench: dict, note: str = "", texts: tupl
     with urllib.request.urlopen(r, timeout=15):
         pass
     log("Slack digest posted")
+    archive_post("\n".join(lines), f"kpi_{res['from']}_{res['to']}")
+
+
+def archive_post(text: str, name: str) -> None:
+    """Keep a copy of every post outside Slack (Jeff, 2026-11-16: free Slack drops
+    messages after 90 days). On GitHub it lands in reports/posts/ and the workflow
+    attaches it to the run; the PC copies it into the Stonebridge OneDrive. On the PC
+    it is written straight to KPI_POST_ARCHIVE (kpi-engine/.env) and nowhere else, so
+    a missing setting saves nothing rather than landing on a personal drive. Never
+    blocks the post."""
+    try:
+        folder = (os.environ.get("KPI_POST_ARCHIVE", "").strip()
+                  or _read_env_value(HERE / ".env", "KPI_POST_ARCHIVE"))
+        if not folder and os.environ.get("GITHUB_ACTIONS"):
+            folder = str(HERE / "reports" / "posts")
+        if not folder:
+            log("post not archived: KPI_POST_ARCHIVE is not set")
+            return
+        stamp = datetime.datetime.now(ZoneInfo("America/Chicago")).strftime("%Y-%m-%d_%H%M")
+        out = Path(folder) / f"{name}_posted_{stamp}.txt"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(text + "\n", encoding="utf-8")
+        log(f"post archived: {out.name}")
+    except Exception as e:  # noqa: BLE001 - an archive failure must never stop a post
+        log(f"post not archived: {e}")
 
 
 def main() -> int:

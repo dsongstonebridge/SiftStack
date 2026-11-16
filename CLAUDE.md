@@ -2256,6 +2256,13 @@ so `sms_kpis.py` and `trigger_kpi_post.ps1` must be the same there as on main. T
 without posting: `python pull_kpis.py --from D --to D --slack print`,
 `python sms_kpis.py --date D [--week]`.
 
+**Every post is kept outside Slack (Jeff, 2026-11-16).** Free Slack drops messages after 90 days. The copies go to the **Stonebridge** OneDrive (`OneDrive - Stonebridge Property Solutions\KPI Posts`), NEVER his personal OneDrive. The numbers also live in the Google Sheet; this keeps the exact post wording.
+- **Which posts:** `pull_kpis.archive_post()` (daily, weekly and "Updated" posts) and `kpi_slack_bot.archive_post()` (Friday sheet post) save each post's text right after it succeeds. A save failure is logged and never blocks the post.
+- **On GitHub:** the copies go to `reports/posts/` and `kpi-bot/posts/`, and the workflow's last step attaches them to the run as artifact `kpi-posts-<run id>` (kept 90 days).
+- **On the PC:** they're written only to `KPI_POST_ARCHIVE` (set in `kpi-engine/.env` and `kpi-bot/.env`). Unset = nothing saved, never a fallback folder.
+- **Fetching the GitHub copies:** `trigger_kpi_post.ps1` -> `Run-Recheck` calls `archive_kpi_posts.ps1` on every 15-minute firing. It downloads each finished run's artifact once and keeps state in `reports/kpi_posts_archived.txt`. "No valid artifacts found to download" means that run had nothing posted.
+- **Gotcha:** the Windows task runs the scripts from the `OneDrive\Desktop\SiftStack` checkout, so the PC half only works if THAT folder has these files.
+
 **smrtPhone session expires ~Oct 31, 2026:** run `kpi-engine\smrtphone_login.bat`, then paste
 `kpi-engine\reports\SMRTPHONE_STATE_paste_me.txt` into the `SMRTPHONE_STATE` GitHub secret.
 

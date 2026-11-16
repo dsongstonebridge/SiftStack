@@ -1219,6 +1219,40 @@ def post_to_slack(payload):
     if resp.status_code != 200:
         raise Exception(f"Slack POST failed ({resp.status_code}): {resp.text}")
     print(f"✅ Slack message posted successfully at {datetime.now().strftime('%I:%M %p')}")
+    archive_post(payload)
+
+
+def archive_post(payload):
+    """Keep a copy of the post outside Slack (Jeff, 2026-11-16: free Slack drops
+    messages after 90 days). On GitHub it lands in posts/ and the workflow attaches
+    it to the run; the PC copies it into the Stonebridge OneDrive. On the PC it goes
+    straight to KPI_POST_ARCHIVE (kpi-bot/.env) and nowhere else. Never blocks the post."""
+    try:
+        folder = os.environ.get("KPI_POST_ARCHIVE", "").strip()
+        if not folder and os.environ.get("GITHUB_ACTIONS"):
+            folder = os.path.join(SCRIPT_DIR, "posts")
+        if not folder:
+            print("post not archived: KPI_POST_ARCHIVE is not set")
+            return
+        parts = []
+        for b in payload.get("blocks", []):
+            t = b.get("text")
+            if isinstance(t, dict) and t.get("text"):
+                parts.append(t["text"])
+            for f in b.get("fields") or []:
+                if isinstance(f, dict) and f.get("text"):
+                    parts.append(f["text"])
+            for e in b.get("elements") or []:
+                if isinstance(e, dict) and e.get("text"):
+                    parts.append(e["text"] if isinstance(e["text"], str) else e["text"].get("text", ""))
+        week_of = _now().date().isoformat()
+        stamp = datetime.now().strftime("%Y-%m-%d_%H%M")
+        out = Path(folder) / f"sheet_summary_{week_of}_posted_{stamp}.txt"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text("\n\n".join(parts) + "\n", encoding="utf-8")
+        print(f"post archived: {out.name}")
+    except Exception as e:  # an archive failure must never stop a post
+        print(f"post not archived: {e}")
 
 
 def main():

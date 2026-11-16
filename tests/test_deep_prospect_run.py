@@ -337,5 +337,23 @@ check("maybe -> no stop, scored as usual, note under the owner status",
       len(fake.board) == 2 and all("POSSIBLE MIX-UP (maybe): " in m for m in fake.board))
 run.owner_profile.identity_findings = _real
 
+# ── charge only pays for the records Jeff named (2026-11-13) ──────────
+_o1 = {"rows": 1}
+check("charge: exact named record -> allowed",
+      run.charge_refusal(_o1, ["5437 E 39th St"], ["5437 e 39th st"]) is None)
+check("charge: nothing named -> refused", run.charge_refusal(_o1, ["5437 E 39th St"], []) is not None)
+check("charge: a different record named -> refused",
+      run.charge_refusal(_o1, ["5437 E 39th St"], ["100 Fake St"]) is not None)
+check("charge: order holds an extra record -> refused",
+      run.charge_refusal({"rows": 2}, ["5437 E 39th St", "100 Fake St"], ["5437 E 39th St"]) is not None)
+check("charge: SmartSkip row count above the named records -> refused",
+      run.charge_refusal({"rows": 3}, ["5437 E 39th St"], ["5437 E 39th St"]) is not None)
+check("charge: the same record named twice -> refused",
+      run.charge_refusal({"rows": 2}, ["5437 E 39th St", "5437 E 39th St"],
+                         ["5437 E 39th St", "5437 E 39th St"]) is not None)
+check("charge: two named, two in the order, order differs -> allowed",
+      run.charge_refusal({"rows": 2}, ["100 Fake St", "5437 E 39th St"],
+                         ["5437 E. 39th St", "100 Fake St"]) is None)
+
 print(f"\n{failures} failure(s)")
 sys.exit(1 if failures else 0)

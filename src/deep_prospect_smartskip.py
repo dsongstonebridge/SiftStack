@@ -462,7 +462,9 @@ def _write_phones(property_uuid: str, owner_uuid: str, rec: dict, people: list[d
     settled before SmartSkip, and phone tags cannot be removed (2026-10-20)."""
     on_record = {sta.norm_phone(p.get("number"))
                  for p in ((rec.get("owner") or {}).get("phones") or [])} - {None}
-    known_tiers = known_tiers or {}
+    # A blank tier is not a score: a dry run once saved "" for every number, and
+    # the real run then skipped all of them as already scored (2026-11-16).
+    known_tiers = {n: t for n, t in (known_tiers or {}).items() if t}
     skip = _already_tiered(rec) | on_record | set(known_tiers)
     subjects = [{"name": label, "property_address": property_uuid, "people": [
         {"phones": [{"number": ph["number"], "type_raw": ph.get("type") or "",
@@ -530,10 +532,13 @@ def _write_phones(property_uuid: str, owner_uuid: str, rec: dict, people: list[d
 
 
 def write_record(rec: dict, plan: dict, *, research: dict, dry_run: bool = True, repost: bool = False,
-                 status_line: str = "", known_tiers: dict | None = None) -> dict:
+                 status_line: str = "", known_tiers: dict | None = None,
+                 county_holder: str = "") -> dict:
     """`write`: Dial First/Second to the phone list, everything else on the board, with
     our research over SmartSkip. A number leaves the record only after the post is
-    confirmed on the board, and only on this deep prospected record."""
+    confirmed on the board, and only on this deep prospected record.
+    `county_holder` (the Assessor title off owner_profile) is used when the board carries
+    no probate/petition "Title holder of record" line, as on SiftMap-pulled records."""
     _api.set_dry_run(dry_run)
     try:
         uuid, owner_uuid, crm = _resolve(rec["property_address"], rec["property_city"],
@@ -553,7 +558,7 @@ def write_record(rec: dict, plan: dict, *, research: dict, dry_run: bool = True,
         remove = split.removable_after_post(rows)
         kept = split.on_record_now(rows) - set(remove)
         people_rows = split.people_from_plan(plan, res.get("tiers") or {}, research)
-        holder = split.title_holder(_api.get_message_board(owner_uuid))
+        holder = split.title_holder(_api.get_message_board(owner_uuid)) or county_holder
         text = split.build_post({"status_lines": [status_line] if status_line else [],
                                  "traced": f"Traced: {plan['subject']}. Call first: " + ", ".join(
                                      x["name"] for x in people_rows if x["section"] == "CALL FIRST") + ".",

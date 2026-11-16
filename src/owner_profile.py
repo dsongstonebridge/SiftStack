@@ -80,6 +80,37 @@ def street_query(street: str) -> str:
     return " ".join(re.sub(r"^(\d+)(ST|ND|RD|TH)$", r"\1", t) for t in toks)
 
 
+_STREET_TYPE = {"AVE": "AVE", "AVENUE": "AVE", "AV": "AVE", "ST": "ST", "STREET": "ST",
+                "PL": "PL", "PLACE": "PL", "CT": "CT", "COURT": "CT", "DR": "DR", "DRIVE": "DR",
+                "RD": "RD", "ROAD": "RD", "LN": "LN", "LANE": "LN", "BLVD": "BLVD", "BV": "BLVD",
+                "BOULEVARD": "BLVD", "CIR": "CIR", "CIRCLE": "CIR", "TER": "TER", "TERRACE": "TER",
+                "PKWY": "PKWY", "WAY": "WAY"}
+
+
+def street_type(street: str) -> str:
+    """'1518 N Columbia Ave' -> 'AVE', '1518 N COLUMBIA PL E' -> 'PL', '' when none."""
+    toks = re.sub(r"[^A-Za-z0-9 ]", " ", street or "").upper().split()
+    while len(toks) > 2 and toks[-1] in {"N", "S", "E", "W"}:
+        toks.pop()
+    return _STREET_TYPE.get(toks[-1], "") if len(toks) > 2 else ""
+
+
+def same_street(a: str, b: str) -> bool:
+    """House number, street name AND street type agree; directionals aside.
+    House number alone picked 12214 E 81 PL N for 12214 E 30th St, and ignoring the
+    type picked 1518 N Columbia PL for 1518 N Columbia Ave (2026-11-16). The type is
+    compared only when both sides carry one."""
+    def key(s):
+        toks = street_query(s).split()
+        name = [t for t in toks[1:] if t not in {"N", "S", "E", "W"}]
+        return (toks[:1], name[:1])
+    ka, kb = key(a), key(b)
+    ta_, tb_ = street_type(a), street_type(b)
+    if ta_ and tb_ and ta_ != tb_:
+        return False
+    return bool(ka[0]) and bool(ka[1]) and ka == kb
+
+
 def area_code(num: str) -> str:
     d = re.sub(r"\D", "", num or "")[-10:]
     return d[:3] if len(d) == 10 else ""
@@ -192,12 +223,11 @@ def assessor_section(street: str, city: str, person: str, *,
         ta.ASSESSOR_INFO_URL_HTTP.format(acct), headers=_UA, timeout=60).text)
     sec = _section("Tulsa County Assessor")
     try:
-        house = street.split()[0]
         hits = search(street_query(street)) or []
         acct = None
-        for h in hits[:5]:
+        for h in hits[:8]:
             s = situs(h.get("AccountNo"))
-            if (s or {}).get("street", "").split()[:1] == [house]:
+            if same_street((s or {}).get("street", ""), street):
                 acct, sit = h.get("AccountNo"), s
                 break
         if not acct:

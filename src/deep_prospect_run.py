@@ -67,6 +67,14 @@ RUNS_DIR = Path(os.getenv("SMS_AGENT_DP_RUNS_DIR") or Path(config.OUTPUT_DIR) / 
 PDF_MARKER = "DEEP PROSPECTING RESEARCH PDF"
 PRICE_PER_HIT = 0.15
 PRICE_CENTS = 15
+#: SmartSkip takes at least this much per order, even from the balance and even on a
+#: miss: a 1-row order that found nothing took $0.50 (2026-11-13, 5437 E 39th St).
+MIN_ORDER_CENTS = 50
+
+
+def order_cost_cents(rows: int) -> int:
+    """The most one order can take from the balance."""
+    return max(rows * PRICE_CENTS, MIN_ORDER_CENTS)
 ORDERS_DIR = RUNS_DIR / "_orders"
 #: `start --only-one` is refused this soon after another order: that is one batch.
 ONE_ORDER_WINDOW_SECONDS = 3600
@@ -324,8 +332,9 @@ def _open_order(items: list) -> int:
     (order / "order.json").write_text(json.dumps(
         {"bulkSkipId": entry["bulkSkipId"], "rows": n, "paid": False, "created_ts": time.time(),
          "runs": [str(p["run"]) for p in prepared]}, indent=2), encoding="utf-8")
-    print(f"\nSMARTSKIP: ONE order, {len(prepared)} record(s), {n} billable row(s), at most "
-          f"${n * PRICE_PER_HIT:.2f} from the balance. NOTHING CHARGED YET.\n"
+    print(f"\nSMARTSKIP: ONE order, {len(prepared)} record(s), {n} billable row(s), up to "
+          f"${order_cost_cents(n) / 100:.2f} from the balance (SmartSkip's per-order minimum is "
+          f"${MIN_ORDER_CENTS / 100:.2f}). NOTHING CHARGED YET.\n"
           f"Next: python src/deep_prospect_run.py charge --order {order.as_posix()}")
     return 0
 
@@ -373,7 +382,7 @@ def pay_from_balance(sess, bid: str, rows: int) -> None:
     code, wallet, _ = sess.call("GET", "/wallet/balance")
     if code != 200:
         raise SystemExit(f"could not read the SmartSkip balance ({code}). Nothing was charged.")
-    have, need = int(wallet.get("balance") or 0), rows * PRICE_CENTS
+    have, need = int(wallet.get("balance") or 0), order_cost_cents(rows)
     if have < need:
         raise SystemExit(f"SMARTSKIP BALANCE TOO LOW: ${have / 100:.2f} on hand, up to ${need / 100:.2f} "
                          f"needed for {rows} row(s). Nothing was charged and the card was not touched. "
@@ -389,8 +398,12 @@ def pay_from_balance(sess, bid: str, rows: int) -> None:
         raise SystemExit(f"balance payment did not go through: {data}. The card was not touched. "
                          "Check the order at https://app.smartskip.io/bulk-skip before retrying.")
     _, after, _ = sess.call("GET", "/wallet/balance")
-    print(f"Paid from the balance. status={data.get('status')} balance now "
-          f"${int((after or {}).get('balance') or 0) / 100:.2f}")
+    left = int((after or {}).get("balance") or 0)
+    print(f"Paid from the balance. status={data.get('status')} took ${(have - left) / 100:.2f}, "
+          f"balance now ${left / 100:.2f}")
+    if have - left > need:
+        print(f"WARNING: SmartSkip took ${(have - left) / 100:.2f}, MORE than the ${need / 100:.2f} "
+              "quoted. Tell Jeff.")
 
 
 def _addr_key(street: str, city: str) -> str:
@@ -424,6 +437,30 @@ def split_export(export: Path, runs: list) -> list:
     return empty
 
 
+def _street_key(street: str) -> str:
+    return " ".join("".join(c if c.isalnum() else " " for c in (street or "").lower()).split())
+
+
+def charge_refusal(order: dict, run_streets: list, named: list) -> str | None:
+    """Why this order may NOT be paid, or None. Jeff, 2026-11-13: a charge never pays for
+    more than the records he named for this run, so the order must hold exactly those
+    addresses, one row each. Anything else is refused before any money moves."""
+    if not named:
+        return ("name the records being paid for: --records \"<street>\" once per record "
+                "Jeff asked for")
+    want = sorted(_street_key(s) for s in named)
+    have = sorted(_street_key(s) for s in run_streets)
+    if len(set(want)) != len(want):
+        return f"the same record is named twice: {named}"
+    if have != want:
+        return (f"the order holds {sorted(run_streets)} but the records named are {sorted(named)}; "
+                "they must match exactly")
+    if int(order.get("rows") or 0) != len(want):
+        return (f"SmartSkip counted {order.get('rows')} billable row(s) for {len(want)} named "
+                "record(s); they must be equal")
+    return None
+
+
 def cmd_charge(a) -> int:
     if not a.order and not a.run:
         raise SystemExit("charge needs --order (or --run for a record's order)")
@@ -440,6 +477,10 @@ def cmd_charge(a) -> int:
     ss = _smartskip()
     sess = ss.Session()
     if not order.get("paid"):
+        why = charge_refusal(order, [_load(r).get("street", "") for r in runs], a.records or [])
+        if why:
+            print(f"REFUSED, nothing charged: {why}")
+            return 8
         pay_from_balance(sess, bid, order["rows"])
         order["paid"] = True
         (order_dir / "order.json").write_text(json.dumps(order, indent=2), encoding="utf-8")
@@ -550,8 +591,20 @@ def cmd_finish(a) -> int:
     if problems:
         raise SystemExit("REFUSED, nothing written:\n  " + "\n  ".join(problems))
     dry = not a.commit
+    # No probate post on a SiftMap-pulled record, so the county title comes from
+    # the free owner profile; otherwise every post said "not found" (2026-11-16).
+    county_holder = ""
+    prof_json = run / "owner_profile.json"
+    if prof_json.exists():
+        prof = json.loads(prof_json.read_text(encoding="utf-8"))
+        for sec in prof.get("sections") or []:
+            sit = (sec.get("data") or {}).get("situs") if isinstance(sec, dict) else None
+            if sit and sit.get("owner"):
+                county_holder = f"{sit['owner']} (Tulsa County Assessor)"
+                break
     res = dps.write_record(rec, plan, research=research, dry_run=dry, repost=a.repost,
-                           status_line=status_line, known_tiers=state.get("tiers"))
+                           status_line=status_line, known_tiers=state.get("tiers"),
+                           county_holder=county_holder)
 
     notes_file = getattr(a, "notes", None)
     notes = Path(notes_file).read_text(encoding="utf-8") if notes_file else ""
@@ -587,9 +640,13 @@ def cmd_finish(a) -> int:
             f"{os.path.basename(pdf)}")
     finally:
         _api.set_dry_run(False)
-    state.update(finished=not dry, primary=a.primary, basis=research.get("basis"), owner_status=status_line,
-                 tiers=res.get("tiers") or state.get("tiers"))
-    _save(run, state)
+    if not dry:
+        # Only real scores are kept. A dry run's blank tiers once made the real
+        # run skip every number as "already scored" (2026-11-16).
+        tiers = {n: t for n, t in {**(state.get("tiers") or {}), **(res.get("tiers") or {})}.items() if t}
+        state.update(finished=True, primary=a.primary, basis=research.get("basis"),
+                     owner_status=status_line, tiers=tiers)
+        _save(run, state)
     print(("DRY RUN - nothing written, nothing billed. " if dry else "") + json.dumps(res))
     print(f"PDF: {pdf}" + ("" if dry else f" (uploaded: {doc.get('filename') or doc})"))
     return 0 if res.get("ok", True) else 2
@@ -618,6 +675,9 @@ def main(argv=None) -> int:
     c = sub.add_parser("charge", help="BILLS the SmartSkip balance once for the order, never the card")
     c.add_argument("--order", help="output/deep_prospect/_orders/<id>")
     c.add_argument("--run", help="a record's run folder: charges that record's order")
+    c.add_argument("--records", action="append",
+                   help="street of each record Jeff named for this run; repeat. Required to pay: "
+                        "the order must hold exactly these, one row each")
     c.add_argument("--wait", type=int, default=1200)
     f = sub.add_parser("finish", help="write phones/board/PDF (dry run until --commit)")
     f.add_argument("--run", required=True)

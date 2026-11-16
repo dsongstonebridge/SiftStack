@@ -81,6 +81,23 @@ c = op.assessor_section("4410 E 99th St", "Tulsa", "Paul Fenwick", search=lambda
                         situs=fake_situs, sales=fake_sales, info_html=lambda acct: INFO)
 check("assessor: no account -> 'not checked', never a silent empty", c["status"] == "not checked")
 check("street query drops suffix and ordinal", op.street_query("4410 E 99th St") == "4410 E 99")
+check("same street: house number alone is not enough (12214 E 81 PL N vs 12214 E 30th St)",
+      not op.same_street("12214 E 81 PL N", "12214 E 30th St"))
+check("same street: county abbreviations still match",
+      op.same_street("12214 E 30 ST S", "12214 E 30th St")
+      and op.same_street("1733 S 141 AV E", "1733 S 141St East Ave")
+      and op.same_street("346 E XYLER ST N", "346 E Xyler St"))
+d = op.assessor_section("12214 E 30th St", "Tulsa", "Joe Dean",
+                        search=lambda q: [{"AccountNo": "WRONG"}, {"AccountNo": "RIGHT"}],
+                        situs=lambda acct: {"street": "12214 E 81 PL N" if acct == "WRONG"
+                                            else "12214 E 30 ST S",
+                                            "owner": "OTHER, PERSON" if acct == "WRONG"
+                                            else "DEAN, JOE P"},
+                        sales=lambda acct: [], info_html=lambda acct: INFO)
+check("assessor: skips a same-number parcel on another street", d["data"].get("account") == "RIGHT")
+check("same street: Ave and Pl are different streets (1518 N Columbia, 2026-11-16)",
+      not op.same_street("1518 N COLUMBIA PL E", "1518 N Columbia Ave")
+      and op.same_street("1518 N COLUMBIA AV E", "1518 N Columbia Ave"))
 
 # ── Treasurer: a link to check by hand (Jeff, 2026-10-28) ────────────
 t = op.treasurer_section("Paul Fenwick", "12345678901234")

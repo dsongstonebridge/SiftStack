@@ -1096,9 +1096,17 @@ def finalize(res: dict, token: str, texts: dict | None) -> None:
     worked = dialed_h | texted_h | status_h | reached | secondary
     outreach_h = dialed_h | texted_h
     by_status = (mark_any & status_h) - mark_rpc
+    # How each right-party contact was reached (Jeff, 2026-11-05: keep this split on the post).
+    # Call = a pickup or callback on the record in this window, even if they also texted.
+    # Text only = a text reply and no call. Other = marked with neither in this window.
+    rpc_h = (mark_rpc | by_status) & outreach_h
+    picked_up = {sms_kpis.rec_hash(u) for u in by_rec}
+    rpc_call = rpc_h & picked_up
+    rpc_text = (rpc_h & (text_rpc | text_sec)) - rpc_call
     res["contact"] = {
-        "rpc": len((mark_rpc | by_status) & outreach_h), "marked": len(mark_rpc & outreach_h),
+        "rpc": len(rpc_h), "marked": len(mark_rpc & outreach_h),
         "by_status": len(by_status & outreach_h),
+        "call": len(rpc_call), "text_only": len(rpc_text), "other": len(rpc_h - rpc_call - rpc_text),
         "secondary": len(secondary), "worked": len(worked),
         "texts_known": texts is not None,
         # records we reached out to (Jeff, 2026-10-30: the first line of the post)
@@ -1183,7 +1191,12 @@ def slack_lines(res: dict, bench: dict, texts: tuple, note: str = "", ledger: di
                   f"• Right-party contacts: *{ct['rpc']}* _(records reached out to {span} with the primary number marked "
                   f"Correct {span}: {ct['marked']}; or a number marked Correct {span} and the record set to a lead "
                   f"status or Not Interested {span}: {ct['by_status']})_" + ("" if ct["texts_known"] else "  · _texts not available_"),
-                  f"• Secondary contacts: *{ct['secondary']}* _(people reached {span} on a number marked Correct but "
+                  f"    Call: *{ct['call']}* _(reached by a pickup or callback; includes anyone who also texted)_",
+                  f"    Text only: *{ct['text_only']}* _(reached by text reply only, no call)_"]
+        if ct["other"]:
+            lines.append(f"    Neither: *{ct['other']}* _(marked Correct {span} with no pickup or text reply {span}; "
+                         f"usually a voicemail greeting or an earlier reply)_")
+        lines += [f"• Secondary contacts: *{ct['secondary']}* _(people reached {span} on a number marked Correct but "
                   f"NOT primary: relatives or secondary decision makers; not in the contact rate)_",
                   f"• Contact rate: *{pct(ct['rpc'], ct['outreach'])}* _(right-party contacts ÷ records reached "
                   f"out to {span}: {ct['rpc']} of {ct['outreach']})_"]

@@ -436,7 +436,7 @@ res = scheduler.run(force=True)
 check("round texts queued", res.get("queued") == 2, res)
 check("first round day: staged HELD, not released",
       [r["status"] for r in outbox(5)] == ["held", "held"], outbox(5))
-review = [p for p in POSTS if p[0].startswith("SMS Tier 2 round")]
+review = [p for p in POSTS if p[0].startswith("Tier 2 Texter")]
 check("review posted, saying held for review",
       review and "HELD for review" in review[0][0], [p[0] for p in POSTS])
 check("review lists held and suggested records",
@@ -470,6 +470,25 @@ check("touch 4 is laid out before a round text", nb["seed_touch_4"] < nb["seed_t
 with store.tx() as cx:
     cx.execute("DELETE FROM outbox")
 config.DRY_RUN = True
+
+# ---- 11b. a reply to a round text says it came from Tier 2 Texter
+SENT = []
+_real_post = escalate._post
+escalate._post = lambda text, blocks=None, **kw: SENT.append(text) or True
+with store.tx() as cx:
+    cx.execute("DELETE FROM outbox")
+store.queue_message("9185550911", "round text", from_number="+19180000001", status="sent",
+                    intent="seed_touch_7", confidence=1.0)
+store.queue_message("9185550912", "touch 3 text", from_number="+19180000001", status="sent",
+                    intent="seed_touch_3", confidence=1.0)
+escalate.reply_alert("9185550911", "who is this", "OTHER")
+escalate.reply_alert("9185550912", "who is this", "OTHER")
+check("reply to touch 7 is labelled Tier 2 Texter",
+      "Tier 2 Texter, touch 7" in SENT[0], SENT[0])
+check("reply to touch 3 carries no Tier 2 label", "Tier 2" not in SENT[1], SENT[1])
+escalate._post = _real_post
+with store.tx() as cx:
+    cx.execute("DELETE FROM outbox")
 
 # ---- 12. off by default
 check("round is OFF by default", config.ROUND_ON is False)

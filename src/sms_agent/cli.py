@@ -497,7 +497,7 @@ def cmd_campaign(args) -> int:
 
 
 def cmd_round(args) -> int:
-    """Preview the Tier 2 SMS Prospecting round. Reads the CRM, stages nothing."""
+    """Preview Tier 2 Texter (touches 5-10). Reads the CRM, stages nothing."""
     from datetime import date as _date
 
     from . import round2
@@ -764,7 +764,7 @@ def main() -> int:
     p.add_argument("--queue", action="store_true", help="stage as HELD outbox rows")
     p.set_defaults(fn=cmd_campaign)
 
-    p = sub.add_parser("round", help="preview the Tier 2 SMS Prospecting round; stages nothing")
+    p = sub.add_parser("tier2", aliases=["round"], help="preview Tier 2 Texter (touches 5-10); stages nothing")
     p.add_argument("--date", help="pretend today is YYYY-MM-DD (round texts go every other weekday)")
     p.add_argument("--show", type=int, default=10)
     p.add_argument("--no-suggest", action="store_true",
@@ -804,7 +804,7 @@ def main() -> int:
 
     p = sub.add_parser("release", help="release held seed touches into the send queue")
     p.add_argument("--touch", type=int, required=True, choices=list(range(1, 11)),
-                   help="1-4, or 5-10 for the Tier 2 SMS Prospecting round")
+                   help="1-4, or 5-10 for Tier 2 Texter")
     p.add_argument("--limit", type=int, default=0)
     p.set_defaults(fn=cmd_release)
 

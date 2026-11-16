@@ -158,6 +158,11 @@ def reply_alert(phone: str, inbound: str, intent: str,
     where = ", ".join(x for x in (ctx.get("street"), ctx.get("city")) if x)
     mention = f"<@{config.HANDOFF_SLACK_ID}> " if config.HANDOFF_SLACK_ID else ""
     headline = _REPLY_HEADLINE.get(intent, _REPLY_VERIFY)
+    # Tier 2 Texter (touches 5-10) shares this engine; say which agent the
+    # reply answered so it can be told apart from touches 1-4.
+    touch = store.last_sent_touch(phone)
+    if touch >= 5:
+        headline = f"Replying to Tier 2 Texter, touch {touch}. " + headline
     lines = [
         f"{mention}*{config.HANDOFF_NAME}: SMS reply - {who}*",
         f"{_fmt_phone(phone)}" + (f"  {where}" if where else ""),

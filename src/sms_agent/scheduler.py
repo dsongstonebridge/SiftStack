@@ -96,7 +96,7 @@ def _warn_number_caps() -> None:
 
 
 def _post_round(rplan, per_touch: dict, held_for_review: bool) -> None:
-    """The daily Tier 2 review: what was staged, who has the status but was
+    """The daily Tier 2 Texter review: what was staged, who has the status but was
     held (and why), who looks eligible without the status, who finished."""
     from . import round2
 
@@ -105,7 +105,7 @@ def _post_round(rplan, per_touch: dict, held_for_review: bool) -> None:
     round2.claim_finished(rplan)
     total = sum(per_touch.values())
     escalate.alert(
-        f"SMS Tier 2 round: {total} text(s) staged"
+        f"Tier 2 Texter: {total} text(s) staged"
         + (" and HELD for review" if held_for_review and total else ""),
         round2.review_text(rplan, per_touch, held_for_review),
         kind="campaign",
@@ -131,7 +131,7 @@ def run(force: bool = False, dry_run: bool = False) -> dict:
     plan = campaign.build(limit=cap)
     ready = plan.candidates[:cap]
 
-    # Tier 2 SMS Prospecting (Jeff, 2026-11-13): touches 5-10 for records the
+    # Tier 2 Texter (Jeff, 2026-11-13): touches 5-10 for records the
     # team gave the round status. OFF until SMS_AGENT_ROUND_ON=1. A failure
     # here never takes the touches 1-4 run down with it.
     rplan = None
@@ -142,10 +142,10 @@ def run(force: bool = False, dry_run: bool = False) -> dict:
                                  already={c.phone for c in ready})
         except Exception as exc:  # noqa: BLE001
             log.exception("round2 build failed")
-            escalate.alert("SMS Tier 2 round: build failed, nothing staged",
+            escalate.alert("Tier 2 Texter: build failed, nothing staged",
                            str(exc)[:300], kind="campaign")
         if rplan and rplan.error:
-            escalate.alert("SMS Tier 2 round: not run", rplan.error, kind="campaign")
+            escalate.alert("Tier 2 Texter: not run", rplan.error, kind="campaign")
     round_ready = rplan.candidates if rplan else []
 
     # NEVER silently short a day (Jeff, 2026-10-26). When the cap stops the

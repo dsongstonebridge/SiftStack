@@ -332,6 +332,19 @@ def phone_sent_from(phone: str) -> str:
     return row[0] if row else ""
 
 
+def last_sent_touch(phone: str) -> int:
+    """Touch number of the last outreach text actually sent to this phone, or 0."""
+    row = _conn().execute(
+        "SELECT intent FROM outbox WHERE phone=? AND status='sent' "
+        "AND intent LIKE 'seed_touch_%' ORDER BY sent_at DESC LIMIT 1",
+        (clean_phone(phone),),
+    ).fetchone()
+    try:
+        return int(row[0].rsplit("_", 1)[1]) if row else 0
+    except (ValueError, IndexError):
+        return 0
+
+
 def record_texted_from(record_uuid: str, from_number: str) -> bool:
     """True once this record has actually been SENT a text from this number.
 

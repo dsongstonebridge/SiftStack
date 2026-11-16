@@ -1,4 +1,4 @@
-"""Tier 2 SMS Prospecting: touches 5-10 for records we still have not reached.
+"""Tier 2 Texter: touches 5-10 for records we still have not reached.
 
 Jeff, 2026-11-13. A "week" is the 5 call attempts, never calendar days.
 

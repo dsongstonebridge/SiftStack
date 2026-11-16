@@ -325,16 +325,14 @@ def _stop_on_reply(phone: str, record_uuid: str, body: str, result,
     # Sensitive replies already post their own, louder alert.
     if result.intent == "ESCALATE" or config.PHASE < 2:
         return acts
-    # A yes after an earlier unclear reply still posts once, so Diego hears
-    # that the number was marked Correct and the others stopped.
+    # Every reply posts (Jeff, 2026-11-16), so each one sends someone back to
+    # the record. Was once per number. The same text twice never gets here:
+    # inbound is deduped by content upstream (store.recent_inbound_exists).
     alert_intent = _alert_intent(result, body)
-    key = "reply-correct" if alert_intent in MARK_CORRECT_INTENTS else "reply"
-    if store.mark_notified(phone, key):
-        ok = escalate.reply_alert(phone, body, alert_intent, context, record_uuid)
-        acts.append(f"posted reply alert for {config.HANDOFF_NAME}" if ok
-                    else "reply alert FAILED to post")
-    else:
-        acts.append("reply alert already posted for this line")
+    repeat = not store.mark_notified(phone, "reply")
+    ok = escalate.reply_alert(phone, body, alert_intent, context, record_uuid, repeat=repeat)
+    acts.append(f"posted reply alert for {config.HANDOFF_NAME}" if ok
+                else "reply alert FAILED to post")
     return acts
 
 

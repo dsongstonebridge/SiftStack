@@ -146,7 +146,8 @@ _REPLY_HEADLINE = {
 
 
 def reply_alert(phone: str, inbound: str, intent: str,
-                context: Optional[dict] = None, record_uuid: str = "") -> bool:
+                context: Optional[dict] = None, record_uuid: str = "",
+                repeat: bool = False) -> bool:
     """SMS_AGENT_STOP_ON_ANY_REPLY: every reply reaches a person, once.
 
     Deliberately plainer than hot_lead(): it claims nothing about selling,
@@ -163,6 +164,8 @@ def reply_alert(phone: str, inbound: str, intent: str,
     touch = store.last_sent_touch(phone)
     if touch >= 5:
         headline = f"Replying to Tier 2 Texter, touch {touch}. " + headline
+    if repeat:
+        headline = "Another reply from this number. " + headline
     lines = [
         f"{mention}*{config.HANDOFF_NAME}: SMS reply - {who}*",
         f"{_fmt_phone(phone)}" + (f"  {where}" if where else ""),

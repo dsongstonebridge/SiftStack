@@ -108,7 +108,12 @@ check("post asks Diego to verify and mark Correct",
       bool(POSTS) and "Verify" in POSTS[0] and "mark this number Correct" in POSTS[0], POSTS[0] if POSTS else "")
 
 engine.handle_inbound({"from": A, "to": "+19180000001", "message": "hello??", "smsId": "s2"})
-check("second unclear reply does not post again", len(POSTS) == 1, str(len(POSTS)))
+# Jeff, 2026-11-16: every reply posts, not once per number.
+check("second reply posts again", len(POSTS) == 2, str(len(POSTS)))
+check("second post says it is another reply", "Another reply from this number" in POSTS[-1], POSTS[-1])
+check("first post does not say another reply", "Another reply" not in POSTS[0], POSTS[0])
+check("the same text read again by the log poll is skipped (no second post)",
+      store.recent_inbound_exists(A, "hello??"))
 
 # ---- an unmistakable yes marks Correct and stops every line of the record
 REC = "rec-9"

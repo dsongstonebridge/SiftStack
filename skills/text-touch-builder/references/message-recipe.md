@@ -114,7 +114,7 @@ No-name versions:
 ## Optional: Tier 2 SMS prospecting (touches 5-10)
 
 For records still not reached after the call attempts: six more texts over two
-weeks (for example Mon, Wed, Fri), then stop. Three rules carry over from the
+weeks (every other weekday: Mon, Wed, Fri, Tue, Thu, Mon), then stop. Three rules carry over from the
 first four touches and one is new:
 
 - **Touch 4 must not promise it is the last text** if you run this round.

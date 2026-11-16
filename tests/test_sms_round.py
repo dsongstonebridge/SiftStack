@@ -418,6 +418,7 @@ POSTS = []
 escalate.alert = lambda title, detail="", **kw: POSTS.append((title, detail)) or True
 round_cands, _, _ = vet()                              # two touch-5 texts from section 6
 campaign.build = lambda **kw: campaign.Plan()          # touches 1-4: nothing today
+_REAL_BUILD = round2.build
 round2.build = lambda today=None, already=None, **kw: round2.RoundPlan(
     candidates=list(round_cands), held=[("x", "1 Held St", "talked to them")],
     suggested=[("y", "2 Maybe Ave", "Correct number, never talked to them")])
@@ -489,6 +490,13 @@ check("reply to touch 3 carries no Tier 2 label", "Tier 2" not in SENT[1], SENT[
 escalate._post = _real_post
 with store.tx() as cx:
     cx.execute("DELETE FROM outbox")
+
+# ---- 11c. a start date holds the round until that day
+config.ROUND_START = "2026-11-23"
+_p = _REAL_BUILD(today=date(2026, 11, 20))
+check("before the start date the round is skipped", "starts 2026-11-23" in (_p.skipped or ""), _p.skipped)
+check("before the start date nothing is a candidate", not _p.candidates)
+config.ROUND_START = ""
 
 # ---- 12. off by default
 check("round is OFF by default", config.ROUND_ON is False)

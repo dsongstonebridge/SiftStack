@@ -303,6 +303,9 @@ def build(today: Optional[date] = None, sms_rows: Optional[list] = None,
     plan = RoundPlan()
     today = today or campaign._local_date(datetime.now(timezone.utc))
     already = already or set()
+    if config.ROUND_START and today.isoformat() < config.ROUND_START:
+        plan.skipped = f"Tier 2 Texter starts {config.ROUND_START}"
+        return plan
     if today.weekday() not in round_days():
         plan.skipped = f"{today:%A} is not a round day"
         return plan

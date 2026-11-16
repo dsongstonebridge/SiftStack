@@ -240,6 +240,9 @@ DP_ALLOW_NUMBERS = {"".join(ch for ch in x if ch.isdigit())[-10:]
 # record in by setting ROUND_STATUS; the code double-checks it (round2.py).
 # OFF until Jeff turns it on.
 ROUND_ON = _env("SMS_AGENT_ROUND_ON", "0") in ("1", "true", "True")
+# First day the round may run (YYYY-MM-DD, business-local); blank = no wait.
+# Jeff, 2026-11-16: on, starting Mon 2026-11-23.
+ROUND_START = _env("SMS_AGENT_ROUND_START", "")
 ROUND_STATUS = _env("SMS_AGENT_ROUND_STATUS", "Tier 2 SMS Prospecting")
 # The preset that lists the records carrying ROUND_STATUS.
 ROUND_PRESET = _env("SMS_AGENT_ROUND_PRESET", "")

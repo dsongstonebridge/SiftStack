@@ -1137,11 +1137,16 @@ def _resolve_sender(row: dict, record_uuid: str, fallback: str) -> str:
     """Whose name signs this touch: the person assigned to the record."""
     assigned = (row.get("assigned") or "").strip()
     if assigned:
-        mapped = config.senders().get(assigned)
+        known = config.senders()
+        mapped = known.get(assigned)
         if mapped:
             return str(mapped).split()[0]
-        # An export's "Assigned To" is usually already a human name.
-        if "@" not in assigned and len(assigned.split()) <= 3:
+        # An export's "Assigned To" is usually already a human name. A user
+        # uuid is not (it once signed a text "B3923Cfc-44Ac-..."), nor is a
+        # sender whose start date has not come yet.
+        looks_uuid = assigned.count("-") == 4 and len(assigned) == 36
+        if (assigned not in known and not looks_uuid
+                and "@" not in assigned and len(assigned.split()) <= 3):
             return assigned.split()[0].title()
     if record_uuid:
         name = crm.deal_context(record_uuid).get("assigned_name") or ""

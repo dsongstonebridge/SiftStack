@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import date
 from pathlib import Path
+from typing import Optional
 
 from dotenv import load_dotenv
 
@@ -443,13 +445,30 @@ ESCALATE_INTENTS = [
 ]
 
 
-def senders() -> dict:
-    """assigned_to uuid -> first name. Also accepts an email or a full name key."""
-    if SENDERS_FILE.exists():
-        data = json.loads(SENDERS_FILE.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            return {k: v for k, v in data.items() if not k.startswith("_")}
-    return {}
+def senders(today: Optional[str] = None) -> dict:
+    """assigned_to uuid -> first name. Also accepts an email or a full name key.
+
+    A value can also be {"name": "Eric", "from": "YYYY-MM-DD"} (Jeff,
+    2026-11-16: a new caller's records are signed by the lead manager during
+    onboarding week and by the caller from that date on). Before the date the
+    key maps to "" so it stays unresolved: the fallback sender signs, and the
+    API user lookup cannot fill the name in early.
+    """
+    if not SENDERS_FILE.exists():
+        return {}
+    data = json.loads(SENDERS_FILE.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        return {}
+    today = today or date.today().isoformat()
+    out = {}
+    for k, v in data.items():
+        if k.startswith("_"):
+            continue
+        if isinstance(v, dict):
+            starts = str(v.get("from") or "")
+            v = str(v.get("name") or "") if not starts or today >= starts else ""
+        out[k] = v
+    return out
 
 
 def number_pools() -> dict:

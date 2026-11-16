@@ -574,7 +574,8 @@ plan = seed.schedule(cands)
 multi = {n for c, n, _ in plan if c.record_uuid == "rec-multi"}
 solo = {n for c, n, _ in plan if c.record_uuid == "rec-solo"}
 check("all phones on one record share one number", len(multi) == 1, str(multi))
-check("a different record still rotates", solo and not (solo & multi), f"{solo} vs {multi}")
+# "a different record still rotates" removed 2026-11-16 (Jeff): since 10-07
+# SMS_AGENT_ONE_NUMBER_PER_DAY puts every new record on the same number.
 store.ensure_conversation("9185550301", from_number="+19180000003", record_uuid="rec-earlier")
 store.map_phone("9185550301", record_uuid="rec-earlier")
 with store.tx() as _c:  # a REAL send pins the record (2026-10-12)

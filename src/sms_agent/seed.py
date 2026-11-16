@@ -227,8 +227,19 @@ _VM_NOTE = re.compile(
     r"\b(no answer|n/?a\b|didn'?t answer|did not answer|vms?|v/m|lvm|left (a )?(vms?|voicemails?|messages?|msg)|"
     r"voice ?mail|mailbox|went to (vm|voicemail)|no pick ?up|rang out|straight to (vm|voicemail)|"
     r"can'?t get a ?hold|couldn'?t (get a ?hold|reach)|unable to reach|no luck|answering (machine|service)|"
-    r"nobody answered|no one answered|wasn'?t answered)\b",
+    r"nobody answered|no one answered|wasn'?t answered|"
+    # A recording is not a person (Jeff, 2026-11-03: "recording says Tim" read
+    # as a conversation because of "says", which stopped the texts).
+    r"rec+ording|rec+orded (messages?|msg|greeting|vms?|voice ?mail|says|said)|greeting|"
+    r"messages? (says|said))\b",
     re.I)
+# "I've never been able to get him to answer the phone" (1021 Ridge Dr,
+# 2026-11-02): nobody picked up, however many words sit before "answer". It only
+# counts as a voicemail note if nothing else in the note says they talked, so
+# "he wouldn't answer my question, said he's not selling" stays a conversation.
+_NEVER_ANSWERS = re.compile(
+    r"\b(never|can'?t|cannot|couldn'?t|unable|not able|haven'?t|hasn'?t|won'?t|wouldn'?t)\b"
+    r"[^.!?]{0,40}?\banswer(ed|ing|s)?\b", re.I)
 _TALK_NOTE = re.compile(
     r"\b(talked|spoke|spoken|convo|conversation|said|says|wants|asking|told me|motivated|interested|"
     r"offer|appointment|appt|reached|hung up|picked up|when i said|answer|answered)\b", re.I)
@@ -256,13 +267,19 @@ def _hand_note(ev: dict) -> str:
     return text
 
 
+def _without_negated_answer(text: str) -> str:
+    return _NEGATED_ANSWER.sub(" ", _NEVER_ANSWERS.sub(" ", text or ""))
+
+
 def is_vm_note(text: str) -> bool:
-    talk = _NEGATED_ANSWER.sub(" ", text or "")
-    return bool(_VM_NOTE.search(text or "")) and not _STRONG_TALK.search(talk)
+    rest = _without_negated_answer(text)
+    if _NEVER_ANSWERS.search(text or "") and not _TALK_NOTE.search(rest):
+        return True
+    return bool(_VM_NOTE.search(text or "")) and not _STRONG_TALK.search(rest)
 
 
 def is_talk_note(text: str) -> bool:
-    return (not is_vm_note(text)) and bool(_TALK_NOTE.search(_NEGATED_ANSWER.sub(" ", text or "")))
+    return (not is_vm_note(text)) and bool(_TALK_NOTE.search(_without_negated_answer(text)))
 
 
 def _event_time(ev: dict) -> Optional[datetime]:

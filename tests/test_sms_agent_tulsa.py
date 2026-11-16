@@ -286,6 +286,21 @@ check("VM greeting with a name is still voicemail",
       seed.is_vm_note("no answer but vm says this is Brian. Left vm"))
 check("'spoke with' is a conversation", seed.is_talk_note("spoke with matthew and he said its his primary residence"))
 check("VM note is not a conversation", not seed.is_talk_note("no answer, left vm, but the message said this is tim"))
+# Jeff, 2026-11-03: a recording is not a person, and "never answers" is not a talk.
+for _t in ("recording says Tim", "reccording", "recorded message", "recorded message says this is tim",
+           "greeting says this is tim", "message said this is tim",
+           "already had this number from his record, but I've never been able to get him to answer the phone.",
+           "can't get her to answer", "won't answer"):
+    check(f"voicemail, not a conversation: {_t!r}", seed.is_vm_note(_t) and not seed.is_talk_note(_t))
+for _t in ("he wouldn't answer my question, said he's not selling", "spoke with him after the recording",
+           "she answered, wants an offer", "listened to the recording then he picked up"):
+    check(f"still a conversation: {_t!r}", seed.is_talk_note(_t) and not seed.is_vm_note(_t))
+check("a recorded deed is not a voicemail note", not seed.is_vm_note("deed recorded 2019"))
+check("'never answers' clears the day's un-noted answered calls",
+      seed.spoken_on([_call(C1, "2026-11-02 22:53:00"), _call(C1, "2026-11-02 22:54:00"),
+                      _note("I've never been able to get him to answer the phone.", "2026-11-02 22:57:00")], C1) == "")
+check("an answered call with no note at all still counts as spoken",
+      seed.spoken_on([_call(C1, "2026-11-02 22:53:00")], C1) != "")
 check("answered call + same-day VM note -> not spoken",
       seed.spoken_on([_call(C1, "2026-09-30 21:20:57"),
                       _note("no answer, left vm, but the message said this is tim", "2026-09-30 21:21:20")], C1) == "")

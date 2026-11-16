@@ -765,7 +765,7 @@ def main() -> int:
     p.set_defaults(fn=cmd_campaign)
 
     p = sub.add_parser("round", help="preview the Tier 2 SMS Prospecting round; stages nothing")
-    p.add_argument("--date", help="pretend today is YYYY-MM-DD (round days are Mon/Wed/Fri)")
+    p.add_argument("--date", help="pretend today is YYYY-MM-DD (round texts go every other weekday)")
     p.add_argument("--show", type=int, default=10)
     p.add_argument("--no-suggest", action="store_true",
                    help="skip the 'looks eligible, no status' list (fewer CRM reads)")

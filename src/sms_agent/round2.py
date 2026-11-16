@@ -7,7 +7,7 @@ Jeff, 2026-11-13. A "week" is the 5 call attempts, never calendar days.
   3. DP week: 5 call attempts again. The NEW numbers get touches 1-4; the old
      numbers get nothing that week (deliberate, do not change it).
   4. After the DP week the team sets ROUND_STATUS on the record. Every
-     no-answer number, OLD AND NEW, gets 6 more texts, Mon/Wed/Fri.
+     no-answer number, OLD AND NEW, gets 6 more texts, every other weekday.
   5. A number marked Correct from its voicemail greeting, where nobody has
      talked to them: the record skips DP and gets the status after step 1.
 
@@ -118,11 +118,19 @@ def history(sms_rows: Optional[list] = None) -> dict:
     return out
 
 
+def _weekdays_since(prev: date, today: date) -> int:
+    """Weekdays after `prev` up to and including `today`."""
+    return sum(1 for i in range(1, (today - prev).days + 1)
+               if (prev + timedelta(days=i)).weekday() < 5)
+
+
 def next_round_touch(entry: Optional[dict], today: date) -> tuple[Optional[int], str]:
     """Which round touch (5-10) this number is due today, or why not.
 
-    Mon/Wed/Fri only, at least ROUND_MIN_GAP_DAYS after the previous text. With
-    touch 4 on a Thursday that is Mon, Wed, Fri, Mon, Wed, Fri.
+    Every other weekday: at least ROUND_MIN_GAP_WEEKDAYS weekdays after the
+    previous text, weekends not counted. With touch 4 on a Thursday that is
+    Mon, Wed, Fri, Tue, Thu, Mon: six texts, the last two weeks after the first.
+    A missed day (PC off) slides the rest; nothing doubles up.
     """
     had = (entry or {}).get("touches") or set()
     done = max(had) if had else 0
@@ -143,8 +151,8 @@ def next_round_touch(entry: Optional[dict], today: date) -> tuple[Optional[int],
             when = campaign._local_date(datetime.fromisoformat(last.replace("Z", "+00:00")))
         except ValueError:
             when = None
-        if when and (today - when).days < config.ROUND_MIN_GAP_DAYS:
-            return None, f"touch {done} was {(today - when).days}d ago"
+        if when and _weekdays_since(when, today) < config.ROUND_MIN_GAP_WEEKDAYS:
+            return None, f"touch {done} was {_weekdays_since(when, today)} weekday(s) ago"
     return done + 1, ""
 
 

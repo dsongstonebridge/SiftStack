@@ -68,16 +68,50 @@ def sent(phone, touch, when, body=None):
                     f"{when}T15:00:00+00:00"))
 
 
-# ---- 1. the schedule: Mon/Wed/Fri, 2 days apart, stops after touch 10
+# ---- 1. the schedule: every other weekday, weekends not counted, stops after touch 10
 e = {"touches": {1, 2, 3, 4}, "last": "2026-11-12T15:00:00+00:00", "t4": "2026-11-12T15:00:00+00:00",
      "promised": False}
-check("touch 4 Thursday -> nothing Friday (1 day)", round2.next_round_touch(e, FRI)[0] is None)
+check("touch 4 Thursday -> nothing Friday (no weekday skipped)", round2.next_round_touch(e, FRI)[0] is None)
 check("nothing on a Saturday", round2.next_round_touch(e, SAT) == (None, "not a round day"))
 check("touch 4 Thursday -> touch 5 Monday", round2.next_round_touch(e, MON)[0] == 5)
-check("nothing on a Tuesday", round2.next_round_touch(e, TUE)[0] is None)
 e5 = {"touches": {1, 2, 3, 4, 5}, "last": "2026-11-16T15:00:00+00:00", "t4": "2026-11-12T15:00:00+00:00",
       "promised": False}
+check("touch 5 Monday -> nothing Tuesday", round2.next_round_touch(e5, TUE)[0] is None)
 check("touch 5 Monday -> touch 6 Wednesday", round2.next_round_touch(e5, WED)[0] == 6)
+
+
+def simulate(start):
+    """Send touch 5 on `start`, then every day the rule says is due. Returns the send dates."""
+    from datetime import timedelta as _td
+    t4 = start - _td(days=7)
+    ent = {"touches": {1, 2, 3, 4}, "last": f"{t4}T15:00:00+00:00", "t4": "2026-11-14T15:00:00+00:00",
+           "promised": False}
+    days, d = [], start
+    while len(days) < 6 and d < start + _td(days=30):
+        n, _ = round2.next_round_touch(ent, d)
+        if n:
+            days.append(d)
+            ent["touches"].add(n)
+            ent["last"] = f"{d}T15:00:00+00:00"
+        d += _td(days=1)
+    return days
+
+
+from datetime import timedelta as _td
+for start in (MON, TUE, WED, date(2026, 11, 19), date(2026, 11, 20)):
+    got = simulate(start)
+    name = start.strftime("%a")
+    check(f"{name} start: 6 texts, the last exactly 2 weeks later",
+          len(got) == 6 and got[0] == start and got[-1] == start + _td(days=14), got)
+    check(f"{name} start: never a weekend", all(d.weekday() < 5 for d in got))
+    check(f"{name} start: one weekday skipped every time",
+          all(round2._weekdays_since(a, b) == 2 for a, b in zip(got, got[1:])), got)
+fri = simulate(date(2026, 11, 20))
+check("a Friday text is followed by Tuesday, not Monday", fri[1] == date(2026, 11, 24), fri)
+# A missed day (PC off on Wednesday): Thursday sends it, and the rest slides.
+ent = dict(e5)
+ent["touches"] = set(e5["touches"])
+check("missed Wednesday -> sends Thursday", round2.next_round_touch(ent, date(2026, 11, 19))[0] == 6)
 check("touches 1-4 not finished -> no round",
       round2.next_round_touch({"touches": {1, 2}, "last": ""}, MON)[1] == round2.NOT_FINISHED_1_4)
 check("touch 4 that promised -> never",

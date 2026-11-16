@@ -184,7 +184,7 @@ def promised_stop(body: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# TIER 2 SMS PROSPECTING (Jeff, 2026-11-13): touches 5-10, Mon/Wed/Fri, for
+# TIER 2 SMS PROSPECTING (Jeff, 2026-11-13): touches 5-10, every other weekday, for
 # records still not contacted after their call attempts. DRAFT wording, built
 # with the text-touch-builder recipe; Jeff approves every line before the round
 # is switched on. Similar to touches 1-4 is fine: round texts are counted by

@@ -236,16 +236,18 @@ DP_ALLOW_NUMBERS = {"".join(ch for ch in x if ch.isdigit())[-10:]
 
 # Tulsa fork (Jeff, 2026-11-13): Tier 2 SMS Prospecting. Records still not
 # contacted after their 5 call attempts (and after the deep prospect week, when
-# there was one) get 6 more texts on Mon/Wed/Fri, touches 5-10. The team opts a
+# there was one) get 6 more texts every other weekday, touches 5-10. The team opts a
 # record in by setting ROUND_STATUS; the code double-checks it (round2.py).
 # OFF until Jeff turns it on.
 ROUND_ON = _env("SMS_AGENT_ROUND_ON", "0") in ("1", "true", "True")
 ROUND_STATUS = _env("SMS_AGENT_ROUND_STATUS", "Tier 2 SMS Prospecting")
 # The preset that lists the records carrying ROUND_STATUS.
 ROUND_PRESET = _env("SMS_AGENT_ROUND_PRESET", "")
-ROUND_DAYS = _env("SMS_AGENT_ROUND_DAYS", "mon,wed,fri")
+ROUND_DAYS = _env("SMS_AGENT_ROUND_DAYS", "mon,tue,wed,thu,fri")
 ROUND_TEXTS = int(_env("SMS_AGENT_ROUND_TEXTS", "6"))
-ROUND_MIN_GAP_DAYS = int(_env("SMS_AGENT_ROUND_MIN_GAP_DAYS", "2"))
+# Weekdays counted from the previous text to today (weekends not counted): 2 =
+# every other weekday, so Mon -> Wed and Fri -> Tue (Jeff, 2026-11-16).
+ROUND_MIN_GAP_WEEKDAYS = int(_env("SMS_AGENT_ROUND_MIN_GAP_WEEKDAYS", "2"))
 # Only a number whose touch 4 went out ON OR AFTER this date can get the round.
 # The numbers that finished touch 4 before the round was built (133 on
 # 2026-11-13, most told "last text from me") stay out (Jeff, 2026-11-12/13).

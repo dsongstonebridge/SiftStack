@@ -14,6 +14,15 @@ New-Item -ItemType Directory -Force (Split-Path $state) | Out-Null
 
 $env:PYTHONIOENCODING = "utf-8"   # sms_kpis prints emoji; without this it exits 1 on cp1252
 
+# Jeff, 2026-11-17: this task runs from its own copy of main, so the SMS agent's live database
+# and the shared smrtPhone session are named in kpi-engine\.env (never copied: a copy goes
+# stale). Exported here so every step below, and run_kpi_local.ps1, sees them.
+Get-Content (Join-Path $here ".env") -ErrorAction SilentlyContinue |
+    Where-Object { $_ -match '^(KPI_SMS_DB|SMRTPHONE_STATE_FILE)=' } | ForEach-Object {
+        $k, $v = $_ -split '=', 2
+        Set-Item "env:$k" $v.Trim().Trim('"').Trim("'")
+    }
+
 function Log($m) { "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  $m" | Out-File -Append -Encoding utf8 $log }
 
 # One Slack message per day when a post could not go out, so a miss is never silent.
@@ -37,8 +46,9 @@ function Get-TextStats($date, $what) {
     try {
         Remove-Item $b64 -ErrorAction SilentlyContinue
         $py = Join-Path (Split-Path -Parent $here) ".venv\Scripts\python.exe"
-        if (-not (Test-Path $py)) { $py = "python" }
         $pyArgs = @((Join-Path $here "sms_kpis.py"), "--date", $date, "--b64-out", $b64)
+        # no .venv in the KPI checkout: use py -3 like every other step (it has tzdata)
+        if (-not (Test-Path $py)) { $py = "py"; $pyArgs = @("-3") + $pyArgs }
         if ($what -eq "both") { $pyArgs += "--week" }
         & $py @pyArgs *> (Join-Path $here "reports\texts_last.log")
         if (Test-Path $b64) { return (Get-Content $b64 -Raw).Trim() }

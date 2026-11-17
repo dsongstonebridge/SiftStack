@@ -2125,7 +2125,7 @@ day and refills the sheet from that day).
 
 **What presses the button: Windows task "KPI posts 630 PM weekdays"** on Jeff's PC, at
 **6:30 PM** (Jeff wants 6:30, not 6:31), no end date. It runs
-`kpi-engine/trigger_kpi_post.ps1`: `gh workflow run kpi-posts.yml`, Friday = `both`,
+`kpi-engine/trigger_kpi_post.ps1` from `C:\Users\dsong\SiftStack-kpi-main` (see below): `gh workflow run kpi-posts.yml`, Friday = `both`,
 otherwise `daily`. **It never wakes the PC** (Jeff, 2026-10-05: wait until he opens it).
 Triggers: 6:30 PM weekdays, logon, unlock, wake from sleep, and every 15 minutes all day,
 so a missed day posts within minutes of the PC being in use, **for the day that was missed**
@@ -2261,7 +2261,12 @@ without posting: `python pull_kpis.py --from D --to D --slack print`,
 - **On GitHub:** the copies go to `reports/posts/` and `kpi-bot/posts/`, and the workflow's last step attaches them to the run as artifact `kpi-posts-<run id>` (kept 90 days).
 - **On the PC:** they're written only to `KPI_POST_ARCHIVE` (set in `kpi-engine/.env` and `kpi-bot/.env`). Unset = nothing saved, never a fallback folder.
 - **Fetching the GitHub copies:** `trigger_kpi_post.ps1` -> `Run-Recheck` calls `archive_kpi_posts.ps1` on every 15-minute firing. It downloads each finished run's artifact once and keeps state in `reports/kpi_posts_archived.txt`. "No valid artifacts found to download" means that run had nothing posted.
-- **Gotcha:** the Windows task runs the scripts from the `OneDrive\Desktop\SiftStack` checkout, so the PC half only works if THAT folder has these files.
+
+**The task runs from its own copy of main (2026-11-17): `C:\Users\dsong\SiftStack-kpi-main`,** a git worktree DETACHED at `origin/main`, off personal OneDrive. The SMS folder (`OneDrive\Desktop\SiftStack`, branch `sms-agent-diego`) no longer runs any KPI post; its `kpi-engine/` and `kpi-bot/` copies are dead (left in place, not deleted).
+- **To pick up new KPI code:** `git fetch origin` then `git checkout --detach origin/main` in that folder. Commit KPI changes there and `git push origin HEAD:main`.
+- **Live files it points at, never copies** (`kpi-engine/.env`): `KPI_SMS_DB` = the SMS agent's `output\sms_agent\sms_agent.db`, and `SMRTPHONE_STATE_FILE` = the SMS folder's `smrtphone_state.json`, so one smrtPhone renewal covers both. `trigger_kpi_post.ps1` exports them, and `sms_kpis.py` / `smrtphone_calls.py` / `smrtphone_login.py` also read them from that `.env` when run by hand.
+- **Its own copies (gitignored):** root `.env` (only `DATASIFT_API_KEY`, `SMRTPHONE_API_KEY`), `kpi-engine/.env`, `kpi-bot/.env`, `kpi-bot/service_account.json`, `kpi-engine/manual_calls.csv` (edit THIS one now), and all state in `kpi-engine/reports/` (`kpi_post_last.txt`, ledger, snapshots).
+- **Only this one task may run `trigger_kpi_post.ps1`**, or posts go out twice. The old "DataSift KPI Engine" / "DataSift KPI Bot" tasks stay disabled.
 
 **smrtPhone session expires ~Oct 31, 2026:** run `kpi-engine\smrtphone_login.bat`, then paste
 `kpi-engine\reports\SMRTPHONE_STATE_paste_me.txt` into the `SMRTPHONE_STATE` GitHub secret.

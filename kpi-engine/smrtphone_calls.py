@@ -16,7 +16,23 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36")
 COLUMNS = ["id", "user", "user_id", "created_at", "direction", "status", "disposition", "from_num",
            "to_num", "price", "duration", "podio_id", "recording_sid", "sid", "call_agent_id"]
-STATE_FILE = Path(__file__).resolve().parent.parent / "smrtphone_state.json"
+
+
+def _state_file() -> Path:
+    """SMRTPHONE_STATE_FILE (environment, then kpi-engine/.env) points every checkout at ONE
+    session file, so a smrtPhone renewal covers the KPI task and the SMS agent alike
+    (Jeff, 2026-11-17: the KPI task runs from its own copy of main). Unset = SiftStack/."""
+    here = Path(__file__).resolve().parent
+    val = os.environ.get("SMRTPHONE_STATE_FILE", "").strip()
+    env = here / ".env"
+    if not val and env.exists():
+        for line in env.read_text(encoding="utf-8-sig").splitlines():
+            if line.startswith("SMRTPHONE_STATE_FILE="):
+                val = line.split("=", 1)[1].strip().strip('"').strip("'")
+    return Path(val) if val else here.parent / "smrtphone_state.json"
+
+
+STATE_FILE = _state_file()
 
 
 class SessionExpired(Exception):

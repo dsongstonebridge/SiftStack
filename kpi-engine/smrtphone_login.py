@@ -5,9 +5,10 @@ and saves that map to reports/smrtphone_discovery.json for Claude."""
 import json, re, time, sys
 from pathlib import Path
 from playwright.sync_api import sync_playwright
+from smrtphone_calls import STATE_FILE
 
 ROOT = Path(__file__).resolve().parent.parent
-STATE = ROOT / "smrtphone_state.json"
+STATE = STATE_FILE   # honours SMRTPHONE_STATE_FILE, so a renewal updates the shared file
 OUT = Path(__file__).resolve().parent / "reports" / "smrtphone_discovery.json"
 BASE = "https://phone.smrt.studio"
 

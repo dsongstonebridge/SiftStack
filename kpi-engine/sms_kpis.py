@@ -38,8 +38,21 @@ from zoneinfo import ZoneInfo
 
 HERE = Path(__file__).resolve().parent
 TZ = ZoneInfo("America/Chicago")
-DB_DEFAULT = Path(__import__("os").environ.get("KPI_SMS_DB") or
-                  HERE.parent / "output" / "sms_agent" / "sms_agent.db")
+
+
+def _env_db() -> str:
+    """KPI_SMS_DB from the environment, then kpi-engine/.env (Jeff, 2026-11-17: the KPI task
+    runs from its own copy of main and reads the SMS agent's LIVE database; never a copy)."""
+    val = __import__("os").environ.get("KPI_SMS_DB", "").strip()
+    env = HERE / ".env"
+    if not val and env.exists():
+        for line in env.read_text(encoding="utf-8-sig").splitlines():
+            if line.startswith("KPI_SMS_DB="):
+                val = line.split("=", 1)[1].strip().strip('"').strip("'")
+    return val
+
+
+DB_DEFAULT = Path(_env_db() or HERE.parent / "output" / "sms_agent" / "sms_agent.db")
 LOG_COLUMNS = ["id", "created", "fromNum", "toNum", "content", "direction",
                "delivery_status", "delivery_code", "source"]
 # a reply this long before a status change still counts as the reason for it

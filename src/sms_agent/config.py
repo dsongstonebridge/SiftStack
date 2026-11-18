@@ -436,6 +436,13 @@ ESCALATION_QUIET_DAYS = int(_env("SMS_AGENT_ESCALATION_QUIET_DAYS", "14"))
 # Who owns a positive reply. Tagged in the post and assigned on the record.
 HANDOFF_NAME = _env("SMS_AGENT_HANDOFF_NAME", "Adriana")
 HANDOFF_SLACK_ID = _env("SMS_AGENT_HANDOFF_SLACK_ID", "")  # needs a bot token to look up
+
+
+def handoff_mention() -> str:
+    """Slack tags for a reply alert. SMS_AGENT_HANDOFF_SLACK_ID may list several
+    ids, comma-separated (Jeff, 2026-11-18: tag Diego and Eric on every reply)."""
+    ids = [i.strip() for i in HANDOFF_SLACK_ID.split(",") if i.strip()]
+    return "".join(f"<@{i}> " for i in ids)
 HANDOFF_ASSIGNEE_UUID = _env("SMS_AGENT_HANDOFF_ASSIGNEE", "")
 
 ESCALATE_INTENTS = [

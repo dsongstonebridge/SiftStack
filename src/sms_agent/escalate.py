@@ -85,7 +85,7 @@ def hot_lead(
     who = ctx.get("owner_first") or "Unknown owner"
     where = ", ".join(x for x in (ctx.get("street"), ctx.get("city"), ctx.get("state")) if x)
 
-    mention = f"<@{config.HANDOFF_SLACK_ID}> " if config.HANDOFF_SLACK_ID else ""
+    mention = config.handoff_mention()
     lines = [
         f"{mention}*{config.HANDOFF_NAME}: yours. Call within 5 minutes.*",
         f"*Positive SMS reply - {who}*",
@@ -157,7 +157,7 @@ def reply_alert(phone: str, inbound: str, intent: str,
     ctx = context or {}
     who = ctx.get("owner_first") or "Owner"
     where = ", ".join(x for x in (ctx.get("street"), ctx.get("city")) if x)
-    mention = f"<@{config.HANDOFF_SLACK_ID}> " if config.HANDOFF_SLACK_ID else ""
+    mention = config.handoff_mention()
     headline = _REPLY_HEADLINE.get(intent, _REPLY_VERIFY)
     # Tier 2 Texter (touches 5-10) shares this engine; say which agent the
     # reply answered so it can be told apart from touches 1-4.

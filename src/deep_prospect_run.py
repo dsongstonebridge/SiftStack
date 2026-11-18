@@ -142,6 +142,9 @@ def _save(run: Path, state: dict) -> None:
     (run / "state.json").write_text(json.dumps(state, indent=2), encoding="utf-8")
 
 
+_SUFFIXES = {"jr", "sr", "ii", "iii", "iv"}
+
+
 def split_name(person: str) -> tuple[str, str]:
     """'First Middle Last' -> (First, Last). 'Francisco|Perez Rodriguez' keeps a
     compound surname whole."""
@@ -150,6 +153,9 @@ def split_name(person: str) -> tuple[str, str]:
         first = first.split()[0] if first else ""
     else:
         parts = person.split()
+        # "Melvin R Monday Sr" went to SmartSkip as last name "Sr" (2026-11-18).
+        while len(parts) > 2 and parts[-1].strip(".,").lower() in _SUFFIXES:
+            parts.pop()
         first, last = (parts[0], parts[-1]) if len(parts) >= 2 else ("", "")
     if not first or not last:
         raise SystemExit(f"need a first and last name to search, got {person!r}")
@@ -586,7 +592,8 @@ def cmd_finish(a) -> int:
                           score_drop=(getattr(a, "no_score", None) or []) + list(research.get("dead") or [])
                           + list(research.get("not_family") or []),
                           owner_deceased=True if getattr(a, "owner_deceased", False) else None,
-                          outside_primary=bool(research.get("call_first_outside")))
+                          outside_primary=bool(research.get("call_first_outside")),
+                          close_family=bool(getattr(a, "close_family", False)))
     problems = split.research_problems(research, split.people_from_plan(plan, {}, research), a.primary or [])
     if problems:
         raise SystemExit("REFUSED, nothing written:\n  " + "\n  ".join(problems))
@@ -708,6 +715,9 @@ def main(argv=None) -> int:
     f.add_argument("--owner-deceased", action="store_true",
                    help="the OWNER died but the traced person is a living relative: score close "
                         "family (deceased-owner rule) without labelling the traced person a decedent")
+    f.add_argument("--close-family", action="store_true",
+                   help="score close family (spouse, parents, children, siblings) whether the "
+                        "owner is living or dead; a living owner is still scored (Jeff, 2026-11-18)")
     f.add_argument("--notes", help="text file of extra research, added to the PDF as 'Research notes'")
     f.add_argument("--repost", action="store_true")
     f.add_argument("--commit", action="store_true")

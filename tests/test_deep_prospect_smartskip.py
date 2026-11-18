@@ -263,6 +263,15 @@ check("--no-score drops someone the default would score",
       "Mark Testman" not in dp.build_plan(REC, ["Susan Testman"], OVR, subject_deceased=True,
                                           score_drop=["Mark Testman"])["scored_names"])
 
+cf = dp.build_plan(spouse_rec, ["subject"], OVR, close_family=True)
+check("--close-family on a living owner: owner, spouse AND children scored",
+      {"Jane Testman", "Susan Testman"} <= set(cf["scored_names"])
+      and cf["subject"] in cf["scored_names"])
+check("--close-family: catch-all relatives still not scored", "Kyle Testman" not in cf["scored_names"])
+cfd = dp.build_plan(REC, ["Susan Testman"], OVR, subject_deceased=True, close_family=True)
+check("--close-family on a dead owner: the dead owner is still never scored",
+      cfd["subject"] not in cfd["scored_names"] and "Susan Testman" in cfd["scored_names"])
+
 od = dp.build_plan(REC, ["subject"], OVR, owner_deceased=True)
 check("--owner-deceased: close family scored, traced subject still labelled Owner",
       "Susan Testman" in od["scored_names"] and "Robert Testman" in od["scored_names"]
@@ -270,6 +279,12 @@ check("--owner-deceased: close family scored, traced subject still labelled Owne
 check("Name@Relationship picks one of two same-named people",
       dp._match("Mark Testman@Son", [{"name": "Mark Testman", "relationship": "Son"},
                                     {"name": "Mark Testman", "relationship": "Parent"}])[0]["relationship"] == "Son")
+two_martins = [{"name": "MARTIN VERA", "relationship": "In-law", "age": "63"},
+               {"name": "MARTIN VERA", "relationship": "In-law", "age": "41"}]
+check("Name#Age picks one of two same-named people with the same relationship",
+      [p["age"] for p in dp._match("MARTIN VERA#41", two_martins)] == ["41"]
+      and [p["age"] for p in dp._match("MARTIN VERA@In-law#63", two_martins)] == ["63"]
+      and len(dp._match("MARTIN VERA", two_martins)) == 2)
 
 heir_fake = FakeAPI()
 dp._api = heir_fake

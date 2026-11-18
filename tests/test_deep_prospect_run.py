@@ -239,6 +239,9 @@ check("board name stops at the '|' of a July obituary post",
       run.decedent_from_board("O1", "P1") == "Roland Theriot")
 check("split_name: plain name -> first and last word",
       run.split_name("Bonnie Marie Pingrey Baker") == ("Bonnie", "Baker"))
+check("split_name: a suffix is never the surname",
+      run.split_name("Melvin R Monday Sr") == ("Melvin", "Monday")
+      and run.split_name("Russell Wayne Thomas Jr.") == ("Russell", "Thomas"))
 check("split_name: First|Last keeps a compound surname",
       run.split_name("Francisco|Perez Rodriguez") == ("Francisco", "Perez Rodriguez"))
 _ST = {"street": "1 A St", "city": "Tulsa", "state": "OK", "searched": "X Y", "searched_at": "mailing"}

@@ -1278,7 +1278,18 @@ family by relationship, what is excluded, and why any record scores nothing. The
   (a living co-owner on title SmartSkip calls "Relative"; a parent who also died).
 - `"Name@Relationship"` in `--primary`/`--score`: picks one of two same-name people
   (John Webster the owner vs John Webster his son). An exact full name beats an
-  initial-only namesake automatically.
+  initial-only namesake automatically. `"Name#Age"` narrows two with the same name
+  AND relationship (two In-law Martin Veras, 63 and 41).
+- `--close-family` (Jeff's trial, 2026-11-18, "08 Send to DP" batch of 21): the
+  deceased-owner scope on EVERY record, alive or dead: the owner if living, spouse,
+  parents, children, siblings. A dead owner's own numbers are still never scored.
+  Used only when Jeff asks for it; the default above is unchanged.
+- **Initial-only names still match loosely in relationship overrides:** "E FRAZIER"
+  (an in-law, 99) took "PANDI FRAZIER"'s Daughter label and would have been scored.
+  Put such a person in `not_family` (exact match wins there) and give them a label.
+- **A suffix is never the surname:** `split_name("Melvin R Monday Sr")` sent last
+  name "Sr" to SmartSkip (caught before paying, 2026-11-18). Suffixes are now dropped.
+  Always read the order's `smartskip_input.csv` before `charge`.
 
 **Owner status, confidence and mix-up notes (2026-10-27/28).** Every board post and the PDF
 open with what OUR research says about the owner, never SmartSkip's deceased flag:

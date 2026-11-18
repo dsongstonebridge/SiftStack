@@ -114,10 +114,15 @@ CLOSE_RELS = SPOUSE_RELS | {"Child", "Son", "Daughter", "Parent", "Mother", "Fat
 
 def _match(want: str, people: list[dict]) -> list[dict]:
     """People matching `want`. "Name@Relationship" narrows two people with the
-    same name (3903 S Union: the traced son and his father are both Lenord Coats)."""
+    same name (3903 S Union: the traced son and his father are both Lenord Coats).
+    "Name#Age" narrows two with the same name AND relationship (220 E 54th St N:
+    two In-law Martin Veras, 63 and 41)."""
+    want, _, age = want.partition("#")
     want, _, rel = want.partition("@")
     pool = [p for p in people if not rel or
             (p["relationship"] or "").strip().lower() == rel.strip().lower()]
+    if age.strip():
+        pool = [p for p in pool if str(p.get("age", "")).strip() == age.strip()]
     hits = [p for p in pool if sta._same_person(want, p["name"])]
     if len(hits) > 1:
         # An initial-only relative ("M COATS") fuzzy-matches anyone with that
@@ -130,7 +135,7 @@ def _match(want: str, people: list[dict]) -> list[dict]:
 def build_plan(rec: dict, primary: list[str], rel_overrides: dict[str, str] | None = None,
                *, subject_deceased: bool = False, score_add: list[str] | None = None,
                score_drop: list[str] | None = None, owner_deceased: bool | None = None,
-               outside_primary: bool = False) -> dict:
+               outside_primary: bool = False, close_family: bool = False) -> dict:
     """Split one parsed SmartSkip record into phone-list people and board people.
 
     `primary` holds "subject" and/or names of relatives (the top heir / PR).
@@ -151,6 +156,9 @@ def build_plan(rec: dict, primary: list[str], rel_overrides: dict[str, str] | No
     added to the phone list, never scored). `score_add` / `score_drop` (names,
     or "subject") correct what SmartSkip's labels cannot know: a co-owner on
     title, or a PR SmartSkip calls a catch-all "Relative".
+    `close_family` (Jeff, 2026-11-18 trial): use the deceased-owner scope
+    (spouse, children, parents, siblings) on a LIVING owner too; a living
+    subject is still scored, a dead one still never is.
     """
     if not primary and not outside_primary:
         raise SystemExit("--primary is required: 'subject' and/or the top heir / PR by name")
@@ -189,7 +197,7 @@ def build_plan(rec: dict, primary: list[str], rel_overrides: dict[str, str] | No
     # owner_deceased: the OWNER died even when the traced subject did not (the
     # traced person is the owner's living son). Scoring then follows the
     # deceased-owner rule while the subject keeps the "Owner" label.
-    dead_owner = subject_deceased if owner_deceased is None else owner_deceased
+    dead_owner = (subject_deceased if owner_deceased is None else owner_deceased) or close_family
     for p in people:
         if p["is_subject"]:
             p["scored"] = not subject_deceased
@@ -246,7 +254,7 @@ def build_plan(rec: dict, primary: list[str], rel_overrides: dict[str, str] | No
             "shared": [ph["number"] for ph in p["phones"] if ph["number"] in primary_numbers],
             "phone_list": tagged, "scored": p["scored"]})
     return {"subject": subject["name"], "primary": primary_out, "board": board_out,
-            "phone_list_numbers": placed,
+            "phone_list_numbers": placed, "close_family_trial": close_family,
             "scored_names": [p["name"] for p in people if p["scored"]]}
 
 
@@ -351,8 +359,10 @@ def build_family_post(plan: dict, *, today: str | None = None,
              f"Traced: {plan['subject']}. Call first: "
              + ", ".join(p["name"] for p in plan["primary"]) + ".",
              "Name | relationship | number | dial tier. Numbers marked '" + BOARD_ONLY
-             + "' were not added or scored (living owner: owner + spouse only; "
-               "deceased owner: close family only).", ""]
+             + ("' were not added or scored (scored: the owner if living, spouse, parents, "
+                "children, siblings)." if plan.get("close_family_trial") else
+                "' were not added or scored (living owner: owner + spouse only; "
+                "deceased owner: close family only)."), ""]
     for p in plan["primary"]:
         who = "Owner (traced subject)" if p["is_subject"] else (p.get("relationship") or "Call first")
         for ph in p["phones"] or [{"number": "none"}]:

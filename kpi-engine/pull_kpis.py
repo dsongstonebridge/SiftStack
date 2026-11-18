@@ -202,8 +202,16 @@ def search_updated(token: str, day_from: str, day_to_excl: str) -> list[dict]:
 
 
 def get_logs(token: str, uuid: str) -> list[dict]:
-    r = req(token, f"/api/internal/property/{uuid}/logs/", params={"limit": 250, "offset": 0})
-    return r.get("results") or r.get("data") or []
+    # 2026-11-17: DataSift now 400s any limit over 100 here, so read pages of 100 (same
+    # 250-event ceiling as before). The caller swallows errors, which made it read as "no activity".
+    out = []
+    while len(out) < 250:
+        r = req(token, f"/api/internal/property/{uuid}/logs/", params={"limit": 100, "offset": len(out)})
+        page = r.get("results") or r.get("data") or []
+        out += page
+        if len(page) < 100 or not r.get("next"):
+            break
+    return out[:250]
 
 
 # ---- event helpers ----

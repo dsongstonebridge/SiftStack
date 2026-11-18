@@ -1,5 +1,6 @@
-# Presses "Run workflow" on the GitHub "KPI posts" workflow for each weekday whose 6:30 PM
-# has passed and has not been posted yet. Run by the Windows task "KPI posts - 6:30 PM".
+# Presses "Run workflow" on the GitHub "KPI posts" workflow for each weekday whose post time
+# (7:00 AM the next weekday, since 2026-11-18) has passed and has not been posted yet.
+# Run by the Windows task "KPI posts 7 AM weekdays".
 # Jeff, 2026-10-02: GitHub's own timer ran hours late; this fires on time, and if the PC was
 # asleep or off it catches up as soon as it is back, posting the day that was missed (not today).
 # Fridays post "both" (daily + weekly sheet). State: reports\kpi_post_last.txt (last day posted).
@@ -57,15 +58,10 @@ function Get-TextStats($date, $what) {
     return ""
 }
 
-# Jeff, 2026-11-03: the first time the PC is open the next morning, compare the 6:30 numbers
-# with the day's real totals; a fresh "Updated KPI's" post goes out only if they changed.
-# kpi_recheck.py does nothing when no day is waiting. A failure here never blocks a post.
+# Jeff, 2026-11-18: a day now posts complete at 7 AM the next weekday, so the next-morning
+# "Updated KPI's" check (kpi_recheck.py) is no longer run. This only archives the posts.
 function Run-Recheck {
     $ErrorActionPreference = "Continue"
-    $recheckLog = Join-Path $here "reports\kpi_recheck.log"
-    Push-Location $here
-    try { cmd /c "py -3 kpi_recheck.py >> `"$recheckLog`" 2>&1" } catch { Log "next-morning check failed: $_" }
-    Pop-Location
     # Jeff, 2026-11-16: keep every post outside Slack (free Slack drops them after 90 days)
     try { & (Join-Path $here "archive_kpi_posts.ps1") } catch { Log "post archive failed: $_" }
     $ErrorActionPreference = "Stop"
@@ -79,12 +75,21 @@ $now  = Get-Date
 $last = if (Test-Path $state) { [datetime]::ParseExact((Get-Content $state -Raw).Trim(), "yyyy-MM-dd", $null) }
         else { $now.Date.AddDays(-1) }
 
-# every weekday after the last posted day whose 6:30 PM is already in the past (max 7 back)
+# Jeff, 2026-11-18: a weekday's KPIs post at 7:00 AM the NEXT weekday (Friday's, with the
+# weekly summary and the sheet post, on Monday), so calls placed late in the day are in the
+# post and no "Updated" post is needed. Was 6:30 PM the same day.
+function PostTime($day) {
+    $t = $day.Date.AddDays(1)
+    while ($t.DayOfWeek -eq "Saturday" -or $t.DayOfWeek -eq "Sunday") { $t = $t.AddDays(1) }
+    return $t.AddHours(7)
+}
+
+# every weekday after the last posted day whose 7 AM post time is already in the past (max 7 back)
 $due = @()
 $d = $last.AddDays(1)
 if ($d -lt $now.Date.AddDays(-7)) { $d = $now.Date.AddDays(-7) }
-while ($d -le $now.Date) {
-    if ($d.DayOfWeek -ne "Saturday" -and $d.DayOfWeek -ne "Sunday" -and $now -ge $d.AddHours(18).AddMinutes(30)) {
+while ($d -lt $now.Date) {
+    if ($d.DayOfWeek -ne "Saturday" -and $d.DayOfWeek -ne "Sunday" -and $now -ge (PostTime $d)) {
         $due += $d
     }
     $d = $d.AddDays(1)
@@ -103,9 +108,8 @@ foreach ($day in $due) {
     # A refusal from GitHub (2026-11-02: "Actions has been disabled") will not change, so don't wait.
     for ($try = 1; $try -le 15 -and -not $ok -and -not $refused; $try++) {
         if (-not $texts) { $texts = Get-TextStats $date $what }
-        # on time: leave date blank (same as pressing the button; sheet refills from yesterday)
-        $ghArgs = @("workflow", "run", "kpi-posts.yml", "--repo", $repo, "-f", "what=$what")
-        if ($day.Date -ne (Get-Date).Date) { $ghArgs += @("-f", "date=$date") }
+        # the day posted is always an earlier day now, so name it
+        $ghArgs = @("workflow", "run", "kpi-posts.yml", "--repo", $repo, "-f", "what=$what", "-f", "date=$date")
         if ($texts) { $ghArgs += @("-f", "texts=$texts") }
         # Stop mode turns gh's stderr into a crash that skips the log and the retry
         $ErrorActionPreference = "Continue"
@@ -119,23 +123,13 @@ foreach ($day in $due) {
         }
     }
     if ($ok) {
-        Log "started $what for $date$(if ($day.Date -ne $now.Date) { ' (catch-up)' })"
-        # the post ran in GitHub's cloud, so remember its numbers on this PC for tomorrow's check
-        if ($day.Date -eq $now.Date) {
-            $ErrorActionPreference = "Continue"
-            Push-Location $here
-            $snapLog = Join-Path $here "reports\kpi_recheck.log"
-            cmd /c "py -3 pull_kpis.py --from $date --to $date --snapshot-only >> `"$snapLog`" 2>&1"
-            if ($what -eq "both") { cmd /c "py -3 pull_kpis.py --week-of $date --snapshot-only --note `"Weekly summary`" >> `"$snapLog`" 2>&1" }
-            Pop-Location
-            $ErrorActionPreference = "Stop"
-        }
+        Log "started $what for $date$(if ($now.Date -gt (PostTime $day).Date) { ' (catch-up)' })"
     } else {
         # GitHub would not start it: run the same steps on this PC instead
         Log "GitHub did not start $what for $date ($ghError); running on this PC"
         $ErrorActionPreference = "Continue"
-        $localArgs = @{ Date = $date; What = $what; Texts = $texts }
-        if ($day.Date -ne $now.Date) { $localArgs.CatchUp = $true }
+        # CatchUp: refill the sheet from that day (it is always an earlier day now)
+        $localArgs = @{ Date = $date; What = $what; Texts = $texts; CatchUp = $true }
         & (Join-Path $here "run_kpi_local.ps1") @localArgs
         $localRc = $LASTEXITCODE
         $ErrorActionPreference = "Stop"
@@ -144,7 +138,7 @@ foreach ($day in $due) {
             Alert-Once "KPI post for $date did not go out: GitHub refused it and the PC run failed. It retries every 15 minutes."
             exit 1
         }
-        Log "posted $what for $date from this PC$(if ($day.Date -ne $now.Date) { ' (catch-up)' })"
+        Log "posted $what for $date from this PC$(if ($now.Date -gt (PostTime $day).Date) { ' (catch-up)' })"
     }
     $date | Out-File -Encoding ascii -NoNewline $state
     if ($due.Count -gt 1) { Start-Sleep -Seconds 90 }   # one run at a time

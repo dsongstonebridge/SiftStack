@@ -2123,14 +2123,16 @@ GitHub's cron ran hours late or not at all. Manual "Run workflow" only, inputs
 `what` = daily / weekly-sheet-post / both and an optional `date` (YYYY-MM-DD; posts that
 day and refills the sheet from that day).
 
-**What presses the button: Windows task "KPI posts 630 PM weekdays"** on Jeff's PC, at
-**6:30 PM** (Jeff wants 6:30, not 6:31), no end date. It runs
+**What presses the button: Windows task "KPI posts 7 AM weekdays"** on Jeff's PC. **Since
+2026-11-18 a weekday's KPIs post COMPLETE at 7:00 AM the next weekday** (Friday's, with the
+weekly summary and the sheet post, on Monday 7 AM), so late calls are in the post and no
+"Updated" post is needed. Before that it was 6:30 PM the same day (task "KPI posts 630 PM
+weekdays", renamed). No end date. It runs
 `kpi-engine/trigger_kpi_post.ps1` from `C:\Users\dsong\SiftStack-kpi-main` (see below): `gh workflow run kpi-posts.yml`, Friday = `both`,
 otherwise `daily`. **It never wakes the PC** (Jeff, 2026-10-05: wait until he opens it).
-Triggers: 6:30 PM weekdays, logon, unlock, wake from sleep, and every 15 minutes all day,
+Triggers: 7:00 AM weekdays, logon, unlock, wake from sleep, and every 15 minutes all day,
 so a missed day posts within minutes of the PC being in use, **for the day that was missed**
-(passed as `date`), never as "today". On-time runs leave `date` blank, exactly like pressing
-the button. The workflow passes that date to the sheet bot as `KPI_AS_OF`, so a Friday post
+(passed as `date`, always, since the day posted is never today). The workflow passes that date to the sheet bot as `KPI_AS_OF`, so a Friday post
 caught up on Monday still reports Friday's day and week. State in
 `kpi-engine/reports/kpi_post_last.txt` (last day posted, so no double posts), log in
 `kpi-engine/reports/kpi_post_trigger.log` (written only when something is due). Needs the PC
@@ -2148,7 +2150,9 @@ many wake events that are not someone using the PC.
   and bot locally (`run_engine.bat`, `run_kpi_bot.bat`). They are disabled; turning them on
   while the GitHub path runs posts everything twice. Never delete them.
 
-**After-hours activity + the next-morning check (Jeff, 2026-11-03).** Activity counts on the day it
+**After-hours activity + the next-morning check (Jeff, 2026-11-03). RETIRED 2026-11-18:** posting
+the next morning made it unnecessary, so `trigger_kpi_post.ps1` no longer runs `kpi_recheck.py`
+(the file and its test stay). History: Activity counts on the day it
 happened, never rolled into the next day. Calls and replies after the post used to reach no daily
 post at all (Nov 2 posted 100 dials / 11 correct / 0 replies; the full day was 124 / 18 / 5). Every
 post now saves its numbers to `reports/kpi_snapshot_<from>_<to>.json`. `kpi-engine/kpi_recheck.py`,

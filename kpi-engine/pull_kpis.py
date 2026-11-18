@@ -53,7 +53,7 @@ HEADERS_BASE = {
 }
 
 DEFAULT_BENCHMARKS = {
-    "dials_floor_per_caller": 150,
+    "dials_floor_per_caller": 200,   # Jeff, 2026-11-18 (was 150)
     "dials_target_per_caller": 200,
     "conversations_floor_per_caller": 5,
     "conversation_min_seconds": 60,

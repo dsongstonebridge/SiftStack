@@ -2224,6 +2224,17 @@ Test: `python tests/test_kpi_recheck.py`. Dry run: `py -3 kpi_recheck.py --dry-r
   (admin) user's markings, so its Correct can read 1 higher than the total. The total and
   the Slack post are right.
 
+**DataSift caps the activity log at 100 rows per request (since 2026-11-17).** `pull_kpis.get_logs`
+reads each record's history (`/property/{uuid}/logs/`) to count dials, Correct marks and leads. It
+asked for 250 rows at once; DataSift began answering 400 "must be <= 100", the error was swallowed,
+and the 11-17 post read 0 dials / 0 Correct / 0 leads (the Texts line said "DataSift not read").
+It now reads pages of 100. **A post showing 0 dials next to live pickups means the DataSift read
+failed, not a quiet day**: run one record's `get_logs` and look at the HTTP error.
+
+**Catch-up when the PC was closed at 7 AM** (verified 2026-11-18): the task starts on wake, unlock,
+logon and every 15 minutes, with StartWhenAvailable on, battery and network conditions off, and
+never wakes the PC itself. A late post still carries the day it covers.
+
 **Testing locally** (Jeff's PC reaches DataSift and smrtPhone directly; skip `--slack`
 unless Jeff says post): `python kpi-engine/pull_kpis.py --from 2026-09-30 --to 2026-09-30`.
 Sep 30 is the regression day (as read 2026-10-08, with "vms" counted): Dials 142, VM 84,

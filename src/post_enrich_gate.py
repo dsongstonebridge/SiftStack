@@ -340,11 +340,18 @@ def apply_post_enrich_gate(rows: list[dict], *, find_property, get_property,
             elif notice_type != "probate":
                 # Value-spread rule (2026-10-09): flagged here, decided by the
                 # user before anything is traced. See spread_review.py.
-                from spread_review import value_spread
+                from spread_review import SPREAD_AUTO_DROP, value_spread
                 info = value_spread(prop, r)
-                if not info["ok"]:
+                if info["spread"] is not None and info["spread"] < SPREAD_AUTO_DROP:
+                    # Jeff, 2026-11-23: under $80k is never worth asking about.
+                    kept.pop()
+                    reasons = [f"value spread ${info['spread']:,.0f} is under "
+                               f"${SPREAD_AUTO_DROP:,} (value ${info['value']:,.0f} - "
+                               f"balance ${info['balance']:,.0f})"]
+                elif not info["ok"]:
                     r["_spread_review"] = {**info, "uuid": prop.get("uuid") or hit.get("uuid")}
-            continue
+            if not reasons:
+                continue
 
         uuid = prop.get("uuid") or hit.get("uuid")
         if _has_been_worked(prop):

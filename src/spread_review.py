@@ -46,6 +46,10 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 SPREAD_MIN = 100_000
+# Jeff, 2026-11-23: a spread UNDER this is dropped by the post-enrichment gate
+# without asking (deleted like any gate failure). $80k-$100k and spreads that
+# cannot be calculated still go on the numbered keep/drop list.
+SPREAD_AUTO_DROP = 80_000
 STORE_PATH = Path(__file__).resolve().parent.parent / "output" / ".spread_review.json"
 
 

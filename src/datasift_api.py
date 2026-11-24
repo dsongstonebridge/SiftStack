@@ -980,9 +980,24 @@ def add_lists(property_uuid: str, lists: list[str]) -> dict:
 
 
 def add_notes(property_uuid: str, notes: str) -> dict:
-    """The only way property notes actually land — see create_property()'s docstring."""
-    return _request("POST", f"{CORE_BASE}/api/internal/property/{property_uuid}/add-notes/",
-                     json_body={"notes": notes})
+    """Property notes.
+
+    2026-11-23: `add-notes/` began returning 404 under every auth (route gone;
+    OPTIONS 404 while `/message/` on the same record answers 405 GET, POST).
+    DataSift's guide now says a property's `notes` "adds a message to the
+    record's message board", so on a 404 the text goes to the PROPERTY
+    Message Board instead. Without this, the failure aborted the board post
+    and custom fields that follow it in upload_to_datasift().
+    """
+    try:
+        return _request("POST", f"{CORE_BASE}/api/internal/property/{property_uuid}/add-notes/",
+                         json_body={"notes": notes})
+    except DataSiftAPIError as e:
+        if "-> 404" not in str(e):
+            raise
+        logger.warning("add-notes is gone (404); posting the notes to the property "
+                       "Message Board instead")
+        return post_property_message_board(property_uuid, notes)
 
 
 def post_message_board(owner_uuid: str, message: str) -> dict:

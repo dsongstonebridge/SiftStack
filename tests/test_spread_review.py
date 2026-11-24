@@ -124,8 +124,28 @@ class GateFlags(unittest.TestCase):
         return kept[0]
 
     def test_thin_spread_flagged(self):
-        r = self.gate({"estimate_value": "146000.00"}, {"Unpaid Principal Balance": 90000})
+        # $80k-$100k is asked about (spread $96,000)
+        r = self.gate({"estimate_value": "186000.00"}, {"Unpaid Principal Balance": 90000})
         self.assertEqual(r["_spread_review"]["uuid"], "u1")
+
+    def test_spread_under_80k_dropped_without_asking(self):
+        # Jeff 2026-11-23: under $80k is deleted, never listed
+        deleted = []
+        row = {"Property Street": "1 A St", "Property City": "Tulsa",
+               "Unpaid Principal Balance": 90000}
+        prop = {"uuid": "u1", "owner": {"uuid": "o1"}, "mls": "Off Market",
+                "estimate_value": "146000.00"}
+        kept, ex = apply_post_enrich_gate(
+            [row], find_property=lambda *a: {"uuid": "u1"}, get_property=lambda u: prop,
+            delete_property=deleted.append, post_board=lambda o, m: None,
+            set_status=lambda u, s: None)
+        self.assertEqual(kept, [])
+        self.assertEqual(deleted, ["u1"])
+        self.assertIn("under $80,000", ex[0]["_gate_reasons"][0])
+
+    def test_uncalculable_spread_still_asked(self):
+        r = self.gate({"estimate_value": None}, {"Unpaid Principal Balance": 90000})
+        self.assertIn("_spread_review", r)
 
     def test_wide_spread_not_flagged(self):
         r = self.gate({"estimate_value": "300000"}, {"Unpaid Principal Balance": 90000})

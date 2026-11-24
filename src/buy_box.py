@@ -193,8 +193,14 @@ def check_buy_box(row: dict, *, notice_type: str | None = None) -> tuple[bool, l
     #    Match a real NEGATIVE, never a bare leading "no": that prefix test
     #    rejected "Not stated..." and "None listed, but..." wording as if the
     #    filing denied a house (Sutton and Hollingshead, 2026-10-08).
+    #    Exception (Jeff, 2026-11-24): a house held in the decedent's own or
+    #    family trust, or jointly with the spouse, passes OUTSIDE probate, so
+    #    the filing says "personal property only" while the family still holds
+    #    a house. Once the user has confirmed the property (Property Confirmed
+    #    = Yes) the filing's wording no longer excludes it.
     rp = str(row.get("Real Property Stated") or "").strip().lower()
-    if _states_no_real_property(rp):
+    confirmed = str(row.get("Property Confirmed") or "").strip().lower() in ("yes", "y", "true", "1")
+    if _states_no_real_property(rp) and not confirmed:
         reasons.append("the filing states NO real property - no house to buy")
 
     # 5. No property address could be resolved.

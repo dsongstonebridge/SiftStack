@@ -2421,9 +2421,11 @@ DataSift sequence (trigger property.assigned, condition assignee = X)
   via `PATCH /api/internal/sequence/{uuid}/` with `{"actions": [...]}` (the full list sent back
   with one value swapped). All 40 sequences were diffed before and after, and that value is the
   only difference. Backups are in `output/backups/*_2026-11-25.json`. The task this sequence
-  creates (task preset "Call New Lead") was already assigned to Diego. 10 records taken from
-  Diego (Sep 28 - Nov 24) are still on Jeff. Jeff chose not to reassign them, since their tasks
-  were Diego's. **When the lead manager changes, update this step.** A sequence keeps no edit
+  creates (task preset "Call New Lead") was already assigned to Diego. Jeff went through the
+  records the sequence had moved and reassigned them by hand on 2026-11-25. 4 went back to
+  Diego, and the rest stay on Jeff on purpose. **Lead flow (Jeff): every new lead goes to Diego,
+  the lead manager, first, and Jeff takes it over after.** So a lead sitting on Jeff later is
+  normal, not a bug to flag. **When the lead manager changes, update this step.** A sequence keeps no edit
   history, so a record's `/logs/` (events with `extra_info.source.title`) is the only way to
   see what a sequence did.
 - `src/assignee_alerts.py` is the earlier polling version (every 15 min, needs the PC). Its

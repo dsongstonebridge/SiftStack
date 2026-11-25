@@ -2300,6 +2300,45 @@ without posting: `python pull_kpis.py --from D --to D --slack print`,
 **Never commit:** `.env`, `kpi-bot/.env`, `kpi-bot/service_account.json`,
 `smrtphone_state.json`, `kpi-engine/manual_calls.csv`, `kpi-engine/reports/`.
 
+## Assignee Slack Alerts (LIVE 2026-11-24)
+
+When a DataSift property is assigned to Diego or Jeff, a private Slack channel gets an
+instant alert tagging them, with the address, owner and a link
+(`https://app.reisift.io/records/properties/<uuid>/details`). Runs with Jeff's PC off.
+
+```
+DataSift sequence (trigger property.assigned, condition assignee = X)
+  -> "Send a webhook" action -> Google Apps Script web app -> Slack incoming webhook
+```
+
+- **Sequences** "Assignee alert - Diego" and "Assignee alert - Jeff" (default folder), created
+  over the API (`POST /api/internal/sequence/`, which works). Shapes, read out of the app's own
+  `main.min.js` and verified by read-back:
+  trigger `property.assigned`; condition
+  `{"condition":"equals_to","payload":{"field":"assigned_to","label":"property.assignee","value":"<user uuid>","resource":true}}`;
+  action `{"action":"send-webhook","payload":{"label":"send.webhook","webhook_uuid":"<uuid>"}}`.
+  Unassigning does not fire it (condition fails).
+- **Webhooks** "Assignee alert Diego" / "Assignee alert Jeff": one per person, added BY JEFF in the
+  app (Settings > Integrations > Webhooks). DataSift's acceptable-use page lists creating webhooks
+  as app-only, so never create them by API or Playwright, even though
+  `/api/internal/integration/webhook/` answers. Same Apps Script URL, differing only in the end:
+  `?k=<token>&who=diego` or `&slack=<Slack member id>`.
+- **Apps Script** (Jeff's Google account, script.google.com): secret-free copy in
+  `deploy/assignee_alert_webhook.gs`; the live copy with the Slack URL + token is gitignored at
+  `output/assignee_alert_webhook.gs`. Checks the `?k=` token (Apps Script cannot read headers, so
+  the Ed25519 signature is not verifiable), dedupes on `event_id` (CacheService), and posts
+  `webhook.test` events raw with no mention. Google answers POSTs with a 302; DataSift logged it as
+  success, 1 attempt. **Updating the script: Deploy > Manage deployments > pencil > New version.
+  "New deployment" makes a new URL and breaks every webhook.**
+- **Checking a delivery:** `GET /api/internal/property/{uuid}/logs/` shows
+  `property.webhook.delivery.success` with `status_code` and `attempts`.
+- **Adding a person:** Jeff adds a webhook with `&slack=<member id>`; clone a sequence with their
+  user uuid. No script edit. Test by unassigning one of their properties and assigning it back.
+- **Known behaviour:** bulk-assigning N properties sends N messages. If the Slack webhook or a
+  sequence is turned off, alerts stop silently (the script still answers DataSift 200).
+- `src/assignee_alerts.py` is the earlier polling version (every 15 min, needs the PC). Its
+  Windows task "Assignee alerts" is DISABLED, kept as a fallback; enabling it double-alerts.
+
 ## DataSift.ai (REISift) Integration
 
 DataSift.ai (formerly REISift) is the CRM where scraped records land for niche sequential marketing campaigns.

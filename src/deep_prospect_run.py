@@ -56,6 +56,7 @@ import deep_prospect_smartskip as dps
 import obituary_check
 import dp_board_split as split
 import owner_profile
+import dp_title_gate
 import skip_trace_agent as sta
 import smartskip_parse
 
@@ -160,6 +161,21 @@ def split_name(person: str) -> tuple[str, str]:
     if not first or not last:
         raise SystemExit(f"need a first and last name to search, got {person!r}")
     return first, last
+
+
+def gate_names(person: str) -> tuple[str, str]:
+    """(first [+ middle], last [+ suffix]) for the title gate. Unlike split_name it
+    keeps the middle and the suffix, because those decide a common-name match."""
+    if "|" in person:
+        first, last = (x.strip() for x in person.split("|", 1))
+        return first, last
+    parts = person.split()
+    suffix = []
+    while len(parts) > 2 and parts[-1].strip(".,").lower() in _SUFFIXES:
+        suffix.insert(0, parts.pop())
+    if len(parts) < 2:
+        return person, ""
+    return " ".join(parts[:-1]), " ".join([parts[-1]] + suffix)
 
 
 def build_input_row(person: str, rec: dict, *, at_property: bool) -> dict:
@@ -270,10 +286,7 @@ def _prepare(a) -> dict | None:
     if not row["Mailing Address"]:
         print(f"SKIPPED {a.street}: no address to search SmartSkip with")
         return None
-    with open(run / "smartskip_input.csv", "w", newline="", encoding="utf-8") as fh:
-        w = csv.DictWriter(fh, fieldnames=list(row))
-        w.writeheader()
-        w.writerow(row)
+    gate_first, gate_last = gate_names(person)
     person = person.replace("|", " ").strip()   # the first|last split was only for SmartSkip
 
     # The board's probate post carries the decedent's FULL name (middle name,
@@ -308,7 +321,23 @@ def _prepare(a) -> dict | None:
     (run / "owner_profile.txt").write_text(profile_txt, encoding="utf-8")
     print("\n" + profile_txt.encode("ascii", "replace").decode("ascii"))
     print("\n" + obit_txt.encode("ascii", "replace").decode("ascii"))
-    return {"run": run, "row": row,
+
+    # Level 2 before Level 3 (Jeff, 2026-11-25): the search person must be the person
+    # on title at this parcel before SmartSkip is paid for them.
+    asr = next((s for s in profile["sections"] if s["source"] == "Tulsa County Assessor"), {})
+    gate = dp_title_gate.verdict(gate_first, gate_last, asr,
+                                 named=bool(getattr(a, "root_owner", False)))
+    (run / "title_gate.json").write_text(json.dumps(gate, indent=2), encoding="utf-8")
+    if gate["verdict"] != "clean" and not getattr(a, "title_ok", False):
+        return {"street": a.street, "run": run, "gate": gate}
+    if gate["verdict"] == "clean" and gate.get("middle"):
+        row["Middle Name"] = gate["middle"]
+        logger.info("%s: adding middle %r from title %r", a.street, gate["middle"], gate["title"])
+    with open(run / "smartskip_input.csv", "w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=list(row))
+        w.writeheader()
+        w.writerow(row)
+    return {"run": run, "row": row, "gate": gate,
             "state": {"street": a.street, "city": a.city, "state": a.state, "property_uuid": uuid,
                       "owner_uuid": owner_uuid, "searched": person, "searched_at":
                       "property" if at_property else "mailing", "paid": False,
@@ -318,7 +347,9 @@ def _prepare(a) -> dict | None:
 def _open_order(items: list) -> int:
     """ONE SmartSkip order for every record in `items`, unpaid (Jeff, 2026-11-02)."""
     ss = _smartskip()           # before the obituary checks: a missing login fails fast
-    prepared = [p for p in (_prepare(a) for a in items) if p]
+    results = [p for p in (_prepare(a) for a in items) if p]
+    prepared = [p for p in results if "row" in p]
+    print(title_gate_summary(results))
     if not prepared:
         print("Nothing to order.")
         return 3
@@ -326,14 +357,15 @@ def _open_order(items: list) -> int:
     order = ORDERS_DIR / order_id
     order.mkdir(parents=True, exist_ok=True)
     inp = order / "smartskip_input.csv"
+    fields = list(dict.fromkeys(k for p in prepared for k in p["row"]))
     with open(inp, "w", newline="", encoding="utf-8") as fh:
-        w = csv.DictWriter(fh, fieldnames=list(prepared[0]["row"]))
+        w = csv.DictWriter(fh, fieldnames=fields, restval="")
         w.writeheader()
         w.writerows(p["row"] for p in prepared)
     entry = ss.submit(ss.Session(), str(inp), {})
     for p in prepared:
         _save(p["run"], {**p["state"], "bulkSkipId": entry["bulkSkipId"], "order": order_id,
-                         "billable_rows": 1})
+                         "billable_rows": 1, "title_gate": p.get("gate")})
     n = entry.get("entities") or len(prepared)
     (order / "order.json").write_text(json.dumps(
         {"bulkSkipId": entry["bulkSkipId"], "rows": n, "paid": False, "created_ts": time.time(),
@@ -343,6 +375,28 @@ def _open_order(items: list) -> int:
           f"${MIN_ORDER_CENTS / 100:.2f}). NOTHING CHARGED YET.\n"
           f"Next: python src/deep_prospect_run.py charge --order {order.as_posix()}")
     return 0
+
+
+def title_gate_summary(results: list) -> str:
+    """The title check's outcome for the whole batch. Only the close/questionable
+    ones are for Jeff; clear misses are listed, not asked about (2026-11-25)."""
+    held = [p for p in results if "row" not in p and p["gate"]["verdict"] == "review"]
+    skipped = [p for p in results if "row" not in p and p["gate"]["verdict"] == "skip"]
+    cleared = [p for p in results if "row" in p and p["gate"]["verdict"] != "clean"]
+    lines = ["", "TITLE CHECK (before SmartSkip)"]
+    if held:
+        lines.append(f"HELD FOR JEFF, not in the order ({len(held)}):")
+        lines += [f"  {i}. {p['street']}: {p['gate']['reason']}" for i, p in enumerate(held, 1)]
+        lines.append("  To order one after Jeff OKs it: add \"title_ok\": true to its row and re-run batch.")
+    if skipped:
+        lines.append(f"Skipped, clear misses, nothing to review ({len(skipped)}):")
+        lines += [f"  - {p['street']}: {p['gate']['reason']}" for p in skipped]
+    if cleared:
+        lines.append(f"Ordered on Jeff's OK despite the check ({len(cleared)}):")
+        lines += [f"  - {p['run'].name}: {p['gate']['reason']}" for p in cleared]
+    if len(lines) == 2:
+        lines.append("Every record's search person is on title.")
+    return "\n".join(lines)
 
 
 def _recent_order(now: float | None = None) -> str | None:
@@ -361,7 +415,8 @@ def cmd_batch(a) -> int:
     return _open_order([argparse.Namespace(
         street=r["street"], city=r.get("city", ""), state=r.get("state", "OK"),
         search_person=r.get("search_person"), search_at=r.get("search_at", "mailing"),
-        spouse=r.get("spouse"), known=r.get("known"), restart=bool(r.get("restart")))
+        spouse=r.get("spouse"), known=r.get("known"), restart=bool(r.get("restart")),
+        title_ok=bool(r.get("title_ok")), root_owner=bool(r.get("root_owner")))
         for r in records])
 
 
@@ -467,6 +522,30 @@ def charge_refusal(order: dict, run_streets: list, named: list) -> str | None:
     return None
 
 
+def subject_age(export: Path) -> str:
+    """The searched person's age off SmartSkip's export ('' when absent)."""
+    try:
+        with open(export, newline="", encoding="utf-8-sig") as fh:
+            for r in csv.DictReader(fh):
+                if (r.get("Relationship") or "").strip() == "Subject" or "RELATIVE 1: First Name" in r:
+                    return (r.get("Age") or "").strip()
+    except OSError:
+        pass
+    return ""
+
+
+def too_young_reason(run: Path, state: dict) -> str | None:
+    """Tacoma check (2026-11-16): SmartSkip's person too young to have bought it."""
+    pj = run / "owner_profile.json"
+    if not pj.exists():
+        return None
+    prof = json.loads(pj.read_text(encoding="utf-8"))
+    asr = next((s for s in prof.get("sections") or [] if s.get("source") == "Tulsa County Assessor"), {})
+    first, last = gate_names(state.get("searched") or "")
+    took = dp_title_gate.acquired(first, last, (asr.get("data") or {}).get("sales") or [])
+    return dp_title_gate.age_check(subject_age(run / "smartskip_export.csv"), took)
+
+
 def cmd_charge(a) -> int:
     if not a.order and not a.run:
         raise SystemExit("charge needs --order (or --run for a record's order)")
@@ -525,6 +604,10 @@ def cmd_charge(a) -> int:
         if oj.exists():
             known = json.loads(oj.read_text(encoding="utf-8")).get("known") or []
         findings = owner_profile.identity_findings(rec, home_state=state.get("state") or "OK")
+        young = too_young_reason(run, state)
+        if young:
+            # A strong finding: finish refuses until Jeff's call is passed (--mixup-call).
+            findings.append({"level": "strong", "text": young})
         state["identity"] = findings
         _save(run, state)
         flags = owner_profile.identity_after_smartskip(rec, known, home_state=state.get("state") or "OK")
@@ -664,7 +747,10 @@ def main(argv=None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     b = sub.add_parser("batch", help="FREE: ONE SmartSkip order for every record, obituary checks + count")
     b.add_argument("--list", required=True, help="JSON list of {street, city, state, search_person, "
-                   "search_at, spouse, known, restart}")
+                   "search_at, spouse, known, restart, title_ok, root_owner}. title_ok = Jeff "
+                   "cleared a record the title check held; root_owner = the search person is a "
+                   "decedent or root owner who may not be on title (an off-title match is then "
+                   "held for Jeff instead of skipped)")
     s = sub.add_parser("start", help="FREE: batch of one, only with --only-one")
     s.add_argument("--only-one", action="store_true", help="there truly is only one record to deep prospect")
     s.add_argument("--street", required=True)
@@ -679,6 +765,10 @@ def main(argv=None) -> int:
                         "the PR are read off the record's board automatically.")
     s.add_argument("--restart", action="store_true",
                    help="open a NEW SmartSkip order even though this property was run before (second charge)")
+    s.add_argument("--title-ok", action="store_true",
+                   help="Jeff cleared this record after the title check held it")
+    s.add_argument("--root-owner", action="store_true",
+                   help="the search person is a decedent / root owner who may not be on title")
     c = sub.add_parser("charge", help="BILLS the SmartSkip balance once for the order, never the card")
     c.add_argument("--order", help="output/deep_prospect/_orders/<id>")
     c.add_argument("--run", help="a record's run folder: charges that record's order")

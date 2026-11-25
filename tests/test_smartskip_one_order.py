@@ -75,7 +75,18 @@ class Orders(unittest.TestCase):
         return argparse.Namespace(street=street, city="Tulsa", state="OK", search_person=person,
                                   search_at="mailing", spouse=None, known=None, restart=False)
 
-    def _order(self, streets):
+    #: county title per street; default = the search person is on title.
+    titles: dict = {}
+
+    def _profile(self, **k):
+        """A stubbed owner profile (no county sites, no web): Mary Smith on title."""
+        owner = self.titles.get(k["street"], "SMITH, MARY")
+        return {"person": k["person"], "street": k["street"], "city": k["city"], "sections": [
+            {"source": "Tulsa County Assessor", "status": "ok", "findings": [],
+             "data": {"account": "R1", "situs": {"street": k["street"], "owner": owner},
+                      "sales": [{"sale_date": "6/3/2001", "grantor": "X", "grantee": owner}]}}]}
+
+    def _order(self, streets, expect=0):
         """Open an order with the record + obituary steps stubbed. Returns the fake SmartSkip module."""
         ss = mock.Mock()
         ss.submit.return_value = {"bulkSkipId": "b1", "entities": len(streets)}
@@ -99,10 +110,46 @@ class Orders(unittest.TestCase):
                 mock.patch.object(run, "known_family_from_board", return_value=[]), \
                 mock.patch.object(run.obituary_check, "check", return_value={"candidates": []}), \
                 mock.patch.object(run.obituary_check, "report", return_value="obit"), \
+                mock.patch.object(run.owner_profile, "build", side_effect=self._profile), \
+                mock.patch.object(run.owner_profile, "report", return_value="profile"), \
                 mock.patch.object(run, "_prepare", side_effect=prepare):
             code = run._open_order([self._ns(s) for s in streets])
-        self.assertEqual(code, 0)
+        self.assertEqual(code, expect)
         return ss
+
+    def test_title_check_holds_and_skips_out_of_the_one_order(self):
+        """Clean records are ordered; a questionable one is held, a clear miss skipped,
+        and neither reaches SmartSkip (2026-11-25)."""
+        self.titles = {"2 B St": "SMITH, JOHN E", "3 C St": "ACME PROPERTIES LLC"}
+        ss = self._order(["1 A St", "2 B St", "3 C St"])
+        order_dir = next((self.tmp / "_orders").iterdir())
+        rows = list(csv.DictReader(open(order_dir / "smartskip_input.csv", encoding="utf-8")))
+        self.assertEqual([r["Property Address"] for r in rows], ["1 A St"])
+        self.assertEqual(json.loads((order_dir / "order.json").read_text(encoding="utf-8"))["runs"],
+                         [str(self.tmp / "1-a-st")])
+        self.assertFalse((self.tmp / "2-b-st" / "state.json").exists())
+        self.assertEqual(json.loads((self.tmp / "2-b-st" / "title_gate.json").read_text())["verdict"], "review")
+        self.assertEqual(json.loads((self.tmp / "3-c-st" / "title_gate.json").read_text())["verdict"], "skip")
+
+    def test_root_owner_off_title_is_held_not_skipped(self):
+        self.titles = {"1 A St": "JONES, BOB"}
+        orig = self._ns
+        self._ns = lambda s, person="Mary Smith": argparse.Namespace(**{**vars(orig(s, person)),
+                                                                        "root_owner": True})
+        self._order(["1 A St"], expect=3)
+        self.assertEqual(json.loads((self.tmp / "1-a-st" / "title_gate.json").read_text())["verdict"],
+                         "review")
+
+    def test_title_ok_orders_a_held_record_and_middle_goes_to_smartskip(self):
+        self.titles = {"1 A St": "SMITH, MARY ELLEN", "2 B St": "SMITH, JOHN E"}
+        orig = self._ns
+        self._ns = lambda s, person="Mary Smith": argparse.Namespace(**{**vars(orig(s, person)),
+                                                                        "title_ok": s == "2 B St"})
+        self._order(["1 A St", "2 B St"])
+        order_dir = next((self.tmp / "_orders").iterdir())
+        rows = list(csv.DictReader(open(order_dir / "smartskip_input.csv", encoding="utf-8")))
+        self.assertEqual([(r["Property Address"], r.get("Middle Name")) for r in rows],
+                         [("1 A St", "Ellen"), ("2 B St", "")])
 
     def test_many_records_make_one_order(self):
         ss = self._order(["1 A St", "2 B St", "3 C St"])

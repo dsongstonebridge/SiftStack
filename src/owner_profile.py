@@ -111,6 +111,20 @@ def same_street(a: str, b: str) -> bool:
     return bool(ka[0]) and bool(ka[1]) and ka == kb
 
 
+def near_street(a: str, b: str) -> bool:
+    """Same house number and street name, but a DIFFERENT street type (1518 N
+    Columbia PL vs Ave). Not the same house for certain; close enough to ask."""
+    ta_, tb_ = street_type(a), street_type(b)
+    if not (ta_ and tb_ and ta_ != tb_):
+        return False
+
+    def key(s):
+        toks = street_query(s).split()
+        return (toks[:1], [t for t in toks[1:] if t not in {"N", "S", "E", "W"}][:1])
+    ka, kb = key(a), key(b)
+    return bool(ka[0]) and bool(ka[1]) and ka == kb
+
+
 def area_code(num: str) -> str:
     d = re.sub(r"\D", "", num or "")[-10:]
     return d[:3] if len(d) == 10 else ""
@@ -224,14 +238,21 @@ def assessor_section(street: str, city: str, person: str, *,
     sec = _section("Tulsa County Assessor")
     try:
         hits = search(street_query(street)) or []
-        acct = None
+        acct, near = None, []
         for h in hits[:8]:
             s = situs(h.get("AccountNo"))
             if same_street((s or {}).get("street", ""), street):
                 acct, sit = h.get("AccountNo"), s
                 break
+            if near_street((s or {}).get("street", ""), street):
+                near.append({"account": h.get("AccountNo"), "street": (s or {}).get("street", ""),
+                             "owner": (s or {}).get("owner", "")})
         if not acct:
-            return _not_checked(sec, f"no Assessor account found for {street}")
+            # Same number and street name, different type (Pl vs Ave): close, so the
+            # title gate asks Jeff rather than skipping (2026-11-25).
+            sec["data"]["near_situs"] = near
+            return _not_checked(sec, f"no Assessor account found for {street}"
+                                + (f" (close: {near[0]['street']})" if near else ""))
         sec["data"].update(account=acct, situs=sit)
         owner = sit.get("owner") or ""
         sec["findings"].append(f"Title holder(s) of record: {owner} (account {acct}).")

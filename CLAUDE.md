@@ -2330,6 +2330,15 @@ DataSift sequence (trigger property.assigned, condition assignee = X)
   `webhook.test` events raw with no mention. Google answers POSTs with a 302; DataSift logged it as
   success, 1 attempt. **Updating the script: Deploy > Manage deployments > pencil > New version.
   "New deployment" makes a new URL and breaks every webhook.**
+- **The Slack webhook must point at a CHANNEL the person is in (fixed 2026-11-25).** The first
+  webhook link was made for the Slack app's own messages window, not a channel: the alert
+  rendered "@Diego Hoemann" but only Jeff could see it, so Diego's phone never buzzed, and
+  Slack offers no way to add people there. Fix: a private channel with Jeff + Diego, and a NEW
+  incoming webhook for it in the SAME Slack app (api.slack.com/apps > the app > Incoming
+  Webhooks > Add New Webhook > pick the channel). Each webhook link is tied to one place, so
+  adding the app to a channel does not move an old link. Keep the app: it owns the link. The
+  new URL is in `.env` `ASSIGNEE_SLACK_WEBHOOK` and the Apps Script's `SLACK_WEBHOOK` (Jeff
+  redeployed as New version). Touched nothing in DataSift. The old link is unused, harmless.
 - **Checking a delivery:** `GET /api/internal/property/{uuid}/logs/` shows
   `property.webhook.delivery.success` with `status_code` and `attempts`.
 - **Adding a person:** Jeff adds a webhook with `&slack=<member id>`; clone a sequence with their

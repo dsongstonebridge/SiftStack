@@ -2001,6 +2001,56 @@ A short balance, or anything but a clean balance payment, stops with the order s
 open: there is no card fallback. `smartskip_trace.pay()` refuses in `src/`. `/wallet/balance`
 is in CENTS. The results are split back to each record's run folder by property address.
 
+### Deep prospecting: title check before the order, SiftMap obituary check after (2026-11-25)
+
+Two free checks around the SmartSkip order. Neither has run on a live order yet (no new
+deep prospects at the time), so read both outputs closely on the first one.
+
+**Title check (`src/dp_title_gate.py`).** Ty's Level 2 (ownership) before Level 3
+(SmartSkip relatives). `batch` compares each search person with the county title holder
+from the owner profile. Only questionable records reach Jeff (his words: "I dont need to
+review all failures... just close and/or questionable ones"):
+- **Clean, ordered.** The person is on title at this parcel. A middle name the county has
+  and the search lacks goes to SmartSkip as `Middle Name` ("John Smith" -> "John E Smith").
+- **Held for Jeff, not in the order.** Middle initial or Jr/Sr differs; same surname,
+  different first; initial-only or family-trust title; parcel street type differs (Pl vs
+  Ave, `owner_profile.near_street`); a deed in the last 2 years out of their name; a deed
+  from them to family (the Chiu case).
+- **Skipped, listed only.** Different family, company with no person, no parcel, or sold
+  to someone else more than 2 years ago.
+- Row keys in the `batch` list: `title_ok: true` orders a held record after Jeff OKs it.
+  `root_owner: true` marks a decedent or Fulton-style root owner who may not be on title;
+  an off-title match is then held, not skipped.
+- **After the order, the age check.** A SmartSkip subject too young to have bought the
+  house is a STRONG identity finding, so `finish` waits for `--mixup-call`. 521 N Tacoma:
+  the "John Smith" found was 36 and the owner bought in 1989.
+- Replay on 44 past runs: 38 clean, 5 held, 1 skipped, each for a real reason.
+
+**SiftMap obituary check (`src/siftmap_obituary.py`).** The plan upgrade put obituary data
+in SiftMap. `GET map.reisift.io/properties/detail/{dataflik_id}/` carries
+`obituary_history: [{full_name "SHERRI COLLINS", death_date "2026-08-13", obit_id}]`
+(first and last name only) and `distressor_data.is_obituary_property`.
+- **What it means:** 7 of 7 SiftMap deaths matched our research and dates. It only knows
+  deaths of names on title, and it misses some (Russell Thomas, died 2026-07-30: empty;
+  612 N Date: flagged, no name). **A hit confirms a death. Empty proves nothing.**
+- **`charge`** runs it per record after SmartSkip. It saves `siftmap_obituary.json` and adds
+  a block to `owner_profile.txt` with one of: the searched person's obituary (noting when
+  SmartSkip says alive), a co-owner's, one matching a SmartSkip relative, a name-less
+  flag, or "none, which proves nothing".
+- **`finish`** re-runs it if missing or failed. A failed read is never "no obituary".
+  It refuses, until `--siftmap-call "<Jeff's decision>"`, when:
+  - the check could not run;
+  - `--owner-status alive` but SiftMap has that person's obituary (when sources disagree,
+    assume dead);
+  - a relative SiftMap shows as dead is not in `dp_research.json` `dead` or `not_family`.
+- A SiftMap death goes on the board under the owner status line, so the SMS agent's death
+  check bans that name.
+- SiftMap is NOT accepted as `--status-proof` for dead. An obituary confirmed against
+  family, or a filing, is still required.
+- **Key:** SiftMap needs the working `DATASIFT_API_KEY` from the main SiftStack `.env`. The
+  deep-prospect checkout's copy was dead on apiv2 and SiftMap (401) and was replaced
+  2026-11-25. Tests: `tests/test_dp_title_gate.py`, `tests/test_siftmap_obituary.py`.
+
 ### Server rewrites and throttling on lookups (2026-11-02)
 
 The server can also drop a LEADING directional and re-space a name: sent

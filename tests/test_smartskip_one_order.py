@@ -239,9 +239,13 @@ class Orders(unittest.TestCase):
         with mock.patch.object(run, "_smartskip", return_value=ss), \
                 mock.patch.object(run, "pay_from_balance") as pay, \
                 mock.patch.object(run.smartskip_parse, "parse", return_value=[]), \
-                mock.patch.object(run.dps, "pick_record", return_value={"subject_phones": [], "relatives": []}):
+                mock.patch.object(run.dps, "pick_record", return_value={"subject_phones": [], "relatives": []}), \
+                mock.patch.object(run.siftmap_obituary, "fetch", return_value={"status": "ok", "obits": [],
+                                                                               "flag": False}) as sm:
             self.assertEqual(run.cmd_charge(a), 0)
         pay.assert_not_called()
+        sm.assert_called_once()     # the SiftMap obituary check runs after SmartSkip
+        self.assertTrue((runs[0] / "siftmap_obituary.json").exists())
 
 
 if __name__ == "__main__":

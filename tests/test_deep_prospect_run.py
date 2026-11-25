@@ -165,6 +165,10 @@ def fake_score(subjects, dry_run=True):
 
 sta.score_phones = fake_score
 sta._current_phone_state = lambda uuid: {}
+# No SiftMap from tests: an obituary-free parcel (the check itself is tested in
+# test_siftmap_obituary).
+run.siftmap_obituary.fetch = lambda *a, **k: {"status": "ok", "obits": [], "flag": False,
+                                              "owner": "", "secondary": []}
 
 
 def finish(commit, repost=False):

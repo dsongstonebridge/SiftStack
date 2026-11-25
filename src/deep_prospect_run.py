@@ -57,6 +57,7 @@ import obituary_check
 import dp_board_split as split
 import owner_profile
 import dp_title_gate
+import siftmap_obituary
 import skip_trace_agent as sta
 import smartskip_parse
 
@@ -611,6 +612,8 @@ def cmd_charge(a) -> int:
         state["identity"] = findings
         _save(run, state)
         flags = owner_profile.identity_after_smartskip(rec, known, home_state=state.get("state") or "OK")
+        if young:
+            flags = [f for f in flags if not f.startswith("No sign")] + [f"STRONG: {young}"]
         block = "\n== Identity check (after SmartSkip)\n" + "\n".join(f"- {f}" for f in flags) + "\n"
         pt = run / "owner_profile.txt"
         if pt.exists() and "Identity check (after SmartSkip)" not in pt.read_text(encoding="utf-8"):
@@ -622,6 +625,10 @@ def cmd_charge(a) -> int:
             # Likely two people merged: Jeff decides before anything is scored (2026-10-28).
             print(f"STOP {state['street']}: SmartSkip likely merged two people. Ask Jeff before "
                   "finish, then pass his decision as --mixup-call \"...\".")
+        # Second death source, after SmartSkip (Jeff, 2026-11-24): SiftMap's obituary data.
+        sm = siftmap_obituary.run_check(run, state, rec)
+        print("== SiftMap obituary check (after SmartSkip)\n"
+              + "\n".join(f"- {x}" for x in sm["lines"]))
     print("\nNext, per record: read obituary_check.txt and owner_profile.txt, write dp_research.json, then\n"
           "python src/deep_prospect_run.py finish --run <record's run folder> --primary ... --commit")
     return 0
@@ -665,6 +672,19 @@ def cmd_finish(a) -> int:
     note = owner_profile.mixup_note(findings, call)
     if note:
         status_line = f"{status_line}\n{note}"
+    # SiftMap's obituary data (Jeff, 2026-11-24). A failed read is re-tried (it is
+    # free) and never read as "no obituary"; runs from before this check get it here.
+    sm = siftmap_obituary.load(run)
+    if not sm or (sm.get("siftmap") or {}).get("status") != "ok":
+        sm = siftmap_obituary.run_check(run, state, rec)
+    sm_call = (getattr(a, "siftmap_call", None) or "").strip()
+    sm_problems = siftmap_obituary.finish_problems(sm, status, research, sm_call)
+    if sm_problems:
+        raise SystemExit("REFUSED, nothing written (SiftMap obituary check):\n  " + "\n  ".join(sm_problems))
+    sm_note = siftmap_obituary.status_note(sm)
+    if sm_note or sm_call:
+        status_line = (f"{status_line}\n{sm_note}"
+                       + (f" Jeff's call: {sm_call}" if sm_call else "")).rstrip()
     # The SmartSkip row carries the property address we sent; the DataSift
     # record is resolved from the run's own address so the two cannot drift.
     rec.update(property_address=state["street"], property_city=state["city"],
@@ -794,6 +814,9 @@ def main(argv=None) -> int:
                    help="how sure the research is that the owner is dead/alive (needed for those)")
     f.add_argument("--mixup-call",
                    help="Jeff's decision when charge said SmartSkip likely merged two people")
+    f.add_argument("--siftmap-call",
+                   help="Jeff's decision when the SiftMap obituary check disagrees with the research "
+                        "or could not run; printed on the board under the owner status")
     f.add_argument("--decedent", action="store_true",
                    help="the obituary or probate filing CONFIRMS the searched person died: "
                         "label them Decedent, not Owner (always true on a probate search)")

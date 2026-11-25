@@ -2431,6 +2431,25 @@ DataSift sequence (trigger property.assigned, condition assignee = X)
 - `src/assignee_alerts.py` is the earlier polling version (every 15 min, needs the PC). Its
   Windows task "Assignee alerts" is DISABLED, kept as a fallback; enabling it double-alerts.
 
+## Backup / safety net (set up 2026-11-24/25)
+
+Nothing important should exist only on this PC. The backup lives in the company OneDrive, and
+the script is deliberately kept OUTSIDE this repo (`~/.siftstack/backup/`) because the repo is public.
+
+- **Windows task "SiftStack nightly backup"** (name kept) runs **daily at 7:30 AM** in the
+  background, and late if the PC was off (StartWhenAvailable). It does NOT wake the PC, and that
+  is on purpose: do not turn on wake-to-run or change lid settings. It copies the SiftStack
+  folder (minus `.venv`), every `C:\Users\dsong\SiftStack-*` worktree, `~/.siftstack`, an
+  integrity-checked snapshot of the SMS agent database and every scheduled task's settings.
+  Result: `LAST_BACKUP.txt` in the backup folder says OK or FAILED; restore steps in `RECOVERY.md` there.
+- Claude memory, skills and agents are junctions into the company OneDrive, so they are live
+  copies, not nightly ones. Don't turn them back into real folders.
+- **Moving the SiftStack folder itself into the company OneDrive was DROPPED (2026-11-25):**
+  too many hardcoded paths (tasks, worktree links, Claude's project/memory folder name) for
+  little gain over the daily copy. Do not re-propose it.
+- Vendor and account logins are recorded in a document outside the repo, never in a tracked
+  file. Never print `.env` values into a chat; build files from it without echoing values.
+
 ## DataSift.ai (REISift) Integration
 
 DataSift.ai (formerly REISift) is the CRM where scraped records land for niche sequential marketing campaigns.

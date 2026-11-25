@@ -1874,7 +1874,7 @@ known inputs.
   - The queue was hand re-laid so the two numbers ALTERNATED record by record. Each number kept its own 5-minute gap, and every phone on a record stayed on one number. Jeff: that moves through the records faster than one number per day. Whether to make that the default is still open.
   - To re-lay a live queue: stop the worker, update BOTH `outbox.from_number`/`not_before` AND `conversations.from_number` (the worker sends from the conversation's number first), then restart via the task.
 - **New numbers:** 2 bought 11-16 (one fully clean). Neither is used until Mon 11-23, when both go in.
-- **Eric Legaspi**, new cold caller (assigned_to `b3923cfc-...`), is on Diego's smrtPhone login, so smrtPhone logs (KPI talk time, call coaching) count his calls as Diego's.
+- **Eric Legaspi**, new cold caller (assigned_to `b3923cfc-...`). He is NOT on Diego's smrtPhone login (Jeff 2026-11-24 corrected an earlier note that said he was).
   - Onboarding week: his records are signed Diego.
   - From Mon 11-23: signed **Eric**, date-gated in gitignored `config/sms_senders.json`. A value may be `{"name": "Eric", "from": "YYYY-MM-DD"}`, and `config.senders()` maps it to "" before that date, so the fallback (`SMS_AGENT_SENDER_NAME`) signs and the API user lookup cannot fill it in early. A thread switching from Diego to Eric mid-sequence is fine (Jeff).
   - Reply alerts in #SMS tag Diego AND Eric on every reply (Jeff, 2026-11-18: nothing else about the post changes). `SMS_AGENT_HANDOFF_SLACK_ID` takes a comma list (`config.handoff_mention()`); Eric is `U0CHDMMLQ3F`.

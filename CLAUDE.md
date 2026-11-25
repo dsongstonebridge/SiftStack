@@ -2345,6 +2345,24 @@ DataSift sequence (trigger property.assigned, condition assignee = X)
   user uuid. No script edit. Test by unassigning one of their properties and assigning it back.
 - **Known behaviour:** bulk-assigning N properties sends N messages. If the Slack webhook or a
   sequence is turned off, alerts stop silently (the script still answers DataSift 200).
+- **Changes made BY a sequence do not seem to fire other sequences.** "Assignee alert - Jeff"
+  showed only our 2 test runs even though "Call New Lead" had moved many records to Jeff. So a
+  record a sequence assigns gets no Slack alert. Jeff accepted this (Eric almost always assigns
+  by hand), so no webhook step was added to Call New Lead.
+- **"Call New Lead" assigned every new lead to JEFF (fixed 2026-11-25).** The Lead Management
+  sequence (uuid `78ff451b-...`, trigger: status changes to New Lead) has had a
+  `property-assign` step set to Jeff since it was built on 2026-06-02. When Eric assigned Diego
+  and then set New Lead, the sequence put the record on Jeff in the same second, so the CRM
+  disagreed with Diego's alert. Diego had been moving some back by hand. Jeff's rule: **every
+  new lead goes to the lead manager (Diego today)**. Only that one value changed, Jeff -> Diego,
+  via `PATCH /api/internal/sequence/{uuid}/` with `{"actions": [...]}` (the full list sent back
+  with one value swapped). All 40 sequences were diffed before and after, and that value is the
+  only difference. Backups are in `output/backups/*_2026-11-25.json`. The task this sequence
+  creates (task preset "Call New Lead") was already assigned to Diego. 10 records taken from
+  Diego (Sep 28 - Nov 24) are still on Jeff. Jeff chose not to reassign them, since their tasks
+  were Diego's. **When the lead manager changes, update this step.** A sequence keeps no edit
+  history, so a record's `/logs/` (events with `extra_info.source.title`) is the only way to
+  see what a sequence did.
 - `src/assignee_alerts.py` is the earlier polling version (every 15 min, needs the PC). Its
   Windows task "Assignee alerts" is DISABLED, kept as a fallback; enabling it double-alerts.
 

@@ -2297,6 +2297,19 @@ without posting: `python pull_kpis.py --from D --to D --slack print`,
 **smrtPhone session expires ~Oct 31, 2026:** run `kpi-engine\smrtphone_login.bat`, then paste
 `kpi-engine\reports\SMRTPHONE_STATE_paste_me.txt` into the `SMRTPHONE_STATE` GitHub secret.
 
+**Eric call-review PDF (Jeff, 2026-11-25).** `kpi-engine/call_review.py`, Windows task "Eric call
+review PDF": weekdays from 8 AM (repeats every 30 min to 7 PM, plus at logon; the PC must be awake),
+it uploads ONE PDF to the KPI channel for the previous weekday (Monday covers Friday) and nothing
+else: no message text. Up to 10 of Eric's live calls, never voicemails: a record counts when his
+board post that day is a talk note (not `_is_vm_note`) or he set a lead / not-interested status.
+Each entry is the person's name linked to the recording (`rec.smrtphone.io`, from the DataSift call
+event; inbound callbacks come from the smrtPhone log), the address and length, and a short summary
+from his note plus the status. No note boxes: Slack's viewer never saved them. Phone width, 2 pages
+max. The records search runs from the day to NOW, because `updated` holds a record's LAST change
+and a day-only window missed 30 of 101 records. Needs `SLACK_BOT_TOKEN` (kpi_bot, `files:write` +
+`chat:write`) and `SLACK_KPI_CHANNEL_ID` in `.env`; state `kpi-engine/reports/call_review_last.txt`.
+`--date YYYY-MM-DD --dry-run` builds the PDF without posting.
+
 **Never commit:** `.env`, `kpi-bot/.env`, `kpi-bot/service_account.json`,
 `smrtphone_state.json`, `kpi-engine/manual_calls.csv`, `kpi-engine/reports/`.
 
